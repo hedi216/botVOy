@@ -1,0 +1,30 @@
+{
+  "name": "rdv-agent",
+  "version": "0.1.0",
+  "description": "MVP Node.js + TypeScript + Playwright pour un agent navigateur local.",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "playwright:install": "playwright install chromium"
+  },
+  "keywords": [
+    "playwright",
+    "typescript",
+    "browser-agent"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "nodemailer": "^9.0.3",
+    "playwright": "^1.49.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/nodemailer": "^6.4.17",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
