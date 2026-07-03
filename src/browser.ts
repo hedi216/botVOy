@@ -1,34 +1,41 @@
-import { chromium, Browser, BrowserContext, Page } from "playwright";
-import { MissionConfig } from "./types.js";
+import { chromium, Browser, Page } from "playwright";
+import { AppConfig } from "./types.js";
 import { logger } from "./logger.js";
 
 export type BrowserSession = {
-  browser: Browser | BrowserContext;
+  browser: Browser;
   page: Page;
 };
 
-export const launchBrowser = async (config: MissionConfig): Promise<BrowserSession> => {
-  const channelText = config.browserChannel ? ` channel=${config.browserChannel}` : "";
-  logger.info(`Lancement navigateur headless=${config.headless}, slowMo=${config.slowMoMs}ms${channelText}`);
+export const launchBrowser = async (config: AppConfig): Promise<BrowserSession> => {
+  if (config.connectToExistingChrome) {
+    logger.info(`Connexion au Chrome deja ouvert: ${config.chromeDebugUrl}`);
 
-  if (config.userDataDir) {
-    logger.info(`Profil navigateur persistant: ${config.userDataDir}`);
-
-    const context = await chromium.launchPersistentContext(config.userDataDir, {
-      channel: config.browserChannel,
-      headless: config.headless,
-      slowMo: config.slowMoMs,
-      viewport: { width: 1366, height: 768 }
+    const browser = await chromium.connectOverCDP(config.chromeDebugUrl);
+    const context = browser.contexts()[0] ?? await browser.newContext();
+    const usablePages = context.pages().filter((candidate) => {
+      const url = candidate.url();
+      return !url.startsWith("devtools://")
+        && !url.startsWith("chrome://")
+        && !url.startsWith("chrome-extension://");
     });
+    const page = [...usablePages].reverse().find((candidate) => candidate.url() !== "about:blank")
+      ?? usablePages[0]
+      ?? await context.newPage();
 
-    const page = context.pages()[0] ?? await context.newPage();
-    page.setDefaultTimeout(10_000);
+    page.setDefaultTimeout(8_000);
+    await page.bringToFront().catch(() => undefined);
 
-    return { browser: context, page };
+    if (config.targetUrl !== "about:blank" && page.url() === "about:blank") {
+      await page.goto(config.targetUrl, { waitUntil: "domcontentloaded" });
+    }
+
+    return { browser, page };
   }
 
+  logger.info(`Lancement Chromium visible=${!config.headless}, slowMo=${config.slowMoMs}ms`);
+
   const browser = await chromium.launch({
-    channel: config.browserChannel,
     headless: config.headless,
     slowMo: config.slowMoMs
   });
@@ -38,7 +45,11 @@ export const launchBrowser = async (config: MissionConfig): Promise<BrowserSessi
   });
 
   const page = await context.newPage();
-  page.setDefaultTimeout(10_000);
+  page.setDefaultTimeout(8_000);
+
+  if (config.targetUrl !== "about:blank") {
+    await page.goto(config.targetUrl, { waitUntil: "domcontentloaded" });
+  }
 
   return { browser, page };
 };

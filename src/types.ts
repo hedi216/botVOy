@@ -1,35 +1,15 @@
-export type MissionConfig = {
+import { Locator } from "playwright";
+
+export type AppConfig = {
   targetUrl: string;
-  loginEmail: string;
-  loginPassword: string;
-  applicationCentre: string;
-  appointmentCategory: string;
-  subCategory: string;
-  firstName: string;
-  lastName: string;
-  currentNationality: string;
-  passportNumber: string;
-  phoneDialCode: string;
-  phoneNumber: string;
-  applicantEmail: string;
-  checkIntervalMinutes: number;
-  afterSaveWaitSeconds: number;
-  afterDateClickWaitSeconds: number;
-  servicesWaitSeconds: number;
-  notificationEmail: string;
-  smtpHost?: string;
-  smtpPort: number;
-  smtpSecure: boolean;
-  smtpUser?: string;
-  smtpPass?: string;
-  browserChannel?: string;
-  userDataDir?: string;
-  slowMoMs: number;
+  connectToExistingChrome: boolean;
+  chromeDebugUrl: string;
+  refreshIntervalMs: number;
   headless: boolean;
-  humanPauseTimeoutMinutes: number;
-  enableAiAssistant: boolean;
-  openAiApiKey?: string;
-  aiModel: string;
+  slowMoMs: number;
+  debugKeepBrowserOpen: boolean;
+  maxRefreshAttempts: number;
+  scanMonthCount: number;
 };
 
 export type HumanValidationResult = {
@@ -37,9 +17,13 @@ export type HumanValidationResult = {
   reason?: string;
 };
 
-export type AiPageAnalysis = {
-  understood: boolean;
-  summary: string;
-  suggestedAction?: string;
-  risk?: string;
+export type AppointmentAvailabilityResult = {
+  detected: boolean;
+  textFound?: string;
+  dateTimeHint?: string;
+};
+
+export type CandidateElementResult = {
+  locator: Locator;
+  text: string;
 };

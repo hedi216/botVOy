@@ -18,12 +18,10 @@
   "license": "MIT",
   "dependencies": {
     "dotenv": "^16.4.7",
-    "nodemailer": "^9.0.3",
     "playwright": "^1.49.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
-    "@types/nodemailer": "^6.4.17",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

@@ -3,4 +3,5 @@ dist/
 artifacts/
 .env
 .browser-profile/
+.chrome-user/
 npm-debug.log*
