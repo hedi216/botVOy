@@ -68,6 +68,7 @@ const els = {
   agencyForm: $("#agencyForm"),
   agencyName: $("#agencyName"),
   agencyLimit: $("#agencyLimit"),
+  agencyEmail: $("#agencyEmail"),
   agencyTableBody: $("#agencyTableBody"),
   profileInitial: $("#profileInitial"),
   profileName: $("#profileName"),
@@ -224,6 +225,7 @@ const renderAgencies = () => {
 
     const row = document.createElement("tr");
     addCell(row, agency.name);
+    addCell(row, agency.notification_email || "-");
     addCell(row, String(agency.active_users));
     addCell(row, String(agency.max_active_clients));
 
@@ -232,6 +234,15 @@ const renderAgencies = () => {
     row.append(statusCell);
 
     const actionCell = document.createElement("td");
+    actionCell.className = "action-cell";
+
+    const emailButton = document.createElement("button");
+    emailButton.className = "outline";
+    emailButton.dataset.agencyEmail = String(agency.id);
+    emailButton.dataset.currentEmail = agency.notification_email || "";
+    emailButton.textContent = "Modifier email";
+    actionCell.append(emailButton);
+
     const button = document.createElement("button");
     button.className = agency.is_active ? "outline danger-text" : "outline success-text";
     button.dataset.agencyId = String(agency.id);
@@ -435,7 +446,8 @@ els.agencyForm.addEventListener("submit", async (event) => {
     method: "POST",
     body: JSON.stringify({
       name: els.agencyName.value,
-      maxActiveClients: Number(els.agencyLimit.value)
+      maxActiveClients: Number(els.agencyLimit.value),
+      notificationEmail: els.agencyEmail.value.trim() || null
     })
   });
   els.agencyForm.reset();
@@ -444,6 +456,21 @@ els.agencyForm.addEventListener("submit", async (event) => {
 });
 
 els.agencyTableBody.addEventListener("click", async (event) => {
+  const emailButton = event.target.closest("button[data-agency-email]");
+  if (emailButton) {
+    const nextEmail = window.prompt("Email notifications agence", emailButton.dataset.currentEmail || "");
+    if (nextEmail === null) {
+      return;
+    }
+
+    await requestJson(`/api/agencies/${emailButton.dataset.agencyEmail}`, {
+      method: "PATCH",
+      body: JSON.stringify({ notificationEmail: nextEmail.trim() || null })
+    });
+    await loadAgencies();
+    return;
+  }
+
   const button = event.target.closest("button[data-agency-id]");
   if (!button) {
     return;
@@ -595,6 +622,10 @@ socket.on("bot-status", ({ status }) => {
 
 socket.on("bot-prompt", ({ message }) => setPrompt(message, true));
 socket.on("bot-log", addLog);
+socket.on("bot-log-history", (events) => {
+  state.logs = Array.isArray(events) ? events.slice(0, 300) : [];
+  renderLogs();
+});
 
 socket.on("maintenance", ({ pid, port, maxClients, activeSessions }) => {
   els.serverPid.textContent = String(pid);

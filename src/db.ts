@@ -20,6 +20,7 @@ export type DbUser = {
 export type DbAgency = {
   id: number;
   name: string;
+  notification_email: string | null;
   is_active: boolean;
   max_active_clients: number;
   created_at: string;
@@ -64,6 +65,7 @@ export const ensureSchema = async (): Promise<void> => {
     CREATE TABLE IF NOT EXISTS agencies (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL UNIQUE,
+      notification_email TEXT,
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
       max_active_clients INTEGER NOT NULL DEFAULT 15 CHECK (max_active_clients BETWEEN 0 AND 15),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -86,6 +88,9 @@ export const ensureSchema = async (): Promise<void> => {
   `);
 
   await pool.query(`
+    ALTER TABLE agencies
+      ADD COLUMN IF NOT EXISTS notification_email TEXT;
+
     ALTER TABLE users
       ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ,

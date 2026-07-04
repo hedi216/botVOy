@@ -99,10 +99,14 @@ export const listAgencies = async (): Promise<Array<DbAgency & { active_users: n
   return result.rows;
 };
 
-export const createAgency = async (name: string, maxActiveClients = 15): Promise<DbAgency> => {
+export const createAgency = async (
+  name: string,
+  maxActiveClients = 15,
+  notificationEmail?: string | null
+): Promise<DbAgency> => {
   const result = await pool.query<DbAgency>(
-    "INSERT INTO agencies (name, max_active_clients) VALUES ($1, $2) RETURNING *",
-    [name, Math.min(maxActiveClients, 15)]
+    "INSERT INTO agencies (name, max_active_clients, notification_email) VALUES ($1, $2, $3) RETURNING *",
+    [name, Math.min(maxActiveClients, 15), notificationEmail || null]
   );
   return result.rows[0];
 };
@@ -118,6 +122,35 @@ export const setAgencyActive = async (agencyId: number, isActive: boolean): Prom
     [agencyId, isActive]
   );
   return result.rows[0];
+};
+
+export const updateAgency = async (
+  agencyId: number,
+  patch: Partial<Pick<DbAgency, "is_active" | "notification_email" | "max_active_clients">>
+): Promise<DbAgency> => {
+  const result = await pool.query<DbAgency>(
+    `UPDATE agencies
+     SET is_active = COALESCE($2, is_active),
+         notification_email = COALESCE($3, notification_email),
+         max_active_clients = COALESCE($4, max_active_clients)
+     WHERE id = $1
+     RETURNING *`,
+    [
+      agencyId,
+      patch.is_active ?? null,
+      patch.notification_email ?? null,
+      patch.max_active_clients ?? null
+    ]
+  );
+  return result.rows[0];
+};
+
+export const getAgencyNotificationEmail = async (agencyId: number): Promise<string | null> => {
+  const result = await pool.query<{ notification_email: string | null }>(
+    "SELECT notification_email FROM agencies WHERE id = $1",
+    [agencyId]
+  );
+  return result.rows[0]?.notification_email ?? null;
 };
 
 export const listUsersForRequester = async (requester: DbUser): Promise<DbUser[]> => {

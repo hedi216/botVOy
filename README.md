@@ -67,6 +67,12 @@ MAX_REFRESH_ATTEMPTS=0
 SCAN_MONTH_COUNT=0
 WEB_PORT=3000
 MAX_CLIENTS_PER_VM=15
+BREVO_API_KEY=
+BREVO_SENDER_EMAIL=notif.noreply@rendezbot.xyz
+BREVO_SENDER_NAME=RendezBot
+BREVO_ALERT_DEFAULT_TO=rendezbot.app@gmail.com
+BREVO_SANDBOX=true
+EMAIL_NOTIFY_NO_SLOT=false
 ```
 
 - `TARGET_URL` : optionnel. Utilise `about:blank` si tu veux naviguer manuellement.
@@ -80,6 +86,63 @@ MAX_CLIENTS_PER_VM=15
 - `SCAN_MONTH_COUNT=0` : scanne tous les mois suivants activables jusqu'au premier mois grise/desactive. Mets `4`, `6`, etc. pour limiter manuellement.
 - `WEB_PORT` : port de l'interface web locale.
 - `MAX_CLIENTS_PER_VM` : limite de sessions Chrome/bot actives sur la VM.
+- `BREVO_API_KEY` : cle API Brevo, cote backend uniquement. Ne jamais la mettre dans le frontend.
+- `BREVO_SENDER_EMAIL` : expediteur verifie dans Brevo. Pour RendezBot : `notif.noreply@rendezbot.xyz`.
+- `BREVO_SENDER_NAME` : nom expediteur, par defaut `RendezBot`.
+- `BREVO_ALERT_DEFAULT_TO` : email de fallback si aucune agence ou aucun destinataire n'est fourni.
+- `BREVO_SANDBOX=true` : ajoute `X-Sib-Sandbox: drop`, Brevo accepte la requete mais ne livre pas l'email.
+- `EMAIL_NOTIFY_NO_SLOT` : si `true`, envoie aussi une notification quand aucun creneau n'est detecte. Laisse `false` pour eviter les emails repetitifs.
+
+## Notifications email Brevo
+
+L'envoi d'emails utilise l'API HTTP Brevo :
+
+```text
+POST https://api.brevo.com/v3/smtp/email
+```
+
+Le domaine `rendezbot.xyz` et l'expediteur `RendezBot <notif.noreply@rendezbot.xyz>` sont deja configures cote Brevo.
+
+Chaque agence peut avoir un email de notification. Cet email recoit uniquement les evenements importants :
+
+- intervention humaine requise ;
+- validation humaine ou blocage detecte ;
+- creneau potentiel detecte ;
+- alerte utilisateur ;
+- erreur ou page inattendue.
+
+Les logs de routine comme `AUCUN_CRENEAU_DETECTE` ne sont pas envoyes par email pour eviter le spam.
+Tu peux activer cette notification avec `EMAIL_NOTIFY_NO_SLOT=true` si tu veux recevoir aussi l'absence de creneau.
+
+Pour tester sans envoyer de vrai email, garde :
+
+```env
+BREVO_SANDBOX=true
+```
+
+Pour envoyer reellement :
+
+```env
+BREVO_SANDBOX=false
+```
+
+Si Brevo retourne une erreur d'IP non reconnue, ajoute l'IP publique de la VM dans la liste des IP autorisees Brevo.
+
+Route de test disponible uniquement hors production et avec le compte admin :
+
+```http
+POST /api/email/test-alert
+```
+
+Exemple body :
+
+```json
+{
+  "to": "rendezbot.app@gmail.com",
+  "subject": "Test alerte RendezBot",
+  "message": "Ceci est un test d'alerte email depuis Brevo."
+}
+```
 
 ## Lancement
 

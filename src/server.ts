@@ -1,13 +1,40 @@
+import "dotenv/config";
 import express from "express";
 import cookieParser from "cookie-parser";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { Server } from "socket.io";
-import { createBotSession, BotSession } from "./sessionManager.js";
+import { Server, Socket } from "socket.io";
+import { createBotSession, BotSession, SessionEvent } from "./sessionManager.js";
 import { logger } from "./logger.js";
 import { AuthenticatedRequest, createSession, destroySession, getSessionUser, requireAdmin, requireAgencyManager, requireAuth } from "./auth.js";
-import { authenticateUser, changeOwnPassword, createAgency, createUser, getAgency, initUserModule, listAgencies, listUsersForRequester, resetUserPassword, setAgencyActive, updateUser } from "./userService.js";
+import { DbUser } from "./db.js";
+import {
+  authenticateUser,
+  changeOwnPassword,
+  createAgency,
+  createUser,
+  getAgency,
+  initUserModule,
+  listAgencies,
+  listUsersForRequester,
+  resetUserPassword,
+  updateAgency,
+  updateUser
+} from "./userService.js";
+import { notifyAgencyIfNeeded } from "./notifications.js";
+import { sendAppAlert } from "./appAlertService.js";
+
+type SessionOwner = {
+  userId: number;
+  agencyId: number | null;
+};
+
+type StoredLog = {
+  event: SessionEvent;
+  owner: SessionOwner;
+  sessionKey: string;
+};
 
 const app = express();
 const server = http.createServer(app);
@@ -15,7 +42,10 @@ const io = new Server(server);
 const preferredPort = Number(process.env.WEB_PORT ?? 3000);
 const maxClients = Number(process.env.MAX_CLIENTS_PER_VM ?? 15);
 const sessions = new Map<string, BotSession>();
-const sessionOwners = new Map<string, { userId: number; agencyId: number | null }>();
+const sessionOwners = new Map<string, SessionOwner>();
+const socketUsers = new Map<string, DbUser>();
+const activePrompts = new Map<string, { message: string; owner: SessionOwner }>();
+const logHistory: StoredLog[] = [];
 let currentPort = preferredPort;
 
 app.use(express.json({ limit: "1mb" }));
@@ -60,13 +90,29 @@ app.get("/api/agencies", requireAuth, requireAdmin, async (_req, res) => {
 });
 
 app.post("/api/agencies", requireAuth, requireAdmin, async (req, res) => {
-  const { name, maxActiveClients } = req.body as { name?: string; maxActiveClients?: number };
-  res.json({ agency: await createAgency(name ?? "Nouvelle agence", maxActiveClients ?? 15) });
+  const body = req.body as { name?: string; maxActiveClients?: number; notificationEmail?: string };
+  res.json({
+    agency: await createAgency(
+      body.name ?? "Nouvelle agence",
+      body.maxActiveClients ?? 15,
+      body.notificationEmail
+    )
+  });
 });
 
 app.patch("/api/agencies/:id", requireAuth, requireAdmin, async (req, res) => {
-  const { isActive } = req.body as { isActive?: boolean };
-  res.json({ agency: await setAgencyActive(Number(req.params.id), Boolean(isActive)) });
+  const body = req.body as {
+    isActive?: boolean;
+    maxActiveClients?: number;
+    notificationEmail?: string;
+  };
+  res.json({
+    agency: await updateAgency(Number(req.params.id), {
+      is_active: body.isActive,
+      max_active_clients: body.maxActiveClients,
+      notification_email: body.notificationEmail
+    })
+  });
 });
 
 app.get("/api/users", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
@@ -118,19 +164,36 @@ app.post("/api/users/:id/reset-password", requireAuth, requireAgencyManager, asy
   res.json(await resetUserPassword(Number(req.params.id), req.user!));
 });
 
+app.post("/api/email/test-alert", requireAuth, requireAdmin, async (req, res) => {
+  if (process.env.NODE_ENV === "production") {
+    res.status(404).json({
+      success: false,
+      provider: "brevo",
+      message: "Route indisponible en production."
+    });
+    return;
+  }
+
+  const body = req.body as { to?: string; subject?: string; message?: string };
+  const result = await sendAppAlert({
+    type: "info",
+    title: body.subject ?? "Test alerte RendezBot",
+    message: body.message ?? "Ceci est un test d'alerte email depuis Brevo.",
+    userEmail: body.to,
+    adminOnly: !body.to,
+    data: {
+      route: "/api/email/test-alert",
+      sandbox: process.env.BREVO_SANDBOX ?? "true"
+    }
+  });
+
+  res.status(result.success ? 200 : 400).json(result);
+});
+
 app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   logger.error(`API error: ${error.message}`);
   res.status(400).json({ error: error.message });
 });
-
-const isProcessAlive = (pid: number): boolean => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-};
 
 const writeServerLock = (port: number): void => {
   currentPort = port;
@@ -166,109 +229,206 @@ const emitMaintenance = (): void => {
   });
 };
 
+const getUserFromSocket = (socket: Socket): DbUser | null => {
+  const cookie = socket.handshake.headers.cookie ?? "";
+  const token = cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("rdv_session="))?.split("=")[1];
+  return getSessionUser(token);
+};
+
+const canSeeOwner = (user: DbUser, owner: SessionOwner): boolean => {
+  return user.role === 0
+    || user.id === owner.userId
+    || (Boolean(user.agency_id) && user.agency_id === owner.agencyId);
+};
+
+const emitLogToAuthorizedSockets = (owner: SessionOwner, event: SessionEvent): void => {
+  for (const [socketId, socket] of io.sockets.sockets) {
+    const user = socketUsers.get(socketId);
+    if (user && canSeeOwner(user, owner)) {
+      socket.emit("bot-log", event);
+    }
+  }
+};
+
+const emitPromptToAuthorizedSockets = (owner: SessionOwner, message: string): void => {
+  for (const [socketId, socket] of io.sockets.sockets) {
+    const user = socketUsers.get(socketId);
+    if (user && canSeeOwner(user, owner)) {
+      socket.emit("bot-prompt", { message });
+    }
+  }
+};
+
+const recordLog = (owner: SessionOwner, event: SessionEvent, sessionKey: string): void => {
+  logHistory.unshift({ event, owner, sessionKey });
+  logHistory.splice(300);
+  emitLogToAuthorizedSockets(owner, event);
+  void notifyAgencyIfNeeded({
+    agencyId: owner.agencyId,
+    level: event.level,
+    message: event.message,
+    sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey
+  });
+};
+
+const emitOwnedLog = (socket: Socket, owner: SessionOwner | null, event: SessionEvent): void => {
+  if (owner) {
+    recordLog(owner, event, socket.id);
+    return;
+  }
+
+  socket.emit("bot-log", event);
+};
+
+const makeEvent = (level: SessionEvent["level"], message: string): SessionEvent => ({
+  level,
+  message,
+  timestamp: new Date().toISOString()
+});
+
+const findSessionForSocket = (socketId: string): [string, BotSession] | undefined => {
+  const direct = sessions.get(socketId);
+  if (direct) {
+    return [socketId, direct];
+  }
+
+  const user = socketUsers.get(socketId);
+  if (!user) {
+    return undefined;
+  }
+
+  const match = [...sessionOwners.entries()].find(([, owner]) => canSeeOwner(user, owner));
+  if (!match) {
+    return undefined;
+  }
+
+  const session = sessions.get(match[0]);
+  return session ? [match[0], session] : undefined;
+};
+
 io.on("connection", (socket) => {
   logger.info(`Interface connectee: ${socket.id}`);
+
+  const connectedUser = getUserFromSocket(socket);
+  if (connectedUser) {
+    socketUsers.set(socket.id, connectedUser);
+    socket.emit(
+      "bot-log-history",
+      logHistory.filter((entry) => canSeeOwner(connectedUser, entry.owner)).map((entry) => entry.event)
+    );
+
+    for (const [sessionKey, prompt] of activePrompts) {
+      if (canSeeOwner(connectedUser, prompt.owner)) {
+        const session = sessions.get(sessionKey);
+        if (session) {
+          socket.emit("bot-session", session.snapshot());
+        }
+        socket.emit("bot-prompt", { message: prompt.message });
+      }
+    }
+  }
+
   emitMaintenance();
 
   socket.on("start-bot", async () => {
-    const cookie = socket.handshake.headers.cookie ?? "";
-    const token = cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("rdv_session="))?.split("=")[1];
-    const user = getSessionUser(token);
+    const user = socketUsers.get(socket.id) ?? getUserFromSocket(socket);
     if (!user) {
-      socket.emit("bot-log", {
-        level: "error",
-        message: "Connexion utilisateur requise pour demarrer un bot.",
-        timestamp: new Date().toISOString()
-      });
+      socket.emit("bot-log", makeEvent("error", "Connexion utilisateur requise pour demarrer un bot."));
       return;
     }
 
+    socketUsers.set(socket.id, user);
+    const owner: SessionOwner = { userId: user.id, agencyId: user.agency_id };
+
     if (user.role !== 0) {
       if (!user.agency_id) {
-        socket.emit("bot-log", {
-          level: "error",
-          message: "Utilisateur sans agence: impossible de demarrer un bot.",
-          timestamp: new Date().toISOString()
-        });
+        emitOwnedLog(socket, owner, makeEvent("error", "Utilisateur sans agence: impossible de demarrer un bot."));
         return;
       }
 
       const agency = await getAgency(user.agency_id);
       if (!agency?.is_active) {
-        socket.emit("bot-log", {
-          level: "error",
-          message: "Agence inactive: impossible de demarrer un bot.",
-          timestamp: new Date().toISOString()
-        });
+        emitOwnedLog(socket, owner, makeEvent("error", "Agence inactive: impossible de demarrer un bot."));
         return;
       }
 
       const activeAgencySessions = [...sessionOwners.values()]
-        .filter((owner) => owner.agencyId === user.agency_id).length;
+        .filter((sessionOwner) => sessionOwner.agencyId === user.agency_id).length;
       if (activeAgencySessions >= agency.max_active_clients) {
-        socket.emit("bot-log", {
-          level: "error",
-          message: `Limite agence atteinte: ${activeAgencySessions}/${agency.max_active_clients} navigateurs actifs.`,
-          timestamp: new Date().toISOString()
-        });
+        emitOwnedLog(socket, owner, makeEvent("error", `Limite agence atteinte: ${activeAgencySessions}/${agency.max_active_clients} navigateurs actifs.`));
         return;
       }
     }
 
-    const currentSession = sessions.get(socket.id);
-    if (currentSession?.isActive()) {
-      socket.emit("bot-log", {
-        level: "warn",
-        message: "Un bot est deja actif pour cette interface.",
-        timestamp: new Date().toISOString()
-      });
+    const currentSession = findSessionForSocket(socket.id);
+    if (currentSession?.[1].isActive()) {
+      emitOwnedLog(socket, owner, makeEvent("warn", "Un bot est deja actif pour cette interface."));
       return;
     }
 
     const activeCount = [...sessions.values()].filter((session) => session.isActive()).length;
     if (activeCount >= maxClients) {
       socket.emit("bot-status", { status: "error" });
-      socket.emit("bot-log", {
-        level: "error",
-        message: `Limite VM atteinte: ${activeCount}/${maxClients} clients actifs.`,
-        timestamp: new Date().toISOString()
-      });
+      emitOwnedLog(socket, owner, makeEvent("error", `Limite VM atteinte: ${activeCount}/${maxClients} clients actifs.`));
       return;
     }
 
+    const sessionKey = socket.id;
     const session = await createBotSession({
-      onLog: (event) => socket.emit("bot-log", event),
-      onPrompt: (message) => socket.emit("bot-prompt", { message }),
+      onLog: (event) => recordLog(owner, event, sessionKey),
+      onPrompt: (message) => {
+        activePrompts.set(sessionKey, { message, owner });
+        emitPromptToAuthorizedSockets(owner, message);
+        void notifyAgencyIfNeeded({
+          agencyId: owner.agencyId,
+          level: "warn",
+          message,
+          sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey
+        });
+      },
       onStatus: (status) => {
-        socket.emit("bot-status", { status });
+        for (const [socketId, connectedSocket] of io.sockets.sockets) {
+          const socketUser = socketUsers.get(socketId);
+          if (socketUser && canSeeOwner(socketUser, owner)) {
+            connectedSocket.emit("bot-status", { status });
+          }
+        }
         if (status === "stopped" || status === "error") {
-          sessions.delete(socket.id);
-          sessionOwners.delete(socket.id);
+          sessions.delete(sessionKey);
+          sessionOwners.delete(sessionKey);
+          activePrompts.delete(sessionKey);
           emitMaintenance();
         }
       }
     });
 
-    sessions.set(socket.id, session);
-    sessionOwners.set(socket.id, { userId: user.id, agencyId: user.agency_id });
+    sessions.set(sessionKey, session);
+    sessionOwners.set(sessionKey, owner);
     socket.emit("bot-session", session.snapshot());
     emitMaintenance();
     void session.start();
   });
 
   socket.on("continue-bot", () => {
-    sessions.get(socket.id)?.continue();
-  });
-
-  socket.on("stop-bot", async () => {
-    const session = sessions.get(socket.id);
-    if (!session) {
+    const match = findSessionForSocket(socket.id);
+    if (!match) {
       return;
     }
 
-    await session.stop();
-    sessions.delete(socket.id);
-    sessionOwners.delete(socket.id);
+    activePrompts.delete(match[0]);
+    match[1].continue();
+  });
+
+  socket.on("stop-bot", async () => {
+    const match = findSessionForSocket(socket.id);
+    if (!match) {
+      return;
+    }
+
+    await match[1].stop();
+    sessions.delete(match[0]);
+    sessionOwners.delete(match[0]);
+    activePrompts.delete(match[0]);
     emitMaintenance();
   });
 
@@ -276,6 +436,7 @@ io.on("connection", (socket) => {
     await Promise.all([...sessions.values()].map((session) => session.stop()));
     sessions.clear();
     sessionOwners.clear();
+    activePrompts.clear();
     emitMaintenance();
   });
 
@@ -283,18 +444,16 @@ io.on("connection", (socket) => {
     await Promise.all([...sessions.values()].map((session) => session.stop()));
     sessions.clear();
     sessionOwners.clear();
+    activePrompts.clear();
     emitMaintenance();
     cleanupServerLock();
-    socket.emit("bot-log", {
-      level: "warn",
-      message: "Arret du serveur web demande depuis l'interface.",
-      timestamp: new Date().toISOString()
-    });
+    socket.emit("bot-log", makeEvent("warn", "Arret du serveur web demande depuis l'interface."));
     server.close(() => process.exit(0));
   });
 
   socket.on("disconnect", async () => {
     logger.info(`Interface deconnectee: ${socket.id}`);
+    socketUsers.delete(socket.id);
   });
 });
 

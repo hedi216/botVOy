@@ -71,7 +71,7 @@
           <div class="account-menu">
             <button id="accountButton" class="avatar-button" type="button">
               <span id="avatarInitial">U</span>
-              <span class="chevron">⌄</span>
+              <span class="chevron">v</span>
             </button>
             <div id="accountDropdown" class="account-dropdown" hidden>
               <span class="muted-label">Connecte en tant que</span>
@@ -267,6 +267,10 @@
                   Clients actifs max
                   <input id="agencyLimit" type="number" min="1" max="15" value="15">
                 </label>
+                <label>
+                  Email notifications
+                  <input id="agencyEmail" type="email" placeholder="notifications@agence.com">
+                </label>
                 <button class="primary" type="submit">Ajouter</button>
               </form>
             </section>
@@ -276,6 +280,7 @@
                 <thead>
                   <tr>
                     <th>Agence</th>
+                    <th>Email notifications</th>
                     <th>Utilisateurs actifs</th>
                     <th>Limite</th>
                     <th>Statut</th>
