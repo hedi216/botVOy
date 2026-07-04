@@ -10,60 +10,80 @@ type NotificationInput = {
 };
 
 const recentNotifications = new Map<string, number>();
+const recentAppointmentByAgency = new Map<number, number>();
 const DEDUPE_MS = 5 * 60 * 1000;
+const SUPPRESS_AFTER_APPOINTMENT_MS = 15 * 60 * 1000;
 
-const shouldNotify = (level: MonitorEventLevel, message: string): boolean => {
-  const text = message.toLowerCase();
-  const notifyNoSlot = (process.env.EMAIL_NOTIFY_NO_SLOT ?? "false").toLowerCase() === "true";
+const stripTechnicalNoise = (message: string): string => message
+  .replace(/\u001b\[[0-9;]*m/g, "")
+  .split("Call log:")[0]
+  .trim();
 
-  return level === "error"
-    || (notifyNoSlot && text.includes("aucun_creneau_detecte"))
-    || text.includes("alerte_utilisateur")
-    || text.includes("creneau_potentiel_detecte")
+type NotificationCategory = "appointment-detected" | "appointment-reserved" | "human-blocked";
+
+const normalizeMessage = (message: string): string => message
+  .normalize("NFD")
+  .replace(/[\u0300-\u036f]/g, "")
+  .replace(/[’']/g, "'")
+  .toLowerCase();
+
+const classifyNotification = (message: string): NotificationCategory | null => {
+  const text = normalizeMessage(message);
+
+  if (text.trim() === "creneau_potentiel_detecte") {
+    return "appointment-detected";
+  }
+
+  if (
+    text.includes("rendez-vous reserve temporairement")
+    || text.includes("bouton 'reservez votre rendez-vous' clique automatiquement")
+  ) {
+    return "appointment-reserved";
+  }
+
+  if (
+    text.includes("alerte_utilisateur")
     || text.includes("intervention humaine requise")
     || text.includes("validation humaine")
     || text.includes("controle humain")
-    || text.includes("blocage")
-    || text.includes("bloque")
+    || text.includes("captcha")
+    || text.includes("security check")
     || text.includes("page instable")
     || text.includes("page inattendue")
-    || text.includes("element de creneau clique");
+    || text.includes("refresh impossible")
+    || text.includes("session expiree")
+    || text.includes("impossible de trouver l'onglet")
+    || text.includes("onglet rendez-vous introuvable")
+    || text.includes("fermez les onglets")
+  ) {
+    return "human-blocked";
+  }
+
+  return null;
 };
 
-const notificationSubject = (level: MonitorEventLevel, message: string): string => {
-  const text = message.toLowerCase();
+const isAppointmentMessage = (category: NotificationCategory): boolean => {
+  return category === "appointment-detected" || category === "appointment-reserved";
+};
 
-  if (text.includes("creneau_potentiel_detecte") || text.includes("element de creneau clique")) {
+const notificationSubject = (category: NotificationCategory): string => {
+  if (category === "appointment-detected") {
     return "[RendezBot] Creneau potentiel detecte";
   }
 
-  if (text.includes("intervention humaine") || text.includes("validation humaine") || text.includes("controle humain")) {
-    return "[RendezBot] Intervention humaine requise";
+  if (category === "appointment-reserved") {
+    return "[RendezBot] Rendez-vous reserve";
   }
 
-  if (level === "error" || text.includes("alerte_utilisateur")) {
-    return "[RendezBot] Alerte bot";
-  }
-
-  return "[RendezBot] Notification";
+  return "[RendezBot] Intervention humaine requise";
 };
 
-const alertType = (level: MonitorEventLevel, message: string): "appointment" | "human" | "system" | "warning" => {
-  const text = message.toLowerCase();
-
-  if (text.includes("creneau_potentiel_detecte") || text.includes("element de creneau clique")) {
+const alertType = (category: NotificationCategory): "appointment" | "human" | "system" | "warning" => {
+  if (category === "appointment-detected" || category === "appointment-reserved") {
     return "appointment";
   }
 
-  if (text.includes("intervention humaine") || text.includes("validation humaine") || text.includes("controle humain")) {
-    return "human";
-  }
-
-  if (level === "error" || text.includes("alerte_utilisateur")) {
-    return "system";
-  }
-
-  return "warning";
+  return "human";
 };
 
 export const notifyAgencyIfNeeded = async ({
@@ -72,7 +92,9 @@ export const notifyAgencyIfNeeded = async ({
   message,
   sessionId
 }: NotificationInput): Promise<void> => {
-  if (!agencyId || !shouldNotify(level, message)) {
+  const category = classifyNotification(message);
+
+  if (!agencyId || !category) {
     return;
   }
 
@@ -81,8 +103,18 @@ export const notifyAgencyIfNeeded = async ({
     return;
   }
 
-  const subject = notificationSubject(level, message);
-  const dedupeKey = `${agencyId}:${subject}:${message}`;
+  if (isAppointmentMessage(category)) {
+    recentAppointmentByAgency.set(agencyId, Date.now());
+  } else {
+    const lastAppointment = recentAppointmentByAgency.get(agencyId) ?? 0;
+    if (Date.now() - lastAppointment < SUPPRESS_AFTER_APPOINTMENT_MS) {
+      return;
+    }
+  }
+
+  const cleanMessage = stripTechnicalNoise(message);
+  const subject = notificationSubject(category);
+  const dedupeKey = `${agencyId}:${subject}:${cleanMessage}`;
   const lastSent = recentNotifications.get(dedupeKey) ?? 0;
   if (Date.now() - lastSent < DEDUPE_MS) {
     return;
@@ -91,9 +123,9 @@ export const notifyAgencyIfNeeded = async ({
   recentNotifications.set(dedupeKey, Date.now());
 
   await sendAppAlert({
-    type: alertType(level, message),
+    type: alertType(category),
     title: subject.replace("[RendezBot] ", ""),
-    message,
+    message: cleanMessage || message,
     userEmail: email,
     data: {
       niveau: level.toUpperCase(),

@@ -32,6 +32,10 @@ export type BotSessionSnapshot = {
   logFile: string;
 };
 
+const isTargetClosedMessage = (message: string): boolean =>
+  /target page, context or browser has been closed|browser has been closed|context has been closed|page has been closed/i.test(message);
+const appointmentPagePattern = /\/workflow\/appointment-booking\//i;
+
 export class BotSession {
   private browser?: Browser;
   private chromeProcess?: ChildProcess;
@@ -112,16 +116,25 @@ export class BotSession {
         waitForUser: (message) => this.waitForUser(message)
       });
 
+      const monitoredPage = await this.waitForAppointmentPage();
       this.setStatus("monitoring");
-      await monitorAppointments(page, config, {
+      await monitorAppointments(monitoredPage, config, {
         log: (level, message) => this.log(level, message),
-        waitForUser: (message) => this.waitForUser(message)
+        waitForUser: (message) => this.waitForUser(message),
+        recoverPage: (preferredUrl) => this.recoverPage(preferredUrl)
       });
 
       this.setStatus("stopped");
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isTargetClosedMessage(message)) {
+        this.log("warn", "Navigateur du bot ferme ou deconnecte. Session arretee.");
+        this.setStatus("stopped");
+        return;
+      }
+
       this.setStatus("error");
-      this.log("error", error instanceof Error ? error.message : String(error));
+      this.log("error", message);
     }
   }
 
@@ -149,6 +162,68 @@ export class BotSession {
     });
 
     await this.waitForChromeDebug();
+  }
+
+  private async recoverPage(preferredUrl?: string): Promise<Page | null> {
+    if (!this.browser?.isConnected()) {
+      return null;
+    }
+
+    const pages = this.browser.contexts()
+      .flatMap((context) => context.pages())
+      .filter((candidate) => {
+        const url = candidate.url();
+        return !candidate.isClosed()
+          && !url.startsWith("devtools://")
+          && !url.startsWith("chrome://")
+          && !url.startsWith("chrome-extension://");
+      });
+
+    const preferredIsAppointment = preferredUrl ? appointmentPagePattern.test(preferredUrl) : false;
+    const appointmentPage = [...pages].reverse().find((candidate) => appointmentPagePattern.test(candidate.url()));
+    const exactPreferredPage = preferredUrl
+      ? [...pages].reverse().find((candidate) => candidate.url() === preferredUrl)
+      : undefined;
+
+    const page = (preferredIsAppointment ? exactPreferredPage : undefined)
+      ?? appointmentPage
+      ?? exactPreferredPage
+      ?? [...pages].reverse().find((candidate) => /tlscontact|vfsglobal/i.test(candidate.url()))
+      ?? [...pages].reverse().find((candidate) => candidate.url() !== "about:blank")
+      ?? pages[0]
+      ?? null;
+
+    if (!page) {
+      return null;
+    }
+
+    page.setDefaultTimeout(8_000);
+    await page.bringToFront().catch(() => undefined);
+    this.page = page;
+    return page;
+  }
+
+  private async waitForAppointmentPage(): Promise<Page> {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const page = await this.recoverPage();
+      if (page && appointmentPagePattern.test(page.url())) {
+        this.log("success", `Onglet rendez-vous selectionne: ${page.url()}`);
+        return page;
+      }
+
+      const currentUrl = page?.url() ?? "aucun onglet";
+      this.log("warn", `Onglet rendez-vous introuvable. Onglet actuel: ${currentUrl}`);
+      await this.waitForUser(
+        "Fermez les onglets/fenetres extra, gardez seulement la page de rendez-vous, puis validez."
+      );
+    }
+
+    const page = await this.recoverPage();
+    if (!page || !appointmentPagePattern.test(page.url())) {
+      throw new Error("Impossible de trouver l'onglet de prise de rendez-vous apres validation.");
+    }
+
+    return page;
   }
 
   private async waitForChromeDebug(): Promise<void> {

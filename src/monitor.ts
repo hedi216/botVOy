@@ -1,16 +1,23 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { Page } from "playwright";
-import { detectAppointmentAvailability, findBestCandidateElement } from "./detectors.js";
+import { detectAppointmentAvailability, findBestCandidateElement, findReserveAppointmentButton } from "./detectors.js";
 import { detectHumanValidation } from "./humanValidation.js";
 import { highlightElement } from "./highlight.js";
 import { logger } from "./logger.js";
 import { takeTimestampedScreenshot } from "./screenshot.js";
 import { AppConfig, MonitorEventLevel, MonitorRuntime } from "./types.js";
 
-const defaultRuntime: Required<MonitorRuntime> = {
+type ResolvedMonitorRuntime = {
+  log: (level: MonitorEventLevel, message: string) => void;
+  waitForUser: (message: string) => Promise<void>;
+  recoverPage: (preferredUrl?: string) => Promise<Page | null>;
+};
+
+const defaultRuntime: ResolvedMonitorRuntime = {
   log: (level: MonitorEventLevel, message: string) => logger[level](message),
-  waitForUser: async (message: string) => askEnter(message)
+  waitForUser: async (message: string) => askEnter(message),
+  recoverPage: async () => null
 };
 
 const askEnter = async (message: string): Promise<void> => {
@@ -22,9 +29,10 @@ const askEnter = async (message: string): Promise<void> => {
   }
 };
 
-const resolveRuntime = (runtime?: MonitorRuntime): Required<MonitorRuntime> => ({
+const resolveRuntime = (runtime?: MonitorRuntime): ResolvedMonitorRuntime => ({
   log: runtime?.log ?? defaultRuntime.log,
-  waitForUser: runtime?.waitForUser ?? defaultRuntime.waitForUser
+  waitForUser: runtime?.waitForUser ?? defaultRuntime.waitForUser,
+  recoverPage: runtime?.recoverPage ?? defaultRuntime.recoverPage
 });
 
 export const waitForUserToStart = async (runtime?: MonitorRuntime): Promise<void> => {
@@ -41,15 +49,44 @@ export const pauseForHuman = async (reason: string, runtime?: MonitorRuntime): P
   await resolved.waitForUser("Validez pour reprendre la surveillance.");
 };
 
-const alertAndStop = (reason: string, runtime: Required<MonitorRuntime>): never => {
+const alertAndStop = (reason: string, runtime: ResolvedMonitorRuntime): never => {
   runtime.log("error", "ALERTE_UTILISATEUR");
   runtime.log("error", reason);
   process.stdout.write("\u0007");
   throw new Error(reason);
 };
 
+const isTargetClosedError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return /target page, context or browser has been closed|browser has been closed|context has been closed|page has been closed/i.test(message);
+};
+
+const recoverAfterTargetClosed = async (
+  runtime: ResolvedMonitorRuntime,
+  preferredUrl?: string
+): Promise<Page | null> => {
+  runtime.log("warn", "Connexion a l'onglet perdue. Tentative de recuperation dans le Chrome client.");
+  const recoveredPage = await runtime.recoverPage(preferredUrl);
+
+  if (!recoveredPage) {
+    runtime.log("warn", "Navigateur du bot ferme ou deconnecte. Redemarrez le bot depuis l'interface.");
+    return null;
+  }
+
+  runtime.log("success", "Onglet du bot recupere. Surveillance reprise.");
+  return recoveredPage;
+};
+
 const safeScreenshot = async (page: Page, prefix: string): Promise<void> => {
+  if (page.isClosed()) {
+    return;
+  }
+
   await takeTimestampedScreenshot(page, prefix).catch((error) => {
+    if (isTargetClosedError(error)) {
+      return;
+    }
+
     logger.warn(`Screenshot impossible: ${error instanceof Error ? error.message : String(error)}`);
   });
 };
@@ -66,7 +103,7 @@ const readVisibleText = async (page: Page, selector: string): Promise<string | n
 
 const detectOnCurrentMonth = async (
   page: Page,
-  runtime: Required<MonitorRuntime>
+  runtime: ResolvedMonitorRuntime
 ): Promise<Awaited<ReturnType<typeof detectAppointmentAvailability>>> => {
   const currentMonth = await readVisibleText(
     page,
@@ -74,6 +111,12 @@ const detectOnCurrentMonth = async (
   );
 
   runtime.log("info", `Mois analyse: ${currentMonth ?? "mois courant visible"}`);
+  const availableSlotCount = await page.locator('button[data-testid="btn-available-slot"], button[class*="AppointmentHour_appointment-hour"]:not([disabled])')
+    .count()
+    .catch(() => 0);
+  if (availableSlotCount > 0) {
+    runtime.log("success", `Slots disponibles DOM: ${availableSlotCount}`);
+  }
   return detectAppointmentAvailability(page);
 };
 
@@ -121,9 +164,13 @@ const detectUnexpectedPageReason = async (page: Page): Promise<string | null> =>
 
 const waitForPageReadyAfterRefresh = async (
   page: Page,
-  runtime: Required<MonitorRuntime>
+  runtime: ResolvedMonitorRuntime
 ): Promise<boolean> => {
   for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (page.isClosed()) {
+      return false;
+    }
+
     runtime.log("info", `Attente post-refresh ${attempt}/3: 10000ms.`);
     await page.waitForTimeout(10_000);
 
@@ -139,7 +186,7 @@ const waitForPageReadyAfterRefresh = async (
 const detectOnAccessibleMonths = async (
   page: Page,
   config: AppConfig,
-  runtime: Required<MonitorRuntime>
+  runtime: ResolvedMonitorRuntime
 ): Promise<Awaited<ReturnType<typeof detectAppointmentAvailability>>> => {
   const maxMonthClicks = config.scanMonthCount === 0 ? 24 : config.scanMonthCount - 1;
   let availability = await detectOnCurrentMonth(page, runtime);
@@ -185,54 +232,131 @@ export const monitorAppointments = async (
   runtime?: MonitorRuntime
 ): Promise<void> => {
   const resolved = resolveRuntime(runtime);
+  let activePage = page;
+  let lastKnownUrl = page.url();
   let attempts = 0;
 
   while (config.maxRefreshAttempts === 0 || attempts < config.maxRefreshAttempts) {
     attempts += 1;
+    lastKnownUrl = activePage.isClosed() ? lastKnownUrl : activePage.url();
     resolved.log("info", `Surveillance tentative ${attempts}.`);
 
-    const validation = await detectHumanValidation(page);
+    const validation = await detectHumanValidation(activePage);
     if (validation.detected) {
-      await takeTimestampedScreenshot(page, "human-validation");
+      await takeTimestampedScreenshot(activePage, "human-validation");
       await pauseForHuman(validation.reason ?? "Validation humaine ou blocage detecte.", resolved);
       continue;
     }
 
-    const availability = await detectOnAccessibleMonths(page, config, resolved);
+    const availability = await detectOnAccessibleMonths(activePage, config, resolved);
     if (availability.detected) {
-      resolved.log("success", "CRENEAU_POTENTIEL_DETECTE");
-      resolved.log("info", `Date/heure: ${availability.dateTimeHint ?? "non determinee"}`);
-      resolved.log("info", `Texte trouve: ${availability.textFound ?? "non determine"}`);
-      await takeTimestampedScreenshot(page, "appointment-detected");
-
-      const candidate = await findBestCandidateElement(page);
+      const candidate = await findBestCandidateElement(activePage);
       if (!candidate) {
-        await pauseForHuman("Creneau potentiel detecte, mais aucun element cliquable fiable trouve.", resolved);
-        return;
+        resolved.log("warn", "Signal de disponibilite ignore: aucun horaire ou bouton cliquable fiable trouve.");
+        resolved.log("info", "AUCUN_CRENEAU_DETECTE");
+        resolved.log("info", "Refresh immediat de la page.");
+        try {
+          await activePage.reload({ waitUntil: "domcontentloaded" });
+          const ready = await waitForPageReadyAfterRefresh(activePage, resolved);
+          if (!ready) {
+            const reason = await detectUnexpectedPageReason(activePage)
+              ?? `La page souhaitee n'est pas revenue apres refresh. URL: ${activePage.url()}`;
+            await safeScreenshot(activePage, "page-not-ready-after-refresh");
+            alertAndStop(reason, resolved);
+          }
+        } catch (error) {
+          if (isTargetClosedError(error)) {
+            const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
+            if (!recovered) {
+              return;
+            }
+            activePage = recovered;
+          } else {
+            const reason = `Refresh impossible ou page instable: ${error instanceof Error ? error.message : String(error)}`;
+            await safeScreenshot(activePage, "reload-error");
+            alertAndStop(reason, resolved);
+          }
+        }
+        continue;
       }
 
-      await highlightElement(page, candidate.locator);
+      resolved.log("success", "CRENEAU_POTENTIEL_DETECTE");
+      resolved.log("info", `Date/heure: ${availability.dateTimeHint ?? candidate.text ?? "non determinee"}`);
+      resolved.log("info", `Texte trouve: ${availability.textFound ?? candidate.text ?? "non determine"}`);
+      await takeTimestampedScreenshot(activePage, "appointment-detected");
+      await highlightElement(activePage, candidate.locator);
       process.stdout.write("\u0007");
-      resolved.log("warn", "Creneau potentiel detecte. Le bot clique l'element surligne puis s'arrete.");
-      await candidate.locator.click();
-      await pauseForHuman("Element de creneau clique automatiquement. Continuez manuellement les etapes suivantes.", resolved);
+      resolved.log("warn", "Creneau potentiel detecte. Tentative de clic automatique sur l'element surligne.");
+      try {
+        await candidate.locator.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
+        await candidate.locator.click({ timeout: 5_000 });
+        resolved.log("info", "Horaire clique automatiquement. Recherche du bouton de reservation.");
+        await activePage.waitForTimeout(800);
+
+        const reserveButton = await findReserveAppointmentButton(activePage);
+        if (!reserveButton) {
+          resolved.log("warn", "Horaire clique, mais bouton 'Reservez votre rendez-vous' introuvable ou inactif.");
+          await resolved.waitForUser("Horaire clique. Cliquez manuellement sur 'Reservez votre rendez-vous', puis validez si vous voulez reprendre.");
+          return;
+        }
+
+        await reserveButton.locator.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
+        await highlightElement(activePage, reserveButton.locator);
+        resolved.log("warn", "Bouton 'Reservez votre rendez-vous' detecte. Tentative de clic automatique.");
+        await reserveButton.locator.click({ timeout: 5_000 });
+        resolved.log("info", "Bouton 'Reservez votre rendez-vous' clique automatiquement. Continuez manuellement les etapes suivantes.");
+        await resolved.waitForUser("Rendez-vous reserve temporairement. Continuez manuellement les etapes suivantes, puis validez si vous voulez reprendre.");
+      } catch {
+        resolved.log("warn", "Creneau detecte, mais le clic automatique n'a pas pu etre confirme. Cliquez manuellement sur l'element surligne.");
+        await resolved.waitForUser("Creneau detecte. Cliquez manuellement sur l'element surligne, puis validez si vous voulez reprendre.");
+      }
       return;
     }
 
     resolved.log("info", "AUCUN_CRENEAU_DETECTE");
     resolved.log("info", "Refresh immediat de la page.");
     try {
-      await page.reload({ waitUntil: "domcontentloaded" });
-      const ready = await waitForPageReadyAfterRefresh(page, resolved);
+      if (activePage.isClosed()) {
+        const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
+        if (!recovered) {
+          return;
+        }
+        activePage = recovered;
+        lastKnownUrl = activePage.url();
+      }
+
+      lastKnownUrl = activePage.url();
+      await activePage.reload({ waitUntil: "domcontentloaded" });
+      const ready = await waitForPageReadyAfterRefresh(activePage, resolved);
       if (!ready) {
-        const reason = await detectUnexpectedPageReason(page)
-          ?? `La page souhaitee n'est pas revenue apres refresh. URL: ${page.url()}`;
-        await safeScreenshot(page, "page-not-ready-after-refresh");
+        if (activePage.isClosed()) {
+          const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
+          if (!recovered) {
+            return;
+          }
+          activePage = recovered;
+          lastKnownUrl = activePage.url();
+          continue;
+        }
+
+        const reason = await detectUnexpectedPageReason(activePage)
+          ?? `La page souhaitee n'est pas revenue apres refresh. URL: ${activePage.url()}`;
+        await safeScreenshot(activePage, "page-not-ready-after-refresh");
         alertAndStop(reason, resolved);
       }
     } catch (error) {
+      if (isTargetClosedError(error)) {
+        const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
+        if (!recovered) {
+          return;
+        }
+        activePage = recovered;
+        lastKnownUrl = activePage.url();
+        continue;
+      }
+
       const reason = `Refresh impossible ou page instable: ${error instanceof Error ? error.message : String(error)}`;
-      await safeScreenshot(page, "reload-error");
+      await safeScreenshot(activePage, "reload-error");
       alertAndStop(reason, resolved);
     }
 

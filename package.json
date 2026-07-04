@@ -8,6 +8,7 @@
     "web:dev": "tsx src/server.ts",
     "db:init": "tsx src/initDb.ts",
     "build": "tsc",
+    "package:win": "powershell -ExecutionPolicy Bypass -File scripts/package-win.ps1",
     "start": "node dist/index.js",
     "web:start": "node dist/server.js",
     "playwright:install": "playwright install chromium"

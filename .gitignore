@@ -1,6 +1,7 @@
 node_modules/
 dist/
 artifacts/
+release/
 .env
 .browser-profile/
 .chrome-user/

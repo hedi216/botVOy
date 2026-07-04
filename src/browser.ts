@@ -7,6 +7,8 @@ export type BrowserSession = {
   page: Page;
 };
 
+const appointmentPagePattern = /\/workflow\/appointment-booking\//i;
+
 export const launchBrowser = async (config: AppConfig): Promise<BrowserSession> => {
   if (config.connectToExistingChrome) {
     logger.info(`Connexion au Chrome deja ouvert: ${config.chromeDebugUrl}`);
@@ -19,7 +21,8 @@ export const launchBrowser = async (config: AppConfig): Promise<BrowserSession> 
         && !url.startsWith("chrome://")
         && !url.startsWith("chrome-extension://");
     });
-    const page = [...usablePages].reverse().find((candidate) => candidate.url() !== "about:blank")
+    const page = [...usablePages].reverse().find((candidate) => appointmentPagePattern.test(candidate.url()))
+      ?? [...usablePages].reverse().find((candidate) => candidate.url() !== "about:blank")
       ?? usablePages[0]
       ?? await context.newPage();
 

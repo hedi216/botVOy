@@ -1,4 +1,4 @@
-import { Locator } from "playwright";
+import { Locator, Page } from "playwright";
 
 export type AppConfig = {
   targetUrl: string;
@@ -33,4 +33,5 @@ export type MonitorEventLevel = "info" | "warn" | "error" | "success";
 export type MonitorRuntime = {
   log?: (level: MonitorEventLevel, message: string) => void;
   waitForUser?: (message: string) => Promise<void>;
+  recoverPage?: (preferredUrl?: string) => Promise<Page | null>;
 };

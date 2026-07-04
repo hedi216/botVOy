@@ -411,6 +411,8 @@ els.loginForm.addEventListener("submit", async (event) => {
       })
     });
     setAuthenticated(user);
+    socket.disconnect();
+    socket.connect();
     await showPage("dashboard");
   } catch (error) {
     els.loginError.textContent = error.message;
@@ -580,6 +582,12 @@ els.passwordForm.addEventListener("submit", async (event) => {
 els.startBot.addEventListener("click", () => {
   els.startBot.disabled = true;
   els.stopBot.disabled = false;
+  state.logs = [];
+  renderLogs();
+  setPrompt("", false);
+  els.chromePort.textContent = "-";
+  els.dashboardChromePort.textContent = "-";
+  els.logFile.textContent = "-";
   updateBotStatus("demarrage");
   socket.emit("start-bot");
 });
