@@ -27,3 +27,10 @@ export type CandidateElementResult = {
   locator: Locator;
   text: string;
 };
+
+export type MonitorEventLevel = "info" | "warn" | "error" | "success";
+
+export type MonitorRuntime = {
+  log?: (level: MonitorEventLevel, message: string) => void;
+  waitForUser?: (message: string) => Promise<void>;
+};

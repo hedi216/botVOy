@@ -5,8 +5,11 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "web:dev": "tsx src/server.ts",
+    "db:init": "tsx src/initDb.ts",
     "build": "tsc",
     "start": "node dist/index.js",
+    "web:start": "node dist/server.js",
     "playwright:install": "playwright install chromium"
   },
   "keywords": [
@@ -17,11 +20,18 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "cookie-parser": "^1.4.7",
     "dotenv": "^16.4.7",
-    "playwright": "^1.49.1"
+    "express": "^5.2.1",
+    "pg": "^8.22.0",
+    "playwright": "^1.49.1",
+    "socket.io": "^4.8.3"
   },
   "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.10.2",
+    "@types/pg": "^8.20.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

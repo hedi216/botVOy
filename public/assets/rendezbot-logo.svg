@@ -1,0 +1,40 @@
+<svg width="520" height="420" viewBox="0 0 520 420" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">RendezBot</title>
+  <desc id="desc">Logo RendezBot avec robot calendrier et texte RendezBot.</desc>
+  <defs>
+    <linearGradient id="outline" x1="112" y1="70" x2="408" y2="300" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0E66C7"/>
+      <stop offset="1" stop-color="#12C8A9"/>
+    </linearGradient>
+    <linearGradient id="teal" x1="310" y1="190" x2="398" y2="278" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#12C8A9"/>
+      <stop offset="1" stop-color="#0EA89B"/>
+    </linearGradient>
+    <linearGradient id="botText" x1="70" y1="350" x2="445" y2="350" gradientUnits="userSpaceOnUse">
+      <stop offset="0.58" stop-color="#06264A"/>
+      <stop offset="0.581" stop-color="#08B7A8"/>
+      <stop offset="1" stop-color="#08B7A8"/>
+    </linearGradient>
+    <filter id="softShadow" x="82" y="34" width="356" height="300" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#06264A" flood-opacity="0.12"/>
+    </filter>
+  </defs>
+  <g filter="url(#softShadow)">
+    <path d="M262 66V96" stroke="url(#outline)" stroke-width="13" stroke-linecap="round"/>
+    <circle cx="262" cy="52" r="19" fill="#09B9AA"/>
+    <path d="M121 165C121 125.788 152.788 94 192 94H329C368.212 94 400 125.788 400 165V225C400 264.212 368.212 296 329 296H230L173 336L178 296C146.166 289.288 121 260.184 121 225V165Z" fill="white" stroke="url(#outline)" stroke-width="14" stroke-linejoin="round"/>
+    <rect x="178" y="127" width="165" height="62" rx="28" fill="#06264A"/>
+    <circle cx="211" cy="158" r="18" fill="#12C8A9"/>
+    <circle cx="310" cy="158" r="18" fill="#12C8A9"/>
+    <path d="M249 179C255 187 267 187 273 179" stroke="white" stroke-width="9" stroke-linecap="round"/>
+    <rect x="178" y="220" width="24" height="24" rx="5" fill="#CBD3DB"/>
+    <rect x="221" y="220" width="24" height="24" rx="5" fill="#CBD3DB"/>
+    <rect x="264" y="220" width="24" height="24" rx="5" fill="#CBD3DB"/>
+    <rect x="178" y="263" width="24" height="24" rx="5" fill="#CBD3DB"/>
+    <rect x="221" y="263" width="24" height="24" rx="5" fill="#CBD3DB"/>
+    <rect x="264" y="263" width="24" height="24" rx="5" fill="#CBD3DB"/>
+    <rect x="321" y="220" width="70" height="68" rx="13" fill="url(#teal)"/>
+    <path d="M340 252L357 269L377 238" stroke="white" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="67" y="392" font-family="Arial, Helvetica, sans-serif" font-size="58" font-weight="800" fill="url(#botText)">RendezBot</text>
+</svg>

@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RendezBot</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <section class="login-screen" id="loginScreen">
+      <form id="loginForm" class="login-card">
+        <div class="brand-row">
+          <img class="login-logo" src="/assets/rendezbot-logo.svg" alt="RendezBot">
+          <div>
+            <h1>RendezBot</h1>
+            <p>Console locale</p>
+          </div>
+        </div>
+
+        <label>
+          Login
+          <input id="loginInput" name="login" autocomplete="username" required>
+        </label>
+
+        <label>
+          Mot de passe
+          <input id="passwordInput" name="password" type="password" autocomplete="current-password" required>
+        </label>
+
+        <button class="primary full" type="submit">Se connecter</button>
+        <p id="loginError" class="form-error"></p>
+        <p class="login-note">Authentification locale MVP. Le compte se desactive apres 3 erreurs.</p>
+      </form>
+    </section>
+
+    <main class="app-layout" id="appLayout" hidden>
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <img class="sidebar-logo" src="/assets/rendezbot-logo.svg" alt="RendezBot">
+          <div>
+            <strong>RendezBot</strong>
+            <span>Monitoring</span>
+          </div>
+        </div>
+
+        <nav class="sidebar-nav">
+          <p>SURVEILLANCE</p>
+          <button class="nav-item active" data-page-target="dashboard">Dashboard</button>
+          <button class="nav-item" data-page-target="bot">Bot</button>
+          <button class="nav-item" data-page-target="logs">Logs</button>
+          <button class="nav-item" data-page-target="maintenance">Maintenance</button>
+
+          <p class="admin-nav" hidden>ADMINISTRATION</p>
+          <button class="nav-item admin-nav" data-page-target="users" hidden>Utilisateurs</button>
+          <button class="nav-item admin-only" data-page-target="agencies" hidden>Agences</button>
+
+          <p>COMPTE</p>
+          <button class="nav-item" data-page-target="profile">Profil</button>
+        </nav>
+
+        <button id="sidebarLogout" class="logout-link">Deconnexion</button>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <h1 id="pageTitle">Dashboard</h1>
+            <p id="pageSubtitle">Vue rapide de la surveillance locale.</p>
+          </div>
+
+          <div class="account-menu">
+            <button id="accountButton" class="avatar-button" type="button">
+              <span id="avatarInitial">U</span>
+              <span class="chevron">⌄</span>
+            </button>
+            <div id="accountDropdown" class="account-dropdown" hidden>
+              <span class="muted-label">Connecte en tant que</span>
+              <strong id="accountName">Utilisateur</strong>
+              <span id="accountLogin"></span>
+              <span id="accountLevel" class="pill blue">Niveau 2</span>
+              <button data-page-target="profile">Profil</button>
+              <button id="dropdownLogout" class="danger-link">Deconnexion</button>
+            </div>
+          </div>
+        </header>
+
+        <section class="content">
+          <section class="page active" id="page-dashboard">
+            <div class="metric-grid">
+              <article class="metric">
+                <span>Statut bot</span>
+                <strong id="dashboardStatus">Pret</strong>
+              </article>
+              <article class="metric">
+                <span>Port Chrome</span>
+                <strong id="dashboardChromePort">-</strong>
+              </article>
+              <article class="metric">
+                <span>Sessions actives</span>
+                <strong id="dashboardActiveCount">0 / -</strong>
+              </article>
+            </div>
+
+            <section class="panel-section">
+              <div>
+                <h2>Action utilisateur</h2>
+                <p id="dashboardPromptText" class="quiet">Aucune action en attente.</p>
+              </div>
+              <button id="dashboardContinue" class="primary" disabled>Valider / continuer</button>
+            </section>
+
+            <section class="panel-section">
+              <div>
+                <h2>Derniers logs</h2>
+                <p class="quiet">Les evenements importants du bot apparaissent ici.</p>
+              </div>
+              <ol id="dashboardLogList" class="compact-log-list"></ol>
+            </section>
+          </section>
+
+          <section class="page" id="page-bot">
+            <section class="panel-section bot-control">
+              <div>
+                <h2>Controle du bot</h2>
+                <p class="quiet">Lance un Chrome dedie au client, puis valide ici quand la page de rendez-vous est prete.</p>
+              </div>
+              <div class="button-row">
+                <button id="startBot" class="primary">Demarrer le bot</button>
+                <button id="continueBot" disabled>Valider / continuer</button>
+                <button id="stopBot" class="danger" disabled>Arreter</button>
+              </div>
+            </section>
+
+            <div class="metric-grid">
+              <article class="metric">
+                <span>Statut</span>
+                <strong id="status">Pret</strong>
+              </article>
+              <article class="metric">
+                <span>Port Chrome</span>
+                <strong id="chromePort">-</strong>
+              </article>
+              <article class="metric">
+                <span>Fichier log</span>
+                <strong id="logFile">-</strong>
+              </article>
+            </div>
+
+            <section class="prompt-panel" id="promptBox" hidden>
+              <div>
+                <span class="muted-label">Action utilisateur</span>
+                <p id="promptText"></p>
+              </div>
+              <button id="promptContinue" class="primary" disabled>Valider</button>
+            </section>
+          </section>
+
+          <section class="page" id="page-logs">
+            <section class="table-panel">
+              <div class="panel-header">
+                <div>
+                  <h2>Logs importants</h2>
+                  <p>Alertes, erreurs, validations et etapes du bot.</p>
+                </div>
+                <button id="clearLogs">Effacer</button>
+              </div>
+              <ol id="logList" class="log-list"></ol>
+            </section>
+          </section>
+
+          <section class="page" id="page-maintenance">
+            <div class="metric-grid">
+              <article class="metric">
+                <span>Serveur PID</span>
+                <strong id="serverPid">-</strong>
+              </article>
+              <article class="metric">
+                <span>Port interface</span>
+                <strong id="serverPort">-</strong>
+              </article>
+              <article class="metric">
+                <span>Clients actifs</span>
+                <strong id="activeCount">0 / -</strong>
+              </article>
+            </div>
+
+            <section class="panel-section">
+              <div>
+                <h2>Navigateurs clients</h2>
+                <p class="quiet">Arret possible depuis l'interface quand une session reste ouverte.</p>
+              </div>
+              <div class="button-row">
+                <button id="stopAllSessions" class="danger">Arreter les navigateurs</button>
+                <button id="shutdownServer" class="danger">Arreter ce serveur</button>
+              </div>
+            </section>
+            <ol id="sessionList" class="session-list"></ol>
+          </section>
+
+          <section class="page" id="page-users">
+            <section id="passwordNotice" class="password-notice" hidden>
+              <strong id="passwordNoticeTitle">Utilisateur cree.</strong>
+              <p>Mot de passe temporaire : <code id="temporaryPassword"></code></p>
+              <span>Copiez-le maintenant, il ne sera plus affiche.</span>
+              <div class="button-row">
+                <button id="copyPassword">Copier</button>
+                <button id="dismissPasswordNotice">Fermer</button>
+              </div>
+            </section>
+
+            <section class="form-panel">
+              <h2>Ajouter un utilisateur</h2>
+              <p>Le mot de passe temporaire est genere automatiquement. Les nouveaux comptes sont actifs par defaut.</p>
+              <form id="userForm" class="create-user-form">
+                <label>
+                  Login
+                  <input id="userLogin" placeholder="prenom.nom" required>
+                </label>
+                <label>
+                  Nom affiche
+                  <input id="userName" placeholder="Nom utilisateur" required>
+                </label>
+                <label id="userAgencyLabel">
+                  Agence
+                  <select id="userAgency"></select>
+                </label>
+                <label>
+                  Niveau
+                  <select id="userRole">
+                    <option value="2">Niveau 2 - bot seulement</option>
+                    <option value="1">Niveau 1 - gestion agence</option>
+                  </select>
+                </label>
+                <button class="primary" type="submit">Creer utilisateur</button>
+              </form>
+            </section>
+
+            <input id="userSearch" class="search-input" placeholder="Rechercher par login, nom, niveau ou statut...">
+
+            <section class="table-panel">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Login</th>
+                    <th>Nom</th>
+                    <th>Niveau</th>
+                    <th>Statut</th>
+                    <th>Dernier login</th>
+                    <th>Creation</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="userTableBody"></tbody>
+              </table>
+            </section>
+          </section>
+
+          <section class="page" id="page-agencies">
+            <section class="form-panel">
+              <h2>Ajouter une agence</h2>
+              <form id="agencyForm" class="agency-form">
+                <label>
+                  Nom agence
+                  <input id="agencyName" required>
+                </label>
+                <label>
+                  Clients actifs max
+                  <input id="agencyLimit" type="number" min="1" max="15" value="15">
+                </label>
+                <button class="primary" type="submit">Ajouter</button>
+              </form>
+            </section>
+
+            <section class="table-panel">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Agence</th>
+                    <th>Utilisateurs actifs</th>
+                    <th>Limite</th>
+                    <th>Statut</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="agencyTableBody"></tbody>
+              </table>
+            </section>
+          </section>
+
+          <section class="page" id="page-profile">
+            <section class="profile-card">
+              <div class="profile-head">
+                <span id="profileInitial" class="profile-avatar">U</span>
+                <div>
+                  <h2 id="profileName">Utilisateur</h2>
+                  <p id="profileLogin">-</p>
+                </div>
+              </div>
+              <dl class="profile-grid">
+                <div><dt>Login</dt><dd id="profileLoginValue">-</dd></div>
+                <div><dt>Niveau</dt><dd id="profileRole">-</dd></div>
+                <div><dt>Statut</dt><dd id="profileStatus">-</dd></div>
+                <div><dt>Dernier login</dt><dd id="profileLastLogin">-</dd></div>
+                <div><dt>Creation</dt><dd id="profileCreated">-</dd></div>
+              </dl>
+            </section>
+
+            <section class="form-panel narrow">
+              <h2>Changer le mot de passe</h2>
+              <form id="passwordForm" class="password-form">
+                <label>
+                  Mot de passe actuel
+                  <input id="currentPassword" type="password" autocomplete="current-password" required>
+                </label>
+                <label>
+                  Nouveau mot de passe
+                  <input id="newPassword" type="password" autocomplete="new-password" required>
+                </label>
+                <label>
+                  Confirmer
+                  <input id="confirmPassword" type="password" autocomplete="new-password" required>
+                </label>
+                <button class="primary" type="submit">Changer le mot de passe</button>
+                <p id="passwordMessage" class="form-message"></p>
+              </form>
+            </section>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
