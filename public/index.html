@@ -125,6 +125,15 @@
                 <p class="quiet">Lance un Chrome dedie au client, puis valide ici quand la page de rendez-vous est prete.</p>
               </div>
               <div class="button-row">
+                <label class="bot-session-field">
+                  Bot actif
+                  <select id="botSelector"></select>
+                </label>
+                <label class="bot-name-field">
+                  Nom du bot
+                  <input id="botName" placeholder="Client 1">
+                </label>
+                <span class="bot-quota">Clients actifs <strong id="botActiveCount">0 / -</strong></span>
                 <button id="startBot" class="primary">Demarrer le bot</button>
                 <button id="continueBot" disabled>Valider / continuer</button>
                 <button id="stopBot" class="danger" disabled>Arreter</button>

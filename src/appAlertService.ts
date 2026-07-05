@@ -22,7 +22,7 @@ const subjectForType = (type: SendAppAlertInput["type"], title: string): string 
   }
 
   if (type === "appointment") {
-    return `[RendezBot] Nouveau rendez-vous detecte`;
+    return `[RendezBot] ${title}`;
   }
 
   if (type === "system") {
@@ -30,7 +30,7 @@ const subjectForType = (type: SendAppAlertInput["type"], title: string): string 
   }
 
   if (type === "human") {
-    return `[RendezBot] Intervention humaine requise`;
+    return `[RendezBot] ${title}`;
   }
 
   return `[RendezBot] ${title}`;

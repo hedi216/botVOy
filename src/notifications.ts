@@ -7,6 +7,7 @@ type NotificationInput = {
   level: MonitorEventLevel;
   message: string;
   sessionId?: string;
+  botName?: string;
 };
 
 const recentNotifications = new Map<string, number>();
@@ -83,11 +84,41 @@ const alertType = (category: NotificationCategory): "appointment" | "human" | "s
   return "human";
 };
 
+const notificationTitle = (category: NotificationCategory, botName?: string): string => {
+  const suffix = botName ? ` - ${botName}` : "";
+  if (category === "appointment-detected") {
+    return `Creneau potentiel detecte${suffix}`;
+  }
+
+  if (category === "appointment-reserved") {
+    return `Rendez-vous reserve${suffix}`;
+  }
+
+  return `Action requise${suffix}`;
+};
+
+const notificationMessage = (category: NotificationCategory, message: string, botName?: string): string => {
+  if (!botName) {
+    return message;
+  }
+
+  if (category === "human-blocked") {
+    return `Action recommandee pour le bot "${botName}":\n${message}`;
+  }
+
+  if (category === "appointment-detected") {
+    return `Creneau potentiel detecte pour le bot "${botName}".\n${message}`;
+  }
+
+  return `Rendez-vous reserve temporairement pour le bot "${botName}".\n${message}`;
+};
+
 export const notifyAgencyIfNeeded = async ({
   agencyId,
   level,
   message,
-  sessionId
+  sessionId,
+  botName
 }: NotificationInput): Promise<void> => {
   const category = classifyNotification(message);
 
@@ -110,7 +141,9 @@ export const notifyAgencyIfNeeded = async ({
   }
 
   const cleanMessage = stripTechnicalNoise(message);
-  const subject = notificationSubject(category);
+  const subject = botName
+    ? `${notificationSubject(category)} - ${botName}`
+    : notificationSubject(category);
   const dedupeKey = `${agencyId}:${subject}:${cleanMessage}`;
   const lastSent = recentNotifications.get(dedupeKey) ?? 0;
   if (Date.now() - lastSent < DEDUPE_MS) {
@@ -121,11 +154,12 @@ export const notifyAgencyIfNeeded = async ({
 
   await sendAppAlert({
     type: alertType(category),
-    title: subject.replace("[RendezBot] ", ""),
-    message: cleanMessage || message,
+    title: notificationTitle(category, botName),
+    message: notificationMessage(category, cleanMessage || message, botName),
     userEmail: email,
     data: {
       niveau: level.toUpperCase(),
+      bot: botName ?? "non nomme",
       session: sessionId ?? "non determinee",
       date: new Date().toLocaleString("fr-FR")
     }

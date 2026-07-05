@@ -26,6 +26,7 @@ type SessionCallbacks = {
 
 export type BotSessionSnapshot = {
   id: string;
+  name: string;
   port: number;
   status: SessionStatus;
   profileDir: string;
@@ -42,10 +43,12 @@ export class BotSession {
   private page?: Page;
   private pendingContinue?: () => void;
   private status: SessionStatus = "created";
+  private stopRequested = false;
   private logStream: WriteStream;
 
   constructor(
     private readonly id: string,
+    private readonly name: string,
     private readonly port: number,
     private readonly profileDir: string,
     private readonly callbacks: SessionCallbacks
@@ -61,6 +64,7 @@ export class BotSession {
   snapshot(): BotSessionSnapshot {
     return {
       id: this.id,
+      name: this.name,
       port: this.port,
       status: this.status,
       profileDir: this.profileDir,
@@ -85,6 +89,7 @@ export class BotSession {
   }
 
   async stop(): Promise<void> {
+    this.stopRequested = true;
     this.setStatus("stopped");
     await this.browser?.close().catch(() => undefined);
     this.chromeProcess?.kill();
@@ -107,6 +112,14 @@ export class BotSession {
     const { browser, page } = await launchBrowser(config);
     this.browser = browser;
     this.page = page;
+    this.browser.on("disconnected", () => {
+      if (!this.stopRequested && this.isActive()) {
+        this.log("warn", "Navigateur du bot ferme ou deconnecte. Session arretee.");
+        this.pendingContinue?.();
+        this.pendingContinue = undefined;
+        this.setStatus("stopped");
+      }
+    });
     this.log("success", `Chrome client demarre sur le port ${this.port}.`);
 
     try {
@@ -126,6 +139,10 @@ export class BotSession {
 
       this.setStatus("stopped");
     } catch (error) {
+      if (!this.isActive()) {
+        return;
+      }
+
       const message = error instanceof Error ? error.message : String(error);
       if (isTargetClosedMessage(message)) {
         this.log("warn", "Navigateur du bot ferme ou deconnecte. Session arretee.");
@@ -159,6 +176,11 @@ export class BotSession {
 
     this.chromeProcess.once("exit", (code) => {
       this.log("warn", `Process Chrome termine avec code ${code ?? "inconnu"}.`);
+      if (!this.stopRequested && this.isActive()) {
+        this.pendingContinue?.();
+        this.pendingContinue = undefined;
+        this.setStatus("stopped");
+      }
     });
 
     await this.waitForChromeDebug();
@@ -250,6 +272,10 @@ export class BotSession {
   }
 
   private setStatus(status: SessionStatus): void {
+    if (this.status === status) {
+      return;
+    }
+
     this.status = status;
     this.callbacks.onStatus(status);
   }
@@ -283,10 +309,11 @@ const getFreePort = async (): Promise<number> => new Promise((resolve, reject) =
   });
 });
 
-export const createBotSession = async (callbacks: SessionCallbacks): Promise<BotSession> => {
+export const createBotSession = async (callbacks: SessionCallbacks, displayName?: string): Promise<BotSession> => {
   const id = `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const name = displayName?.trim() || id;
   const port = await getFreePort();
   const profileDir = path.join(process.cwd(), "artifacts", "chrome-profiles", id);
 
-  return new BotSession(id, port, profileDir, callbacks);
+  return new BotSession(id, name, port, profileDir, callbacks);
 };

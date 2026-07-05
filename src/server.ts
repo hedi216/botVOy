@@ -28,6 +28,7 @@ import { sendAppAlert } from "./appAlertService.js";
 type SessionOwner = {
   userId: number;
   agencyId: number | null;
+  botName: string;
 };
 
 type StoredLog = {
@@ -44,6 +45,7 @@ const maxClients = Number(process.env.MAX_CLIENTS_PER_VM ?? 15);
 const sessions = new Map<string, BotSession>();
 const sessionOwners = new Map<string, SessionOwner>();
 const socketUsers = new Map<string, DbUser>();
+const selectedSessionBySocket = new Map<string, string>();
 const activePrompts = new Map<string, { message: string; owner: SessionOwner }>();
 const logHistory: StoredLog[] = [];
 let currentPort = preferredPort;
@@ -218,15 +220,39 @@ const cleanupServerLock = (): void => {
   }
 };
 
-const sessionSnapshots = () => [...sessions.values()].map((session) => session.snapshot());
+const sessionSnapshotsForUser = (user?: DbUser | null) => [...sessions.entries()]
+  .filter(([sessionKey]) => {
+    const owner = sessionOwners.get(sessionKey);
+    return owner && (!user || canSeeOwner(user, owner));
+  })
+  .map(([sessionKey, session]) => ({
+    ...session.snapshot(),
+    hasPrompt: activePrompts.has(sessionKey),
+    promptMessage: activePrompts.get(sessionKey)?.message ?? ""
+  }));
 
-const emitMaintenance = (): void => {
-  io.emit("maintenance", {
+const countAgencySessions = (agencyId: number | null): number =>
+  [...sessionOwners.values()].filter((owner) => owner.agencyId === agencyId).length;
+
+const emitMaintenanceToSocket = async (socket: Socket, user?: DbUser | null): Promise<void> => {
+  const agency = user?.agency_id ? await getAgency(user.agency_id).catch(() => null) : null;
+  const agencyActiveCount = user?.agency_id ? countAgencySessions(user.agency_id) : sessions.size;
+  const agencyMaxClients = agency?.max_active_clients ?? maxClients;
+
+  socket.emit("maintenance", {
     pid: process.pid,
     port: currentPort,
     maxClients,
-    activeSessions: sessionSnapshots()
+    agencyActiveCount,
+    agencyMaxClients,
+    activeSessions: sessionSnapshotsForUser(user)
   });
+};
+
+const emitMaintenance = (): void => {
+  for (const [socketId, socket] of io.sockets.sockets) {
+    void emitMaintenanceToSocket(socket, socketUsers.get(socketId));
+  }
 };
 
 const getUserFromSocket = (socket: Socket): DbUser | null => {
@@ -250,24 +276,30 @@ const emitLogToAuthorizedSockets = (owner: SessionOwner, event: SessionEvent): v
   }
 };
 
-const emitPromptToAuthorizedSockets = (owner: SessionOwner, message: string): void => {
+const emitPromptToAuthorizedSockets = (owner: SessionOwner, message: string, sessionKey: string): void => {
   for (const [socketId, socket] of io.sockets.sockets) {
     const user = socketUsers.get(socketId);
     if (user && canSeeOwner(user, owner)) {
-      socket.emit("bot-prompt", { message });
+      socket.emit("bot-prompt", { sessionId: sessionKey, botName: owner.botName, message });
     }
   }
 };
 
 const recordLog = (owner: SessionOwner, event: SessionEvent, sessionKey: string): void => {
-  logHistory.unshift({ event, owner, sessionKey });
+  const visibleEvent = {
+    ...event,
+    message: `[${owner.botName}] ${event.message}`
+  };
+
+  logHistory.unshift({ event: visibleEvent, owner, sessionKey });
   logHistory.splice(300);
-  emitLogToAuthorizedSockets(owner, event);
+  emitLogToAuthorizedSockets(owner, visibleEvent);
   void notifyAgencyIfNeeded({
     agencyId: owner.agencyId,
     level: event.level,
     message: event.message,
-    sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey
+    sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey,
+    botName: owner.botName
   });
 };
 
@@ -287,9 +319,10 @@ const makeEvent = (level: SessionEvent["level"], message: string): SessionEvent 
 });
 
 const findSessionForSocket = (socketId: string): [string, BotSession] | undefined => {
-  const direct = sessions.get(socketId);
-  if (direct) {
-    return [socketId, direct];
+  const selectedSessionKey = selectedSessionBySocket.get(socketId);
+  const selectedSession = selectedSessionKey ? sessions.get(selectedSessionKey) : undefined;
+  if (selectedSession) {
+    return [selectedSessionKey!, selectedSession];
   }
 
   const user = socketUsers.get(socketId);
@@ -297,7 +330,10 @@ const findSessionForSocket = (socketId: string): [string, BotSession] | undefine
     return undefined;
   }
 
-  const match = [...sessionOwners.entries()].find(([, owner]) => canSeeOwner(user, owner));
+  const match = [...sessionOwners.entries()].find(([sessionKey, owner]) => {
+    const session = sessions.get(sessionKey);
+    return Boolean(session) && canSeeOwner(user, owner);
+  });
   if (!match) {
     return undefined;
   }
@@ -323,14 +359,18 @@ io.on("connection", (socket) => {
         if (session) {
           socket.emit("bot-session", session.snapshot());
         }
-        socket.emit("bot-prompt", { message: prompt.message });
+        socket.emit("bot-prompt", {
+          sessionId: sessionKey,
+          botName: prompt.owner.botName,
+          message: prompt.message
+        });
       }
     }
   }
 
-  emitMaintenance();
+  void emitMaintenanceToSocket(socket, connectedUser);
 
-  socket.on("start-bot", async () => {
+  socket.on("start-bot", async (payload?: { botName?: string }) => {
     const user = socketUsers.get(socket.id) ?? getUserFromSocket(socket);
     if (!user) {
       socket.emit("bot-log", makeEvent("error", "Connexion utilisateur requise pour demarrer un bot."));
@@ -338,7 +378,9 @@ io.on("connection", (socket) => {
     }
 
     socketUsers.set(socket.id, user);
-    const owner: SessionOwner = { userId: user.id, agencyId: user.agency_id };
+    const fallbackBotNumber = user.agency_id ? countAgencySessions(user.agency_id) + 1 : sessions.size + 1;
+    const botName = payload?.botName?.trim() || `Bot ${fallbackBotNumber}`;
+    const owner: SessionOwner = { userId: user.id, agencyId: user.agency_id, botName };
 
     if (user.role !== 0) {
       if (!user.agency_id) {
@@ -360,12 +402,6 @@ io.on("connection", (socket) => {
       }
     }
 
-    const currentSession = findSessionForSocket(socket.id);
-    if (currentSession?.[1].isActive()) {
-      emitOwnedLog(socket, owner, makeEvent("warn", "Un bot est deja actif pour cette interface."));
-      return;
-    }
-
     const activeCount = [...sessions.values()].filter((session) => session.isActive()).length;
     if (activeCount >= maxClients) {
       socket.emit("bot-status", { status: "error" });
@@ -373,62 +409,128 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const sessionKey = socket.id;
+    let sessionKey = "";
     const session = await createBotSession({
       onLog: (event) => recordLog(owner, event, sessionKey),
       onPrompt: (message) => {
         activePrompts.set(sessionKey, { message, owner });
-        emitPromptToAuthorizedSockets(owner, message);
+        selectedSessionBySocket.set(socket.id, sessionKey);
+        emitPromptToAuthorizedSockets(owner, message, sessionKey);
         void notifyAgencyIfNeeded({
           agencyId: owner.agencyId,
           level: "warn",
           message,
-          sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey
+          sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey,
+          botName: owner.botName
         });
       },
       onStatus: (status) => {
         for (const [socketId, connectedSocket] of io.sockets.sockets) {
           const socketUser = socketUsers.get(socketId);
-          if (socketUser && canSeeOwner(socketUser, owner)) {
-            connectedSocket.emit("bot-status", { status });
+          if (socketUser && canSeeOwner(socketUser, owner) && selectedSessionBySocket.get(socketId) === sessionKey) {
+            connectedSocket.emit("bot-status", { sessionId: sessionKey, botName: owner.botName, status });
           }
         }
         if (status === "stopped" || status === "error") {
           sessions.delete(sessionKey);
           sessionOwners.delete(sessionKey);
+          selectedSessionBySocket.delete(socket.id);
           activePrompts.delete(sessionKey);
           emitMaintenance();
         }
       }
-    });
+    }, botName);
 
+    sessionKey = session.snapshot().id;
     sessions.set(sessionKey, session);
     sessionOwners.set(sessionKey, owner);
+    selectedSessionBySocket.set(socket.id, sessionKey);
     socket.emit("bot-session", session.snapshot());
     emitMaintenance();
     void session.start();
   });
 
-  socket.on("continue-bot", () => {
-    const match = findSessionForSocket(socket.id);
+  socket.on("select-session", ({ sessionId }: { sessionId?: string }) => {
+    if (!sessionId) {
+      return;
+    }
+
+    const user = socketUsers.get(socket.id);
+    const owner = sessionOwners.get(sessionId);
+    const session = sessions.get(sessionId);
+    if (!user || !owner || !session || !canSeeOwner(user, owner)) {
+      return;
+    }
+
+    selectedSessionBySocket.set(socket.id, sessionId);
+    socket.emit("bot-session", session.snapshot());
+    const prompt = activePrompts.get(sessionId);
+    if (prompt) {
+      socket.emit("bot-prompt", { sessionId, botName: owner.botName, message: prompt.message });
+    } else {
+      socket.emit("bot-prompt", { sessionId, botName: owner.botName, message: "" });
+    }
+  });
+
+  socket.on("continue-bot", ({ sessionId }: { sessionId?: string } = {}) => {
+    const match = sessionId && sessions.has(sessionId) ? [sessionId, sessions.get(sessionId)!] as [string, BotSession] : findSessionForSocket(socket.id);
     if (!match) {
       return;
     }
 
+    const user = socketUsers.get(socket.id);
+    const owner = sessionOwners.get(match[0]);
+    if (!user || !owner || !canSeeOwner(user, owner)) {
+      return;
+    }
+
+    selectedSessionBySocket.set(socket.id, match[0]);
     activePrompts.delete(match[0]);
     match[1].continue();
+    emitMaintenance();
   });
 
-  socket.on("stop-bot", async () => {
-    const match = findSessionForSocket(socket.id);
+  socket.on("stop-bot", async ({ sessionId }: { sessionId?: string } = {}) => {
+    const match = sessionId && sessions.has(sessionId) ? [sessionId, sessions.get(sessionId)!] as [string, BotSession] : findSessionForSocket(socket.id);
     if (!match) {
+      return;
+    }
+
+    const user = socketUsers.get(socket.id);
+    const owner = sessionOwners.get(match[0]);
+    if (!user || !owner || !canSeeOwner(user, owner)) {
       return;
     }
 
     await match[1].stop();
     sessions.delete(match[0]);
     sessionOwners.delete(match[0]);
+    selectedSessionBySocket.delete(socket.id);
     activePrompts.delete(match[0]);
+    emitMaintenance();
+  });
+
+  socket.on("stop-session", async ({ sessionId }: { sessionId?: string }) => {
+    if (!sessionId) {
+      return;
+    }
+
+    const user = socketUsers.get(socket.id);
+    const owner = sessionOwners.get(sessionId);
+    const session = sessions.get(sessionId);
+    if (!user || !owner || !session || !canSeeOwner(user, owner)) {
+      return;
+    }
+
+    await session.stop();
+    sessions.delete(sessionId);
+    sessionOwners.delete(sessionId);
+    activePrompts.delete(sessionId);
+    for (const [socketId, selectedSessionId] of selectedSessionBySocket) {
+      if (selectedSessionId === sessionId) {
+        selectedSessionBySocket.delete(socketId);
+      }
+    }
     emitMaintenance();
   });
 
@@ -436,6 +538,7 @@ io.on("connection", (socket) => {
     await Promise.all([...sessions.values()].map((session) => session.stop()));
     sessions.clear();
     sessionOwners.clear();
+    selectedSessionBySocket.clear();
     activePrompts.clear();
     emitMaintenance();
   });
@@ -444,6 +547,7 @@ io.on("connection", (socket) => {
     await Promise.all([...sessions.values()].map((session) => session.stop()));
     sessions.clear();
     sessionOwners.clear();
+    selectedSessionBySocket.clear();
     activePrompts.clear();
     emitMaintenance();
     cleanupServerLock();
@@ -454,6 +558,7 @@ io.on("connection", (socket) => {
   socket.on("disconnect", async () => {
     logger.info(`Interface deconnectee: ${socket.id}`);
     socketUsers.delete(socket.id);
+    selectedSessionBySocket.delete(socket.id);
   });
 });
 

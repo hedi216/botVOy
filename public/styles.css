@@ -423,9 +423,36 @@ td {
 }
 
 .button-row {
+  align-items: end;
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
+}
+
+.bot-name-field,
+.bot-session-field {
+  min-width: 180px;
+}
+
+.bot-session-field {
+  min-width: 220px;
+}
+
+.bot-quota {
+  align-items: center;
+  background: #eef7ff;
+  border: 1px solid #b8d6ec;
+  border-radius: 6px;
+  color: #41516a;
+  display: inline-flex;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 12px;
+  white-space: nowrap;
+}
+
+.bot-quota strong {
+  color: var(--brand-dark);
 }
 
 .prompt-panel {

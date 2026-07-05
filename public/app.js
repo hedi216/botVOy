@@ -6,7 +6,12 @@ const state = {
   agencies: [],
   logs: [],
   page: "dashboard",
-  botStatus: "Pret"
+  botStatus: "Pret",
+  agencyActiveCount: 0,
+  agencyMaxClients: null,
+  sessions: [],
+  selectedSessionId: null,
+  prompts: {}
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -36,6 +41,9 @@ const els = {
   dashboardContinue: $("#dashboardContinue"),
   dashboardLogList: $("#dashboardLogList"),
   startBot: $("#startBot"),
+  botSelector: $("#botSelector"),
+  botName: $("#botName"),
+  botActiveCount: $("#botActiveCount"),
   continueBot: $("#continueBot"),
   promptContinue: $("#promptContinue"),
   stopBot: $("#stopBot"),
@@ -358,13 +366,79 @@ const updateBotStatus = (status) => {
   els.dashboardStatus.textContent = status;
 };
 
-const setPrompt = (message, enabled) => {
-  els.promptText.textContent = message;
-  els.dashboardPromptText.textContent = message || "Aucune action en attente.";
+const selectedSession = () => state.sessions.find((session) => session.id === state.selectedSessionId) || null;
+
+const setPrompt = (message, enabled, botName = "") => {
+  const visibleMessage = message && botName ? `${botName}: ${message}` : message;
+  els.promptText.textContent = visibleMessage;
+  els.dashboardPromptText.textContent = visibleMessage || "Aucune action en attente.";
   els.promptBox.hidden = !enabled;
   els.continueBot.disabled = !enabled;
   els.promptContinue.disabled = !enabled;
   els.dashboardContinue.disabled = !enabled;
+};
+
+const renderSelectedSession = () => {
+  const session = selectedSession();
+  if (!session) {
+    els.chromePort.textContent = "-";
+    els.dashboardChromePort.textContent = "-";
+    els.logFile.textContent = "-";
+    updateBotStatus(state.sessions.length ? "Selectionnez un bot" : "Pret");
+    setPrompt("", false);
+    els.stopBot.disabled = true;
+    return;
+  }
+
+  els.chromePort.textContent = String(session.port);
+  els.dashboardChromePort.textContent = String(session.port);
+  els.logFile.textContent = session.logFile;
+  updateBotStatus(session.status);
+  els.stopBot.disabled = false;
+  const prompt = state.prompts[session.id] || session.promptMessage || "";
+  setPrompt(prompt, Boolean(prompt), session.name);
+};
+
+const renderBotSelector = () => {
+  els.botSelector.replaceChildren();
+
+  if (state.sessions.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Aucun bot actif";
+    els.botSelector.append(option);
+    els.botSelector.disabled = true;
+    state.selectedSessionId = null;
+    renderSelectedSession();
+    return;
+  }
+
+  els.botSelector.disabled = false;
+  for (const session of state.sessions) {
+    const option = document.createElement("option");
+    option.value = session.id;
+    option.textContent = `${session.name || session.id} - ${session.status}${session.hasPrompt || state.prompts[session.id] ? " - action requise" : ""}`;
+    els.botSelector.append(option);
+  }
+
+  if (!state.selectedSessionId || !state.sessions.some((session) => session.id === state.selectedSessionId)) {
+    state.selectedSessionId = state.sessions[0].id;
+  }
+
+  els.botSelector.value = state.selectedSessionId;
+  renderSelectedSession();
+};
+
+const mergeSession = (session) => {
+  const index = state.sessions.findIndex((item) => item.id === session.id);
+  if (index >= 0) {
+    state.sessions[index] = { ...state.sessions[index], ...session };
+  } else {
+    state.sessions.unshift(session);
+  }
+
+  state.selectedSessionId = session.id;
+  renderBotSelector();
 };
 
 const addLog = ({ level = "info", message, timestamp = new Date().toISOString() }) => {
@@ -394,8 +468,14 @@ const renderLogs = () => {
 };
 
 const continueBot = () => {
+  if (!state.selectedSessionId) {
+    return;
+  }
+
+  delete state.prompts[state.selectedSessionId];
   setPrompt("", false);
-  socket.emit("continue-bot");
+  socket.emit("continue-bot", { sessionId: state.selectedSessionId });
+  renderBotSelector();
 };
 
 els.loginForm.addEventListener("submit", async (event) => {
@@ -582,22 +662,41 @@ els.passwordForm.addEventListener("submit", async (event) => {
 els.startBot.addEventListener("click", () => {
   els.startBot.disabled = true;
   els.stopBot.disabled = false;
-  state.logs = [];
-  renderLogs();
   setPrompt("", false);
   els.chromePort.textContent = "-";
   els.dashboardChromePort.textContent = "-";
   els.logFile.textContent = "-";
   updateBotStatus("demarrage");
-  socket.emit("start-bot");
+  const typedBotName = els.botName.value.trim();
+  const botName = typedBotName || `Bot ${state.agencyActiveCount + 1}`;
+  socket.emit("start-bot", { botName });
+  els.botName.value = "";
+  els.botName.placeholder = `Bot ${state.agencyActiveCount + 2}`;
+  window.setTimeout(() => {
+    if (state.user && (state.agencyMaxClients === null || state.agencyActiveCount < state.agencyMaxClients)) {
+      els.startBot.disabled = false;
+    }
+  }, 1500);
 });
 
 els.continueBot.addEventListener("click", continueBot);
 els.promptContinue.addEventListener("click", continueBot);
 els.dashboardContinue.addEventListener("click", continueBot);
 
+els.botSelector.addEventListener("change", () => {
+  state.selectedSessionId = els.botSelector.value || null;
+  renderSelectedSession();
+  if (state.selectedSessionId) {
+    socket.emit("select-session", { sessionId: state.selectedSessionId });
+  }
+});
+
 els.stopBot.addEventListener("click", () => {
-  socket.emit("stop-bot");
+  if (!state.selectedSessionId) {
+    return;
+  }
+
+  socket.emit("stop-bot", { sessionId: state.selectedSessionId });
   els.stopBot.disabled = true;
   els.startBot.disabled = false;
   setPrompt("", false);
@@ -612,34 +711,80 @@ els.stopAllSessions.addEventListener("click", () => socket.emit("stop-all-sessio
 els.shutdownServer.addEventListener("click", () => socket.emit("shutdown-server"));
 
 socket.on("bot-session", (session) => {
-  els.chromePort.textContent = String(session.port);
-  els.dashboardChromePort.textContent = String(session.port);
-  els.logFile.textContent = session.logFile;
-  updateBotStatus(session.status);
-});
-
-socket.on("bot-status", ({ status }) => {
-  updateBotStatus(status);
-
-  if (status === "stopped" || status === "error") {
+  mergeSession(session);
+  els.stopBot.disabled = false;
+  if (state.agencyMaxClients === null || state.agencyActiveCount < state.agencyMaxClients) {
     els.startBot.disabled = false;
-    els.stopBot.disabled = true;
-    setPrompt("", false);
   }
 });
 
-socket.on("bot-prompt", ({ message }) => setPrompt(message, true));
+socket.on("bot-status", ({ sessionId, status }) => {
+  const session = state.sessions.find((item) => item.id === sessionId);
+  if (session) {
+    session.status = status;
+  }
+
+  if (status === "stopped" || status === "error") {
+    delete state.prompts[sessionId];
+    state.sessions = state.sessions.filter((item) => item.id !== sessionId);
+    if (state.selectedSessionId === sessionId) {
+      state.selectedSessionId = state.sessions[0]?.id || null;
+    }
+  }
+
+  renderBotSelector();
+
+  if (state.agencyMaxClients === null || state.agencyActiveCount < state.agencyMaxClients) {
+    els.startBot.disabled = false;
+  }
+});
+
+socket.on("bot-prompt", ({ sessionId, botName, message }) => {
+  if (!sessionId) {
+    setPrompt(message, Boolean(message), botName);
+    return;
+  }
+
+  if (message) {
+    state.prompts[sessionId] = message;
+    state.selectedSessionId = sessionId;
+  } else {
+    delete state.prompts[sessionId];
+  }
+
+  renderBotSelector();
+});
 socket.on("bot-log", addLog);
 socket.on("bot-log-history", (events) => {
   state.logs = Array.isArray(events) ? events.slice(0, 300) : [];
   renderLogs();
 });
 
-socket.on("maintenance", ({ pid, port, maxClients, activeSessions }) => {
+socket.on("maintenance", ({ pid, port, maxClients, agencyActiveCount, agencyMaxClients, activeSessions }) => {
   els.serverPid.textContent = String(pid);
   els.serverPort.textContent = String(port);
-  els.activeCount.textContent = `${activeSessions.length} / ${maxClients}`;
-  els.dashboardActiveCount.textContent = `${activeSessions.length} / ${maxClients}`;
+  const count = Number.isFinite(agencyActiveCount) ? agencyActiveCount : activeSessions.length;
+  const limit = Number.isFinite(agencyMaxClients) ? agencyMaxClients : maxClients;
+  state.agencyActiveCount = count;
+  state.agencyMaxClients = limit;
+  els.activeCount.textContent = `${count} / ${limit}`;
+  els.dashboardActiveCount.textContent = `${count} / ${limit}`;
+  els.botActiveCount.textContent = `${count} / ${limit}`;
+  els.botName.placeholder = `Bot ${count + 1}`;
+  els.startBot.disabled = count >= limit;
+  state.sessions = activeSessions;
+  const activeIds = new Set(activeSessions.map((session) => session.id));
+  for (const promptSessionId of Object.keys(state.prompts)) {
+    if (!activeIds.has(promptSessionId)) {
+      delete state.prompts[promptSessionId];
+    }
+  }
+  for (const session of activeSessions) {
+    if (session.promptMessage) {
+      state.prompts[session.id] = session.promptMessage;
+    }
+  }
+  renderBotSelector();
   els.sessionList.replaceChildren();
 
   if (activeSessions.length === 0) {
@@ -654,10 +799,15 @@ socket.on("maintenance", ({ pid, port, maxClients, activeSessions }) => {
     const status = document.createElement("strong");
     const portText = document.createElement("span");
     const id = document.createElement("small");
+    const stopButton = document.createElement("button");
     status.textContent = session.status;
     portText.textContent = `Chrome ${session.port}`;
-    id.textContent = session.id;
-    item.append(status, portText, id);
+    id.textContent = `${session.name || session.id} - ${session.id}`;
+    stopButton.className = "danger";
+    stopButton.type = "button";
+    stopButton.textContent = "Arreter";
+    stopButton.addEventListener("click", () => socket.emit("stop-session", { sessionId: session.id }));
+    item.append(status, portText, id, stopButton);
     els.sessionList.append(item);
   }
 });
