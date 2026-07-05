@@ -34,10 +34,7 @@ const classifyNotification = (message: string): NotificationCategory | null => {
     return "appointment-detected";
   }
 
-  if (
-    text.includes("rendez-vous reserve temporairement")
-    || text.includes("bouton 'reservez votre rendez-vous' clique automatiquement")
-  ) {
+  if (text.trim() === "rendez_vous_reserve_temporaire") {
     return "appointment-reserved";
   }
 

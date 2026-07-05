@@ -39,7 +39,7 @@ const dateTimePattern = /(\b\d{1,2}[:h]\d{2}\b|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b
 const containsTimeSlotPattern = /\b\d{1,2}[:h]\d{2}\b/i;
 const timeSlotPattern = /^\s*\d{1,2}[:h]\d{2}\s*$/i;
 const excludedCandidatePattern = /close|menu|language|langue|account|compte|cart|panier|legend|legende|next|prev|suivant|precedent|header|footer|indisponible|unavailable/i;
-const reserveButtonPattern = /rendez-vous|appointment/i;
+const reserveButtonPattern = /r[eé]servez|reserve|book/i;
 
 const normalizeText = (text: string): string => text
   .normalize("NFD")
@@ -333,9 +333,14 @@ export const findReserveAppointmentButton = async (
     const text = (await visible.innerText().catch(() => "")).trim();
     const ariaLabel = await visible.getAttribute("aria-label").catch(() => "") ?? "";
     const className = await visible.getAttribute("class").catch(() => "") ?? "";
-    const fullText = `${text} ${ariaLabel} ${className}`;
+    const testId = await visible.getAttribute("data-testid").catch(() => "") ?? "";
+    const fullText = normalizeText(`${text} ${ariaLabel} ${className} ${testId}`);
 
-    if (!/reservez|rendez-vous|appointment/i.test(fullText)) {
+    if (/appointmenthour|btn-available-slot|btn-unavailable-slot/i.test(fullText)) {
+      continue;
+    }
+
+    if (!/reservez|reserve|book/i.test(fullText)) {
       continue;
     }
 

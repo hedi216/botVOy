@@ -162,6 +162,17 @@ const detectUnexpectedPageReason = async (page: Page): Promise<string | null> =>
   return null;
 };
 
+const hasMovedPastAppointmentPage = async (page: Page): Promise<boolean> => {
+  const url = page.url();
+  if (!/\/workflow\/appointment-booking\//i.test(url)) {
+    return true;
+  }
+
+  const bodyText = await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
+  return /assurance voyage|recapitulatif|récapitulatif|paiement|services additionnels|payment|review/i.test(bodyText)
+    && !/selectionnez un creneau|sélectionnez un créneau/i.test(bodyText);
+};
+
 const waitForPageReadyAfterRefresh = async (
   page: Page,
   runtime: ResolvedMonitorRuntime
@@ -286,25 +297,35 @@ export const monitorAppointments = async (
       await takeTimestampedScreenshot(activePage, "appointment-detected");
       await highlightElement(activePage, candidate.locator);
       process.stdout.write("\u0007");
-      resolved.log("warn", "Creneau potentiel detecte. Tentative de clic automatique sur l'element surligne.");
+      resolved.log("warn", "Creneau potentiel detecte. Tentative de selection automatique du slot surligne.");
       try {
         await candidate.locator.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
         await candidate.locator.click({ timeout: 5_000 });
-        resolved.log("info", "Horaire clique automatiquement. Recherche du bouton de reservation.");
+        resolved.log("info", "Slot selectionne automatiquement. Recherche du bouton 'Reservez votre rendez-vous'.");
         await activePage.waitForTimeout(800);
 
         const reserveButton = await findReserveAppointmentButton(activePage);
         if (!reserveButton) {
           resolved.log("warn", "Horaire clique, mais bouton 'Reservez votre rendez-vous' introuvable ou inactif.");
-          await resolved.waitForUser("Horaire clique. Cliquez manuellement sur 'Reservez votre rendez-vous', puis validez si vous voulez reprendre.");
+          await resolved.waitForUser("Slot selectionne. Cliquez manuellement sur 'Reservez votre rendez-vous', puis validez si vous voulez reprendre.");
           return;
         }
 
         await reserveButton.locator.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
         await highlightElement(activePage, reserveButton.locator);
-        resolved.log("warn", "Bouton 'Reservez votre rendez-vous' detecte. Tentative de clic automatique.");
+        resolved.log("warn", "Slot deja selectionne. Tentative de clic sur 'Reservez votre rendez-vous'.");
         await reserveButton.locator.click({ timeout: 5_000 });
-        resolved.log("info", "Bouton 'Reservez votre rendez-vous' clique automatiquement. Continuez manuellement les etapes suivantes.");
+        await activePage.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => undefined);
+        await activePage.waitForTimeout(1_500);
+
+        if (!(await hasMovedPastAppointmentPage(activePage))) {
+          resolved.log("warn", "Clic reservation envoye, mais la page n'a pas confirme le passage a l'etape suivante.");
+          await resolved.waitForUser("Slot selectionne, mais reservation non confirmee. Cliquez manuellement sur 'Reservez votre rendez-vous', puis validez si vous voulez reprendre.");
+          return;
+        }
+
+        resolved.log("success", "RENDEZ_VOUS_RESERVE_TEMPORAIRE");
+        resolved.log("info", "Slot selectionne puis bouton 'Reservez votre rendez-vous' clique avec confirmation de passage a l'etape suivante.");
         await resolved.waitForUser("Rendez-vous reserve temporairement. Continuez manuellement les etapes suivantes, puis validez si vous voulez reprendre.");
       } catch {
         resolved.log("warn", "Creneau detecte, mais le clic automatique n'a pas pu etre confirme. Cliquez manuellement sur l'element surligne.");
