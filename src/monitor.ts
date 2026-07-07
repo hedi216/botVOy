@@ -49,11 +49,11 @@ export const pauseForHuman = async (reason: string, runtime?: MonitorRuntime): P
   await resolved.waitForUser("Validez pour reprendre la surveillance.");
 };
 
-const alertAndStop = (reason: string, runtime: ResolvedMonitorRuntime): never => {
+const alertAndPause = async (reason: string, runtime: ResolvedMonitorRuntime): Promise<void> => {
   runtime.log("error", "ALERTE_UTILISATEUR");
   runtime.log("error", reason);
   process.stdout.write("\u0007");
-  throw new Error(reason);
+  await pauseForHuman(reason, runtime);
 };
 
 const isTargetClosedError = (error: unknown): boolean => {
@@ -194,6 +194,82 @@ const waitForPageReadyAfterRefresh = async (
   return false;
 };
 
+const waitForReloadToSettle = async (
+  page: Page,
+  runtime: ResolvedMonitorRuntime
+): Promise<{ settled: boolean; error?: unknown }> => {
+  let settled = false;
+  let reloadError: unknown;
+
+  const reload = page.reload({ waitUntil: "domcontentloaded", timeout: 45_000 })
+    .catch((error) => {
+      reloadError = error;
+    })
+    .finally(() => {
+      settled = true;
+    });
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await page.waitForTimeout(10_000);
+
+    if (settled) {
+      if (reloadError) {
+        runtime.log("warn", `Refresh termine avec avertissement apres attente ${attempt}/3.`);
+      } else {
+        runtime.log("info", `Refresh termine apres attente ${attempt}/3.`);
+      }
+      await reload;
+      return { settled: true, error: reloadError };
+    }
+
+    runtime.log("warn", `Refresh encore en cours apres ${attempt * 10}s.`);
+  }
+
+  return { settled: false };
+};
+
+const refreshAndWaitForReady = async (
+  page: Page,
+  runtime: ResolvedMonitorRuntime
+): Promise<void> => {
+  const reloadResult = await waitForReloadToSettle(page, runtime);
+
+  if (page.isClosed()) {
+    throw new Error("Page fermee pendant le refresh.");
+  }
+
+  const reloadErrorMessage = reloadResult.error instanceof Error ? reloadResult.error.message : String(reloadResult.error ?? "");
+  const reloadTimedOut = /timeout/i.test(reloadErrorMessage);
+  if (reloadResult.error && !reloadTimedOut) {
+    const unexpectedReason = await detectUnexpectedPageReason(page);
+    if (unexpectedReason) {
+      throw new Error(unexpectedReason);
+    }
+    runtime.log("warn", `Refresh a signale une erreur reseau, verification de la page: ${reloadErrorMessage}`);
+  }
+
+  if (!reloadResult.settled) {
+    const alreadyReady = await isAppointmentPageReady(page);
+    if (alreadyReady) {
+      runtime.log("warn", "Refresh long, mais la page de rendez-vous est exploitable.");
+      return;
+    }
+
+    throw new Error(`Refresh toujours en cours apres 30000ms. URL: ${page.url()}`);
+  }
+
+  if (reloadTimedOut) {
+    runtime.log("warn", "Refresh plus lent que prevu. Verification de la page apres timeout.");
+  }
+
+  const ready = await waitForPageReadyAfterRefresh(page, runtime);
+  if (!ready) {
+    const reason = await detectUnexpectedPageReason(page)
+      ?? `La page souhaitee n'est pas revenue apres refresh. URL: ${page.url()}`;
+    throw new Error(reason);
+  }
+};
+
 const detectOnAccessibleMonths = async (
   page: Page,
   config: AppConfig,
@@ -267,14 +343,7 @@ export const monitorAppointments = async (
         resolved.log("info", "AUCUN_CRENEAU_DETECTE");
         resolved.log("info", "Refresh immediat de la page.");
         try {
-          await activePage.reload({ waitUntil: "domcontentloaded" });
-          const ready = await waitForPageReadyAfterRefresh(activePage, resolved);
-          if (!ready) {
-            const reason = await detectUnexpectedPageReason(activePage)
-              ?? `La page souhaitee n'est pas revenue apres refresh. URL: ${activePage.url()}`;
-            await safeScreenshot(activePage, "page-not-ready-after-refresh");
-            alertAndStop(reason, resolved);
-          }
+          await refreshAndWaitForReady(activePage, resolved);
         } catch (error) {
           if (isTargetClosedError(error)) {
             const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
@@ -285,7 +354,7 @@ export const monitorAppointments = async (
           } else {
             const reason = `Refresh impossible ou page instable: ${error instanceof Error ? error.message : String(error)}`;
             await safeScreenshot(activePage, "reload-error");
-            alertAndStop(reason, resolved);
+            await alertAndPause(reason, resolved);
           }
         }
         continue;
@@ -347,24 +416,7 @@ export const monitorAppointments = async (
       }
 
       lastKnownUrl = activePage.url();
-      await activePage.reload({ waitUntil: "domcontentloaded" });
-      const ready = await waitForPageReadyAfterRefresh(activePage, resolved);
-      if (!ready) {
-        if (activePage.isClosed()) {
-          const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
-          if (!recovered) {
-            return;
-          }
-          activePage = recovered;
-          lastKnownUrl = activePage.url();
-          continue;
-        }
-
-        const reason = await detectUnexpectedPageReason(activePage)
-          ?? `La page souhaitee n'est pas revenue apres refresh. URL: ${activePage.url()}`;
-        await safeScreenshot(activePage, "page-not-ready-after-refresh");
-        alertAndStop(reason, resolved);
-      }
+      await refreshAndWaitForReady(activePage, resolved);
     } catch (error) {
       if (isTargetClosedError(error)) {
         const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
@@ -378,7 +430,7 @@ export const monitorAppointments = async (
 
       const reason = `Refresh impossible ou page instable: ${error instanceof Error ? error.message : String(error)}`;
       await safeScreenshot(activePage, "reload-error");
-      alertAndStop(reason, resolved);
+      await alertAndPause(reason, resolved);
     }
 
     resolved.log("info", "Relance immediate de la recherche apres refresh.");
