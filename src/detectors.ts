@@ -75,6 +75,10 @@ const isActionable = async (locator: Locator): Promise<boolean> => {
       return false;
     }
 
+    if (element.getAttribute("data-rdv-agent-tried") === "true") {
+      return false;
+    }
+
     if (isTlsAvailableSlot) {
       return style.pointerEvents !== "none"
         && Number(style.opacity || "1") > 0.35;

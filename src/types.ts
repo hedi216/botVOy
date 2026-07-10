@@ -38,6 +38,7 @@ export type CandidateElementResult = {
 export type MonitorEventLevel = "info" | "warn" | "error" | "success";
 
 export type MonitorRuntime = {
+  botName?: string;
   log?: (level: MonitorEventLevel, message: string) => void;
   waitForUser?: (message: string) => Promise<void>;
   recoverPage?: (preferredUrl?: string) => Promise<Page | null>;

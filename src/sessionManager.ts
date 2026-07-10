@@ -135,6 +135,7 @@ export class BotSession {
       const monitoredPage = await this.waitForAppointmentPage();
       this.setStatus("monitoring");
       await monitorAppointments(monitoredPage, config, {
+        botName: this.name,
         log: (level, message) => this.log(level, message),
         waitForUser: (message) => this.waitForUser(message),
         recoverPage: (preferredUrl) => this.recoverPage(preferredUrl)

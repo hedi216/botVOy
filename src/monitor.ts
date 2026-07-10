@@ -5,11 +5,21 @@ import { detectAppointmentAvailability, findBestCandidateElement, findReserveApp
 import { detectHumanValidation } from "./humanValidation.js";
 import { highlightElement } from "./highlight.js";
 import { logger } from "./logger.js";
-import { applyRateLimitCooldown, releaseScanTurn, waitForScanTurn, waitRandomDelay } from "./orchestrator.js";
+import {
+  applyRateLimitCooldown,
+  broadcastAppointmentSignal,
+  clearAppointmentSignal,
+  isAppointmentSignalActive,
+  releaseScanTurn,
+  scheduleReservationHoldRecheck,
+  waitForScanTurn,
+  waitRandomDelay
+} from "./orchestrator.js";
 import { takeTimestampedScreenshot } from "./screenshot.js";
-import { AppConfig, MonitorEventLevel, MonitorRuntime } from "./types.js";
+import { AppConfig, CandidateElementResult, MonitorEventLevel, MonitorRuntime } from "./types.js";
 
 type ResolvedMonitorRuntime = {
+  botName?: string;
   log: (level: MonitorEventLevel, message: string) => void;
   waitForUser: (message: string) => Promise<void>;
   recoverPage: (preferredUrl?: string) => Promise<Page | null>;
@@ -31,6 +41,7 @@ const askEnter = async (message: string): Promise<void> => {
 };
 
 const resolveRuntime = (runtime?: MonitorRuntime): ResolvedMonitorRuntime => ({
+  botName: runtime?.botName,
   log: runtime?.log ?? defaultRuntime.log,
   waitForUser: runtime?.waitForUser ?? defaultRuntime.waitForUser,
   recoverPage: runtime?.recoverPage ?? defaultRuntime.recoverPage
@@ -229,6 +240,114 @@ const hasMovedPastAppointmentPage = async (page: Page): Promise<boolean> => {
   const bodyText = await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
   return /assurance voyage|recapitulatif|récapitulatif|paiement|services additionnels|payment|review/i.test(bodyText)
     && !/selectionnez un creneau|sélectionnez un créneau/i.test(bodyText);
+};
+
+const hasReservationConfirmation = async (page: Page): Promise<boolean> => {
+  if (/\/workflow\/order-summary\//i.test(page.url())) {
+    return true;
+  }
+
+  const bodyText = await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
+  const text = normalizePageText(bodyText);
+  return text.includes("resume de la commande")
+    || text.includes("recapitulatif de la commande")
+    || text.includes("rendez-vous au centre de visas")
+    || text.includes("rendez-vous reserve pour");
+};
+
+const detectSlotUnavailableAfterReserve = async (page: Page): Promise<boolean> => {
+  if (!/\/workflow\/appointment-booking\//i.test(page.url())) {
+    return false;
+  }
+
+  const bodyText = await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
+  const text = normalizePageText(bodyText);
+  return text.includes("creneau n'est plus disponible")
+    || text.includes("creneau nest plus disponible")
+    || text.includes("creneau plus disponible")
+    || text.includes("creneau indisponible")
+    || text.includes("rendez-vous n'est plus disponible")
+    || text.includes("rendez-vous nest plus disponible")
+    || text.includes("slot is no longer available")
+    || text.includes("appointment is no longer available")
+    || text.includes("no longer available");
+};
+
+const hasNoSlotsMessage = async (page: Page): Promise<boolean> => {
+  const bodyText = await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
+  const text = normalizePageText(bodyText);
+  return text.includes("nous n'avons actuellement plus de creneaux de rendez-vous disponibles")
+    || text.includes("nous navons actuellement plus de creneaux de rendez-vous disponibles")
+    || text.includes("plus de creneaux de rendez-vous disponibles")
+    || text.includes("aucun creneau n'est disponible")
+    || text.includes("aucun creneau nest disponible")
+    || text.includes("no appointment slots")
+    || text.includes("no appointments available")
+    || text.includes("currently no appointment");
+};
+
+const markCandidateAsTried = async (candidate: CandidateElementResult): Promise<void> => {
+  await candidate.locator.evaluate((node) => {
+    (node as HTMLElement).setAttribute("data-rdv-agent-tried", "true");
+  }).catch(() => undefined);
+};
+
+const tryReserveAvailableSlots = async (
+  page: Page,
+  initialCandidate: CandidateElementResult,
+  runtime: ResolvedMonitorRuntime
+): Promise<"reserved" | "manual-needed" | "exhausted"> => {
+  let candidate: CandidateElementResult | null = initialCandidate;
+
+  for (let attempt = 1; attempt <= 12 && candidate; attempt += 1) {
+    runtime.log("warn", `Tentative reservation slot ${attempt}/12: ${candidate.text || "horaire candidat"}.`);
+    await markCandidateAsTried(candidate);
+    await candidate.locator.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
+    await candidate.locator.click({ timeout: 5_000 });
+    runtime.log("info", "Slot selectionne automatiquement. Recherche du bouton 'Reservez votre rendez-vous'.");
+    await page.waitForTimeout(800);
+
+    const reserveButton = await findReserveAppointmentButton(page);
+    if (!reserveButton) {
+      runtime.log("warn", "Horaire clique, mais bouton 'Reservez votre rendez-vous' introuvable ou inactif.");
+      candidate = await findBestCandidateElement(page);
+      continue;
+    }
+
+    await reserveButton.locator.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
+    await highlightElement(page, reserveButton.locator);
+
+    runtime.log("warn", "Slot deja selectionne. Tentative de clic sur 'Reservez votre rendez-vous'.");
+    await reserveButton.locator.click({ timeout: 5_000 });
+
+    const confirmedByUrl = await page.waitForURL(/\/workflow\/order-summary\//i, { timeout: 15_000 })
+      .then(() => true)
+      .catch(() => false);
+
+    await page.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => undefined);
+    await page.waitForTimeout(1_000);
+
+    if (confirmedByUrl || await hasReservationConfirmation(page)) {
+      runtime.log("success", "Reservation confirmee par URL ou contenu order-summary.");
+      return "reserved";
+    }
+
+    if (await detectSlotUnavailableAfterReserve(page)) {
+      runtime.log("warn", "Slot refuse par TLS: creneau plus disponible. Essai rapide du prochain slot.");
+      candidate = await findBestCandidateElement(page);
+      continue;
+    }
+
+    if (await hasMovedPastAppointmentPage(page)) {
+      runtime.log("warn", `Le site a quitte appointment-booking sans order-summary confirme. URL actuelle: ${page.url()}`);
+      return "manual-needed";
+    }
+
+    runtime.log("warn", "Clic reservation envoye, mais TLS reste sur appointment-booking. Essai du prochain slot disponible.");
+    candidate = await findBestCandidateElement(page);
+  }
+
+  return "exhausted";
 };
 
 const waitForPageReadyAfterRefresh = async (
@@ -439,7 +558,7 @@ export const monitorAppointments = async (
 
     const domain = pageDomain(activePage);
     await waitForScanTurn({
-      botName: undefined,
+      botName: resolved.botName,
       domain,
       settings: config,
       log: resolved.log
@@ -460,11 +579,26 @@ export const monitorAppointments = async (
       if (!candidate) {
         resolved.log("warn", "Signal de disponibilite ignore: aucun horaire ou bouton cliquable fiable trouve.");
         resolved.log("info", "AUCUN_CRENEAU_DETECTE");
+
+        if (isAppointmentSignalActive(domain)) {
+          resolved.log("warn", "Mode creneau actif: aucun element cliquable fiable. Refresh rapide et nouvelle recherche.");
+          try {
+            await refreshAndWaitForReady(activePage, resolved);
+          } catch (error) {
+            const reason = `Refresh rapide impossible en mode creneau: ${error instanceof Error ? error.message : String(error)}`;
+            await safeScreenshot(activePage, "reload-error");
+            await alertAndPause(reason, resolved);
+          }
+          continue;
+        }
+
         await waitRandomDelay(
           config.botCycleCooldownMinMs,
           config.botCycleCooldownMaxMs,
           resolved.log,
-          "Attente avant nouveau cycle"
+          "Attente avant nouveau cycle",
+          domain,
+          resolved.botName
         );
         continue;
       }
@@ -472,47 +606,55 @@ export const monitorAppointments = async (
       resolved.log("success", "CRENEAU_POTENTIEL_DETECTE");
       resolved.log("info", `Date/heure: ${availability.dateTimeHint ?? candidate.text ?? "non determinee"}`);
       resolved.log("info", `Texte trouve: ${availability.textFound ?? candidate.text ?? "non determine"}`);
+      broadcastAppointmentSignal(domain, resolved.botName, resolved.log);
       await takeTimestampedScreenshot(activePage, "appointment-detected");
       await highlightElement(activePage, candidate.locator);
       process.stdout.write("\u0007");
       resolved.log("warn", "Creneau potentiel detecte. Tentative de selection automatique du slot surligne.");
       try {
-        await candidate.locator.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
-        await candidate.locator.click({ timeout: 5_000 });
-        resolved.log("info", "Slot selectionne automatiquement. Recherche du bouton 'Reservez votre rendez-vous'.");
-        await activePage.waitForTimeout(800);
+        const reserveResult = await tryReserveAvailableSlots(activePage, candidate, resolved);
 
-        const reserveButton = await findReserveAppointmentButton(activePage);
-        if (!reserveButton) {
-          resolved.log("warn", "Horaire clique, mais bouton 'Reservez votre rendez-vous' introuvable ou inactif.");
-          await resolved.waitForUser("Slot selectionne. Cliquez manuellement sur 'Reservez votre rendez-vous', puis validez si vous voulez reprendre.");
+        if (reserveResult === "reserved") {
+          resolved.log("success", "RENDEZ_VOUS_RESERVE_TEMPORAIRE");
+          resolved.log("info", "Reservation confirmee: URL/contenu order-summary detecte.");
+          scheduleReservationHoldRecheck(domain, resolved.botName, resolved.log);
+          await resolved.waitForUser("Rendez-vous reserve temporairement. Continuez manuellement les etapes suivantes, puis validez si vous voulez reprendre.");
           return;
         }
 
-        await reserveButton.locator.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
-        await highlightElement(activePage, reserveButton.locator);
-        resolved.log("warn", "Slot deja selectionne. Tentative de clic sur 'Reservez votre rendez-vous'.");
-        await reserveButton.locator.click({ timeout: 5_000 });
-        await activePage.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => undefined);
-        await activePage.waitForTimeout(1_500);
-
-        if (!(await hasMovedPastAppointmentPage(activePage))) {
-          resolved.log("warn", "Clic reservation envoye, mais la page n'a pas confirme le passage a l'etape suivante.");
-          await resolved.waitForUser("Slot selectionne, mais reservation non confirmee. Cliquez manuellement sur 'Reservez votre rendez-vous', puis validez si vous voulez reprendre.");
+        if (reserveResult === "manual-needed") {
+          resolved.log("warn", "Etat inattendu apres clic reservation. Verification humaine demandee avant d'envoyer une alerte de reservation.");
+          await resolved.waitForUser("Le bot a clique un creneau, mais order-summary n'est pas confirme. Verifiez la page, puis validez si vous voulez reprendre.");
           return;
         }
 
-        resolved.log("success", "RENDEZ_VOUS_RESERVE_TEMPORAIRE");
-        resolved.log("info", "Slot selectionne puis bouton 'Reservez votre rendez-vous' clique avec confirmation de passage a l'etape suivante.");
-        await resolved.waitForUser("Rendez-vous reserve temporairement. Continuez manuellement les etapes suivantes, puis validez si vous voulez reprendre.");
-      } catch {
-        resolved.log("warn", "Creneau detecte, mais le clic automatique n'a pas pu etre confirme. Cliquez manuellement sur l'element surligne.");
-        await resolved.waitForUser("Creneau detecte. Cliquez manuellement sur l'element surligne, puis validez si vous voulez reprendre.");
+        resolved.log("warn", "Mode creneau actif: aucun slot reserve apres plusieurs essais. Refresh rapide et nouvelle recherche.");
+        await refreshAndWaitForReady(activePage, resolved);
+        continue;
+      } catch (error) {
+        resolved.log("warn", `Creneau detecte, mais tentative automatique incomplete: ${error instanceof Error ? error.message : String(error)}`);
+        await refreshAndWaitForReady(activePage, resolved);
+        continue;
       }
-      return;
     }
 
     resolved.log("info", "AUCUN_CRENEAU_DETECTE");
+
+    if (isAppointmentSignalActive(domain)) {
+      if (await hasNoSlotsMessage(activePage)) {
+        clearAppointmentSignal(domain, "message officiel aucun creneau disponible", resolved.log);
+      } else {
+        resolved.log("warn", "Mode creneau actif: aucun creneau confirme. Refresh rapide et nouveau balayage.");
+        try {
+          await refreshAndWaitForReady(activePage, resolved);
+        } catch (error) {
+          const reason = `Refresh rapide impossible en mode creneau: ${error instanceof Error ? error.message : String(error)}`;
+          await safeScreenshot(activePage, "reload-error");
+          await alertAndPause(reason, resolved);
+        }
+        continue;
+      }
+    }
 
     if (config.refreshEveryCycles > 0 && attempts % config.refreshEveryCycles === 0) {
       resolved.log("info", `Refresh planifie apres ${config.refreshEveryCycles} cycle(s) sans creneau.`);
@@ -554,7 +696,9 @@ export const monitorAppointments = async (
       config.botCycleCooldownMinMs,
       config.botCycleCooldownMaxMs,
       resolved.log,
-      "Attente avant nouveau cycle"
+      "Attente avant nouveau cycle",
+      domain,
+      resolved.botName
     );
   }
 
