@@ -5,6 +5,7 @@ import { detectAppointmentAvailability, findBestCandidateElement, findReserveApp
 import { detectHumanValidation } from "./humanValidation.js";
 import { highlightElement } from "./highlight.js";
 import { logger } from "./logger.js";
+import { applyRateLimitCooldown, releaseScanTurn, waitForScanTurn, waitRandomDelay } from "./orchestrator.js";
 import { takeTimestampedScreenshot } from "./screenshot.js";
 import { AppConfig, MonitorEventLevel, MonitorRuntime } from "./types.js";
 
@@ -91,6 +92,15 @@ const safeScreenshot = async (page: Page, prefix: string): Promise<void> => {
   });
 };
 
+const pageDomain = (page: Page): string => {
+  try {
+    const hostname = new URL(page.url()).hostname;
+    return hostname || "local";
+  } catch {
+    return "local";
+  }
+};
+
 const readVisibleText = async (page: Page, selector: string): Promise<string | null> => {
   const locator = page.locator(selector).first();
 
@@ -100,6 +110,12 @@ const readVisibleText = async (page: Page, selector: string): Promise<string | n
 
   return (await locator.innerText().catch(() => "")).trim() || null;
 };
+
+const normalizePageText = (text: string): string => text
+  .normalize("NFD")
+  .replace(/[\u0300-\u036f]/g, "")
+  .replace(/[’']/g, "'")
+  .toLowerCase();
 
 const detectOnCurrentMonth = async (
   page: Page,
@@ -137,6 +153,42 @@ const isAppointmentPageReady = async (page: Page): Promise<boolean> => {
 const detectUnexpectedPageReason = async (page: Page): Promise<string | null> => {
   const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
   const url = page.url();
+  const text = normalizePageText(bodyText);
+  const normalizedUrl = url.toLowerCase();
+
+  if (
+    /error\s*1015/i.test(bodyText)
+    || /rate limited|temporarily banned/i.test(bodyText)
+    || /error\s*1015|rate-limited/i.test(normalizedUrl)
+  ) {
+    return `Blocage TLS/Cloudflare detecte: erreur 1015 / rate limit. Arretez les recherches sur ce site et laissez le cooldown avant de reprendre. URL: ${url}`;
+  }
+
+  if (
+    text.includes("verification de securite en cours")
+    || text.includes("verifiez que vous etes humain")
+    || text.includes("checking if the site connection is secure")
+    || text.includes("verify you are human")
+    || normalizedUrl.includes("__cf_chl_tk")
+  ) {
+    return `Validation humaine TLS/Cloudflare detectee. Terminez la verification dans le navigateur du bot, revenez sur la page de rendez-vous, puis cliquez Valider/continuer. URL: ${url}`;
+  }
+
+  if (
+    /\/i2-auth\/|\/login/i.test(normalizedUrl)
+    || (text.includes("connectez-vous") && text.includes("mot de passe"))
+    || (text.includes("adresse electronique") && text.includes("mot de passe"))
+  ) {
+    return `Session TLS expiree: page de connexion detectee. Reconnectez-vous manuellement, retournez sur la page de rendez-vous, puis cliquez Valider/continuer. URL: ${url}`;
+  }
+
+  if (
+    /visas-fr\.tlscontact\.com\/fr-fr\/?$/i.test(normalizedUrl)
+    || (text.includes("bienvenue sur tlscontact") && text.includes("prendre un rendez-vous"))
+  ) {
+    return `Session TLS sortie du workflow: le navigateur est revenu a l'accueil TLScontact. Retournez manuellement sur la page Prise de rendez-vous, puis cliquez Valider/continuer. URL: ${url}`;
+  }
+
   const patterns = [
     /bad gateway/i,
     /error code 502/i,
@@ -144,6 +196,9 @@ const detectUnexpectedPageReason = async (page: Page): Promise<string | null> =>
     /gateway timeout/i,
     /error code 503/i,
     /error code 504/i,
+    /error 1015/i,
+    /rate limited/i,
+    /temporarily banned/i,
     /host error/i,
     /page not found/i,
     /session expired/i,
@@ -156,11 +211,14 @@ const detectUnexpectedPageReason = async (page: Page): Promise<string | null> =>
   const match = patterns.find((pattern) => pattern.test(bodyText) || pattern.test(url));
 
   if (match) {
-    return `Page inattendue apres refresh: ${match.source}. URL: ${url}`;
+    return `Page inattendue detectee: ${match.source}. Verifiez le navigateur du bot, remettez la page de rendez-vous si necessaire, puis cliquez Valider/continuer. URL: ${url}`;
   }
 
   return null;
 };
+
+const isRateLimitReason = (reason: string): boolean =>
+  /1015|rate limited|temporarily banned/i.test(reason);
 
 const hasMovedPastAppointmentPage = async (page: Page): Promise<boolean> => {
   const url = page.url();
@@ -226,6 +284,40 @@ const waitForReloadToSettle = async (
   }
 
   return { settled: false };
+};
+
+const waitMonthClickDelay = async (
+  config: AppConfig,
+  runtime: ResolvedMonitorRuntime
+): Promise<void> => {
+  await waitRandomDelay(
+    config.monthClickMinDelayMs,
+    config.monthClickMaxDelayMs,
+    runtime.log,
+    "Attente entre changements de mois"
+  );
+};
+
+const returnToFirstAccessibleMonth = async (
+  page: Page,
+  config: AppConfig,
+  runtime: ResolvedMonitorRuntime
+): Promise<void> => {
+  for (let index = 0; index < 24; index += 1) {
+    const prevAvailable = page.locator('[data-testid="btn-prev-month-available"]').first();
+    if (!(await prevAvailable.isVisible().catch(() => false))) {
+      return;
+    }
+
+    if (!(await prevAvailable.isEnabled().catch(() => true))) {
+      return;
+    }
+
+    const prevMonth = (await prevAvailable.innerText().catch(() => "")).trim();
+    runtime.log("info", `Retour au mois precedent activable: ${prevMonth || `-${index + 1}`}`);
+    await prevAvailable.click();
+    await waitMonthClickDelay(config, runtime);
+  }
 };
 
 const refreshAndWaitForReady = async (
@@ -298,7 +390,7 @@ const detectOnAccessibleMonths = async (
     const nextMonth = (await nextAvailable.innerText().catch(() => "")).trim();
     runtime.log("info", `Passage au mois suivant activable: ${nextMonth || `+${index}`}`);
     await nextAvailable.click();
-    await page.waitForTimeout(1_000);
+    await waitMonthClickDelay(config, runtime);
 
     availability = await detectOnCurrentMonth(page, runtime);
     if (availability.detected) {
@@ -335,28 +427,45 @@ export const monitorAppointments = async (
       continue;
     }
 
-    const availability = await detectOnAccessibleMonths(activePage, config, resolved);
+    const unexpectedReason = await detectUnexpectedPageReason(activePage);
+    if (unexpectedReason) {
+      if (isRateLimitReason(unexpectedReason)) {
+        applyRateLimitCooldown(pageDomain(activePage), config.rateLimitCooldownMinutes, resolved.log);
+      }
+      await safeScreenshot(activePage, "unexpected-page");
+      await alertAndPause(unexpectedReason, resolved);
+      continue;
+    }
+
+    const domain = pageDomain(activePage);
+    await waitForScanTurn({
+      botName: undefined,
+      domain,
+      settings: config,
+      log: resolved.log
+    });
+
+    let availability: Awaited<ReturnType<typeof detectAppointmentAvailability>>;
+    try {
+      availability = await detectOnAccessibleMonths(activePage, config, resolved);
+      if (!availability.detected) {
+        await returnToFirstAccessibleMonth(activePage, config, resolved);
+      }
+    } finally {
+      releaseScanTurn(domain, resolved.log);
+    }
+
     if (availability.detected) {
       const candidate = await findBestCandidateElement(activePage);
       if (!candidate) {
         resolved.log("warn", "Signal de disponibilite ignore: aucun horaire ou bouton cliquable fiable trouve.");
         resolved.log("info", "AUCUN_CRENEAU_DETECTE");
-        resolved.log("info", "Refresh immediat de la page.");
-        try {
-          await refreshAndWaitForReady(activePage, resolved);
-        } catch (error) {
-          if (isTargetClosedError(error)) {
-            const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
-            if (!recovered) {
-              return;
-            }
-            activePage = recovered;
-          } else {
-            const reason = `Refresh impossible ou page instable: ${error instanceof Error ? error.message : String(error)}`;
-            await safeScreenshot(activePage, "reload-error");
-            await alertAndPause(reason, resolved);
-          }
-        }
+        await waitRandomDelay(
+          config.botCycleCooldownMinMs,
+          config.botCycleCooldownMaxMs,
+          resolved.log,
+          "Attente avant nouveau cycle"
+        );
         continue;
       }
 
@@ -404,36 +513,49 @@ export const monitorAppointments = async (
     }
 
     resolved.log("info", "AUCUN_CRENEAU_DETECTE");
-    resolved.log("info", "Refresh immediat de la page.");
-    try {
-      if (activePage.isClosed()) {
-        const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
-        if (!recovered) {
-          return;
-        }
-        activePage = recovered;
-        lastKnownUrl = activePage.url();
-      }
 
-      lastKnownUrl = activePage.url();
-      await refreshAndWaitForReady(activePage, resolved);
-    } catch (error) {
-      if (isTargetClosedError(error)) {
-        const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
-        if (!recovered) {
-          return;
+    if (config.refreshEveryCycles > 0 && attempts % config.refreshEveryCycles === 0) {
+      resolved.log("info", `Refresh planifie apres ${config.refreshEveryCycles} cycle(s) sans creneau.`);
+      try {
+        if (activePage.isClosed()) {
+          const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
+          if (!recovered) {
+            return;
+          }
+          activePage = recovered;
+          lastKnownUrl = activePage.url();
         }
-        activePage = recovered;
-        lastKnownUrl = activePage.url();
-        continue;
-      }
 
-      const reason = `Refresh impossible ou page instable: ${error instanceof Error ? error.message : String(error)}`;
-      await safeScreenshot(activePage, "reload-error");
-      await alertAndPause(reason, resolved);
+        lastKnownUrl = activePage.url();
+        await refreshAndWaitForReady(activePage, resolved);
+      } catch (error) {
+        if (isTargetClosedError(error)) {
+          const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
+          if (!recovered) {
+            return;
+          }
+          activePage = recovered;
+          lastKnownUrl = activePage.url();
+          continue;
+        }
+
+        const reason = `Refresh impossible ou page instable: ${error instanceof Error ? error.message : String(error)}`;
+        if (isRateLimitReason(reason)) {
+          applyRateLimitCooldown(pageDomain(activePage), config.rateLimitCooldownMinutes, resolved.log);
+        }
+        await safeScreenshot(activePage, "reload-error");
+        await alertAndPause(reason, resolved);
+      }
+    } else {
+      resolved.log("info", `Refresh ignore ce cycle. Prochain refresh planifie tous les ${config.refreshEveryCycles || 0} cycle(s).`);
     }
 
-    resolved.log("info", "Relance immediate de la recherche apres refresh.");
+    await waitRandomDelay(
+      config.botCycleCooldownMinMs,
+      config.botCycleCooldownMaxMs,
+      resolved.log,
+      "Attente avant nouveau cycle"
+    );
   }
 
   resolved.log("warn", "Nombre maximum de tentatives atteint.");

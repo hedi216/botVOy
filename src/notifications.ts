@@ -31,6 +31,10 @@ const normalizeMessage = (message: string): string => message
 const classifyNotification = (message: string): NotificationCategory | null => {
   const text = normalizeMessage(message);
 
+  if (text.trim() === "alerte_utilisateur") {
+    return null;
+  }
+
   if (text.trim() === "creneau_potentiel_detecte") {
     return "appointment-detected";
   }
@@ -40,16 +44,21 @@ const classifyNotification = (message: string): NotificationCategory | null => {
   }
 
   if (
-    text.includes("alerte_utilisateur")
-    || text.includes("intervention humaine requise")
+    text.includes("intervention humaine requise")
     || text.includes("validation humaine")
+    || text.includes("validation humaine tls/cloudflare")
+    || text.includes("blocage tls/cloudflare")
+    || text.includes("rate limit")
     || text.includes("controle humain")
     || text.includes("captcha")
+    || text.includes("cloudflare")
     || text.includes("security check")
     || text.includes("page instable")
     || text.includes("page inattendue")
     || text.includes("refresh impossible")
+    || text.includes("page de connexion detectee")
     || text.includes("session expiree")
+    || text.includes("session tls")
     || text.includes("impossible de trouver l'onglet")
     || text.includes("onglet rendez-vous introuvable")
     || text.includes("fermez les onglets")

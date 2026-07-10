@@ -9,6 +9,7 @@ import { loadConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { monitorAppointments, waitForUserToStart } from "./monitor.js";
 import { AppConfig, MonitorEventLevel } from "./types.js";
+import { MonitoringSettings } from "./userService.js";
 
 export type SessionStatus = "created" | "starting" | "waiting" | "monitoring" | "stopped" | "error";
 
@@ -51,7 +52,8 @@ export class BotSession {
     private readonly name: string,
     private readonly port: number,
     private readonly profileDir: string,
-    private readonly callbacks: SessionCallbacks
+    private readonly callbacks: SessionCallbacks,
+    private readonly monitoringSettings?: MonitoringSettings
   ) {
     mkdirSync(path.join(process.cwd(), "artifacts", "logs"), { recursive: true });
     this.logStream = createWriteStream(this.logFile, { flags: "a" });
@@ -103,6 +105,7 @@ export class BotSession {
 
     const config: AppConfig = {
       ...loadConfig(),
+      ...this.monitoringSettings,
       connectToExistingChrome: true,
       chromeDebugUrl: `http://127.0.0.1:${this.port}`,
       targetUrl: "about:blank",
@@ -309,11 +312,15 @@ const getFreePort = async (): Promise<number> => new Promise((resolve, reject) =
   });
 });
 
-export const createBotSession = async (callbacks: SessionCallbacks, displayName?: string): Promise<BotSession> => {
+export const createBotSession = async (
+  callbacks: SessionCallbacks,
+  displayName?: string,
+  monitoringSettings?: MonitoringSettings
+): Promise<BotSession> => {
   const id = `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const name = displayName?.trim() || id;
   const port = await getFreePort();
   const profileDir = path.join(process.cwd(), "artifacts", "chrome-profiles", id);
 
-  return new BotSession(id, name, port, profileDir, callbacks);
+  return new BotSession(id, name, port, profileDir, callbacks, monitoringSettings);
 };

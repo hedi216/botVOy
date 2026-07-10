@@ -35,5 +35,12 @@ export const loadConfig = (): AppConfig => ({
   slowMoMs: numberEnv("SLOW_MO_MS", 200),
   debugKeepBrowserOpen: booleanEnv("DEBUG_KEEP_BROWSER_OPEN", true),
   maxRefreshAttempts: numberEnv("MAX_REFRESH_ATTEMPTS", 0),
-  scanMonthCount: numberEnv("SCAN_MONTH_COUNT", 0)
+  scanMonthCount: numberEnv("SCAN_MONTH_COUNT", 0),
+  maxParallelScansPerDomain: numberEnv("MAX_PARALLEL_SCANS_PER_DOMAIN", 1),
+  monthClickMinDelayMs: numberEnv("MONTH_CLICK_MIN_DELAY_MS", 5_000),
+  monthClickMaxDelayMs: numberEnv("MONTH_CLICK_MAX_DELAY_MS", 10_000),
+  botCycleCooldownMinMs: numberEnv("BOT_CYCLE_COOLDOWN_MIN_MS", 120_000),
+  botCycleCooldownMaxMs: numberEnv("BOT_CYCLE_COOLDOWN_MAX_MS", 240_000),
+  refreshEveryCycles: numberEnv("REFRESH_EVERY_CYCLES", 20),
+  rateLimitCooldownMinutes: numberEnv("RATE_LIMIT_COOLDOWN_MINUTES", 45)
 });

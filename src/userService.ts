@@ -1,6 +1,8 @@
 import { ADMIN_LOGIN, ADMIN_PASSWORD, DbAgency, DbUser, ensureDatabaseExists, ensureSchema, pool } from "./db.js";
+import { loadConfig } from "./config.js";
 import { hashPassword, verifyPassword } from "./password.js";
 import { randomBytes } from "node:crypto";
+import { AppConfig } from "./types.js";
 
 export type CreateUserInput = {
   agencyId: number;
@@ -14,6 +16,76 @@ export type CreateUserInput = {
 export type CreateUserResult = {
   user: DbUser;
   temporaryPassword: string;
+};
+
+export type MonitoringSettings = Pick<
+  AppConfig,
+  | "maxParallelScansPerDomain"
+  | "monthClickMinDelayMs"
+  | "monthClickMaxDelayMs"
+  | "botCycleCooldownMinMs"
+  | "botCycleCooldownMaxMs"
+  | "refreshEveryCycles"
+  | "rateLimitCooldownMinutes"
+>;
+
+const defaultMonitoringSettings = (): MonitoringSettings => {
+  const config = loadConfig();
+  return {
+    maxParallelScansPerDomain: config.maxParallelScansPerDomain,
+    monthClickMinDelayMs: config.monthClickMinDelayMs,
+    monthClickMaxDelayMs: config.monthClickMaxDelayMs,
+    botCycleCooldownMinMs: config.botCycleCooldownMinMs,
+    botCycleCooldownMaxMs: config.botCycleCooldownMaxMs,
+    refreshEveryCycles: config.refreshEveryCycles,
+    rateLimitCooldownMinutes: config.rateLimitCooldownMinutes
+  };
+};
+
+const agencyToMonitoringSettings = (agency: DbAgency | null): MonitoringSettings => {
+  const defaults = defaultMonitoringSettings();
+  if (!agency) {
+    return defaults;
+  }
+
+  return {
+    maxParallelScansPerDomain: agency.max_parallel_scans_per_domain ?? defaults.maxParallelScansPerDomain,
+    monthClickMinDelayMs: agency.month_click_min_delay_ms ?? defaults.monthClickMinDelayMs,
+    monthClickMaxDelayMs: agency.month_click_max_delay_ms ?? defaults.monthClickMaxDelayMs,
+    botCycleCooldownMinMs: agency.bot_cycle_cooldown_min_ms ?? defaults.botCycleCooldownMinMs,
+    botCycleCooldownMaxMs: agency.bot_cycle_cooldown_max_ms ?? defaults.botCycleCooldownMaxMs,
+    refreshEveryCycles: agency.refresh_every_cycles ?? defaults.refreshEveryCycles,
+    rateLimitCooldownMinutes: agency.rate_limit_cooldown_minutes ?? defaults.rateLimitCooldownMinutes
+  };
+};
+
+const clampInt = (value: unknown, fallback: number, min: number, max: number): number => {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) {
+    return fallback;
+  }
+
+  return Math.min(Math.max(Math.trunc(numberValue), min), max);
+};
+
+export const normalizeMonitoringSettings = (
+  patch: Partial<MonitoringSettings>,
+  current = defaultMonitoringSettings()
+): MonitoringSettings => {
+  const minMonthDelay = clampInt(patch.monthClickMinDelayMs, current.monthClickMinDelayMs, 0, 600_000);
+  const maxMonthDelay = clampInt(patch.monthClickMaxDelayMs, current.monthClickMaxDelayMs, minMonthDelay, 600_000);
+  const minCycleCooldown = clampInt(patch.botCycleCooldownMinMs, current.botCycleCooldownMinMs, 0, 3_600_000);
+  const maxCycleCooldown = clampInt(patch.botCycleCooldownMaxMs, current.botCycleCooldownMaxMs, minCycleCooldown, 3_600_000);
+
+  return {
+    maxParallelScansPerDomain: clampInt(patch.maxParallelScansPerDomain, current.maxParallelScansPerDomain, 1, 5),
+    monthClickMinDelayMs: minMonthDelay,
+    monthClickMaxDelayMs: maxMonthDelay,
+    botCycleCooldownMinMs: minCycleCooldown,
+    botCycleCooldownMaxMs: maxCycleCooldown,
+    refreshEveryCycles: clampInt(patch.refreshEveryCycles, current.refreshEveryCycles, 0, 100),
+    rateLimitCooldownMinutes: clampInt(patch.rateLimitCooldownMinutes, current.rateLimitCooldownMinutes, 1, 1_440)
+  };
 };
 
 export const initUserModule = async (): Promise<void> => {
@@ -114,6 +186,46 @@ export const createAgency = async (
 export const getAgency = async (agencyId: number): Promise<DbAgency | null> => {
   const result = await pool.query<DbAgency>("SELECT * FROM agencies WHERE id = $1", [agencyId]);
   return result.rows[0] ?? null;
+};
+
+export const getAgencyMonitoringSettings = async (agencyId: number | null): Promise<MonitoringSettings> => {
+  if (!agencyId) {
+    return defaultMonitoringSettings();
+  }
+
+  return agencyToMonitoringSettings(await getAgency(agencyId));
+};
+
+export const updateAgencyMonitoringSettings = async (
+  agencyId: number,
+  patch: Partial<MonitoringSettings>
+): Promise<MonitoringSettings> => {
+  const current = await getAgencyMonitoringSettings(agencyId);
+  const settings = normalizeMonitoringSettings(patch, current);
+  const result = await pool.query<DbAgency>(
+    `UPDATE agencies
+     SET max_parallel_scans_per_domain = $2,
+         month_click_min_delay_ms = $3,
+         month_click_max_delay_ms = $4,
+         bot_cycle_cooldown_min_ms = $5,
+         bot_cycle_cooldown_max_ms = $6,
+         refresh_every_cycles = $7,
+         rate_limit_cooldown_minutes = $8
+     WHERE id = $1
+     RETURNING *`,
+    [
+      agencyId,
+      settings.maxParallelScansPerDomain,
+      settings.monthClickMinDelayMs,
+      settings.monthClickMaxDelayMs,
+      settings.botCycleCooldownMinMs,
+      settings.botCycleCooldownMaxMs,
+      settings.refreshEveryCycles,
+      settings.rateLimitCooldownMinutes
+    ]
+  );
+
+  return agencyToMonitoringSettings(result.rows[0]);
 };
 
 export const setAgencyActive = async (agencyId: number, isActive: boolean): Promise<DbAgency> => {

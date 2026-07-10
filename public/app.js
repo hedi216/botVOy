@@ -78,6 +78,17 @@ const els = {
   agencyLimit: $("#agencyLimit"),
   agencyEmail: $("#agencyEmail"),
   agencyTableBody: $("#agencyTableBody"),
+  settingsForm: $("#settingsForm"),
+  settingsAgencyLabel: $("#settingsAgencyLabel"),
+  settingsAgency: $("#settingsAgency"),
+  maxParallelScansPerDomain: $("#maxParallelScansPerDomain"),
+  monthClickMinDelaySec: $("#monthClickMinDelaySec"),
+  monthClickMaxDelaySec: $("#monthClickMaxDelaySec"),
+  botCycleCooldownMinMin: $("#botCycleCooldownMinMin"),
+  botCycleCooldownMaxMin: $("#botCycleCooldownMaxMin"),
+  refreshEveryCycles: $("#refreshEveryCycles"),
+  rateLimitCooldownMinutes: $("#rateLimitCooldownMinutes"),
+  settingsMessage: $("#settingsMessage"),
   profileInitial: $("#profileInitial"),
   profileName: $("#profileName"),
   profileLogin: $("#profileLogin"),
@@ -98,6 +109,7 @@ const pageMeta = {
   bot: ["Bot", "Demarrage du navigateur client et validation des pauses."],
   logs: ["Logs", "Historique important pour support et maintenance."],
   maintenance: ["Maintenance", "Sessions Chrome et serveur web local."],
+  settings: ["Parametres", "Orchestration et rythme de surveillance des bots."],
   users: ["User Management", "Gestion des comptes utilisateurs et activation."],
   agencies: ["Agences", "Limites clients et activation des agences."],
   profile: ["Profil", "Informations du compte et securite."]
@@ -158,6 +170,7 @@ const setAuthenticated = (user) => {
   const isAdmin = user.role === 0;
   $$(".admin-nav").forEach((el) => { el.hidden = !canManageUsers; });
   $$(".admin-only").forEach((el) => { el.hidden = !isAdmin; });
+  $$(".settings-nav").forEach((el) => { el.hidden = ![0, 1].includes(user.role); });
   els.userAgencyLabel.hidden = !isAdmin;
 
   els.accountName.textContent = user.name;
@@ -175,6 +188,9 @@ const showPage = async (page) => {
   if (page === "agencies" && state.user?.role !== 0) {
     page = "dashboard";
   }
+  if (page === "settings" && ![0, 1].includes(state.user?.role)) {
+    page = "dashboard";
+  }
 
   state.page = page;
   $$(".page").forEach((el) => el.classList.toggle("active", el.id === `page-${page}`));
@@ -190,6 +206,9 @@ const showPage = async (page) => {
   }
   if (page === "agencies") {
     await loadAgencies();
+  }
+  if (page === "settings") {
+    await loadMonitoringSettings();
   }
 };
 
@@ -260,6 +279,40 @@ const renderAgencies = () => {
     row.append(actionCell);
     els.agencyTableBody.append(row);
   }
+};
+
+const loadMonitoringSettings = async () => {
+  if (![0, 1].includes(state.user?.role)) {
+    return;
+  }
+
+  if (state.user.role === 0 && state.agencies.length === 0) {
+    await loadAgencies();
+  }
+
+  els.settingsAgencyLabel.hidden = state.user.role !== 0;
+  els.settingsAgency.replaceChildren();
+  if (state.user.role === 0) {
+    for (const agency of state.agencies) {
+      const option = document.createElement("option");
+      option.value = String(agency.id);
+      option.textContent = agency.name;
+      els.settingsAgency.append(option);
+    }
+  }
+
+  const agencyId = state.user.role === 0 ? els.settingsAgency.value : "";
+  const url = agencyId ? `/api/monitoring-settings?agencyId=${encodeURIComponent(agencyId)}` : "/api/monitoring-settings";
+  const { settings } = await requestJson(url);
+  els.maxParallelScansPerDomain.value = String(settings.maxParallelScansPerDomain);
+  els.monthClickMinDelaySec.value = String(Math.round(settings.monthClickMinDelayMs / 1000));
+  els.monthClickMaxDelaySec.value = String(Math.round(settings.monthClickMaxDelayMs / 1000));
+  els.botCycleCooldownMinMin.value = String(Math.round(settings.botCycleCooldownMinMs / 60000));
+  els.botCycleCooldownMaxMin.value = String(Math.round(settings.botCycleCooldownMaxMs / 60000));
+  els.refreshEveryCycles.value = String(settings.refreshEveryCycles);
+  els.rateLimitCooldownMinutes.value = String(settings.rateLimitCooldownMinutes);
+  els.settingsMessage.textContent = "";
+  els.settingsMessage.className = "form-message";
 };
 
 const loadUsers = async () => {
@@ -563,6 +616,38 @@ els.agencyTableBody.addEventListener("click", async (event) => {
     body: JSON.stringify({ isActive: button.dataset.active === "true" })
   });
   await loadAgencies();
+});
+
+els.settingsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  els.settingsMessage.textContent = "";
+  els.settingsMessage.className = "form-message";
+
+  try {
+    await requestJson("/api/monitoring-settings", {
+      method: "PATCH",
+      body: JSON.stringify({
+        agencyId: state.user.role === 0 ? Number(els.settingsAgency.value) : undefined,
+        maxParallelScansPerDomain: Number(els.maxParallelScansPerDomain.value),
+        monthClickMinDelayMs: Number(els.monthClickMinDelaySec.value) * 1000,
+        monthClickMaxDelayMs: Number(els.monthClickMaxDelaySec.value) * 1000,
+        botCycleCooldownMinMs: Number(els.botCycleCooldownMinMin.value) * 60000,
+        botCycleCooldownMaxMs: Number(els.botCycleCooldownMaxMin.value) * 60000,
+        refreshEveryCycles: Number(els.refreshEveryCycles.value),
+        rateLimitCooldownMinutes: Number(els.rateLimitCooldownMinutes.value)
+      })
+    });
+    await loadMonitoringSettings();
+    els.settingsMessage.textContent = "Parametres enregistres.";
+    els.settingsMessage.classList.add("success");
+  } catch (error) {
+    els.settingsMessage.textContent = error.message;
+    els.settingsMessage.classList.add("error");
+  }
+});
+
+els.settingsAgency.addEventListener("change", () => {
+  void loadMonitoringSettings();
 });
 
 els.userForm.addEventListener("submit", async (event) => {

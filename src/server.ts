@@ -15,11 +15,13 @@ import {
   createAgency,
   createUser,
   getAgency,
+  getAgencyMonitoringSettings,
   initUserModule,
   listAgencies,
   listUsersForRequester,
   resetUserPassword,
   updateAgency,
+  updateAgencyMonitoringSettings,
   updateUser
 } from "./userService.js";
 import { notifyAgencyIfNeeded } from "./notifications.js";
@@ -164,6 +166,35 @@ app.patch("/api/users/:id", requireAuth, requireAgencyManager, async (req: Authe
 
 app.post("/api/users/:id/reset-password", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
   res.json(await resetUserPassword(Number(req.params.id), req.user!));
+});
+
+app.get("/api/monitoring-settings", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = req.user!.role === 0
+    ? Number(req.query.agencyId)
+    : Number(req.user!.agency_id);
+
+  if (![0, 1].includes(req.user!.role) || !agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  res.json({ settings: await getAgencyMonitoringSettings(agencyId) });
+});
+
+app.patch("/api/monitoring-settings", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const body = req.body as { agencyId?: number };
+  const agencyId = req.user!.role === 0
+    ? Number(body.agencyId)
+    : Number(req.user!.agency_id);
+
+  if (![0, 1].includes(req.user!.role) || !agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  res.json({
+    settings: await updateAgencyMonitoringSettings(agencyId, req.body)
+  });
 });
 
 app.post("/api/email/test-alert", requireAuth, requireAdmin, async (req, res) => {
@@ -410,6 +441,7 @@ io.on("connection", (socket) => {
     }
 
     let sessionKey = "";
+    const monitoringSettings = await getAgencyMonitoringSettings(owner.agencyId);
     const session = await createBotSession({
       onLog: (event) => recordLog(owner, event, sessionKey),
       onPrompt: (message) => {
@@ -439,7 +471,7 @@ io.on("connection", (socket) => {
           emitMaintenance();
         }
       }
-    }, botName);
+    }, botName, monitoringSettings);
 
     sessionKey = session.snapshot().id;
     sessions.set(sessionKey, session);

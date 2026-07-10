@@ -49,6 +49,7 @@
           <button class="nav-item" data-page-target="bot">Bot</button>
           <button class="nav-item" data-page-target="logs">Logs</button>
           <button class="nav-item" data-page-target="maintenance">Maintenance</button>
+          <button class="nav-item settings-nav" data-page-target="settings" hidden>Parametres</button>
 
           <p class="admin-nav" hidden>ADMINISTRATION</p>
           <button class="nav-item admin-nav" data-page-target="users" hidden>Utilisateurs</button>
@@ -204,6 +205,49 @@
               </div>
             </section>
             <ol id="sessionList" class="session-list"></ol>
+          </section>
+
+          <section class="page" id="page-settings">
+            <section class="form-panel">
+              <h2>Parametres de surveillance</h2>
+              <p>Ces valeurs s'appliquent aux bots de votre agence. Elles permettent de reduire les blocages dus aux recherches trop rapides.</p>
+              <form id="settingsForm" class="settings-form">
+                <label id="settingsAgencyLabel" class="admin-only" hidden>
+                  Agence
+                  <select id="settingsAgency"></select>
+                </label>
+                <label>
+                  Scans simultanes maximum
+                  <input id="maxParallelScansPerDomain" type="number" min="1" max="5" required>
+                </label>
+                <label>
+                  Delai min entre mois (secondes)
+                  <input id="monthClickMinDelaySec" type="number" min="0" max="600" required>
+                </label>
+                <label>
+                  Delai max entre mois (secondes)
+                  <input id="monthClickMaxDelaySec" type="number" min="0" max="600" required>
+                </label>
+                <label>
+                  Pause min entre cycles (minutes)
+                  <input id="botCycleCooldownMinMin" type="number" min="0" max="60" required>
+                </label>
+                <label>
+                  Pause max entre cycles (minutes)
+                  <input id="botCycleCooldownMaxMin" type="number" min="0" max="60" required>
+                </label>
+                <label>
+                  Refresh tous les X cycles (defaut conseille: 20)
+                  <input id="refreshEveryCycles" type="number" min="1" max="100" required>
+                </label>
+                <label>
+                  Cooldown rate limit (minutes)
+                  <input id="rateLimitCooldownMinutes" type="number" min="1" max="1440" required>
+                </label>
+                <button class="primary" type="submit">Enregistrer</button>
+              </form>
+              <p id="settingsMessage" class="form-message"></p>
+            </section>
           </section>
 
           <section class="page" id="page-users">

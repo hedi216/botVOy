@@ -10,6 +10,13 @@ export type AppConfig = {
   debugKeepBrowserOpen: boolean;
   maxRefreshAttempts: number;
   scanMonthCount: number;
+  maxParallelScansPerDomain: number;
+  monthClickMinDelayMs: number;
+  monthClickMaxDelayMs: number;
+  botCycleCooldownMinMs: number;
+  botCycleCooldownMaxMs: number;
+  refreshEveryCycles: number;
+  rateLimitCooldownMinutes: number;
 };
 
 export type HumanValidationResult = {

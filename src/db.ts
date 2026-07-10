@@ -23,6 +23,13 @@ export type DbAgency = {
   notification_email: string | null;
   is_active: boolean;
   max_active_clients: number;
+  max_parallel_scans_per_domain: number;
+  month_click_min_delay_ms: number;
+  month_click_max_delay_ms: number;
+  bot_cycle_cooldown_min_ms: number;
+  bot_cycle_cooldown_max_ms: number;
+  refresh_every_cycles: number;
+  rate_limit_cooldown_minutes: number;
   created_at: string;
 };
 
@@ -68,6 +75,13 @@ export const ensureSchema = async (): Promise<void> => {
       notification_email TEXT,
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
       max_active_clients INTEGER NOT NULL DEFAULT 15 CHECK (max_active_clients BETWEEN 0 AND 15),
+      max_parallel_scans_per_domain INTEGER NOT NULL DEFAULT 1 CHECK (max_parallel_scans_per_domain BETWEEN 1 AND 5),
+      month_click_min_delay_ms INTEGER NOT NULL DEFAULT 5000 CHECK (month_click_min_delay_ms BETWEEN 0 AND 600000),
+      month_click_max_delay_ms INTEGER NOT NULL DEFAULT 10000 CHECK (month_click_max_delay_ms BETWEEN 0 AND 600000),
+      bot_cycle_cooldown_min_ms INTEGER NOT NULL DEFAULT 120000 CHECK (bot_cycle_cooldown_min_ms BETWEEN 0 AND 3600000),
+      bot_cycle_cooldown_max_ms INTEGER NOT NULL DEFAULT 240000 CHECK (bot_cycle_cooldown_max_ms BETWEEN 0 AND 3600000),
+      refresh_every_cycles INTEGER NOT NULL DEFAULT 20 CHECK (refresh_every_cycles BETWEEN 0 AND 100),
+      rate_limit_cooldown_minutes INTEGER NOT NULL DEFAULT 45 CHECK (rate_limit_cooldown_minutes BETWEEN 1 AND 1440),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -89,11 +103,27 @@ export const ensureSchema = async (): Promise<void> => {
 
   await pool.query(`
     ALTER TABLE agencies
-      ADD COLUMN IF NOT EXISTS notification_email TEXT;
+      ADD COLUMN IF NOT EXISTS notification_email TEXT,
+      ADD COLUMN IF NOT EXISTS max_parallel_scans_per_domain INTEGER NOT NULL DEFAULT 1,
+      ADD COLUMN IF NOT EXISTS month_click_min_delay_ms INTEGER NOT NULL DEFAULT 5000,
+      ADD COLUMN IF NOT EXISTS month_click_max_delay_ms INTEGER NOT NULL DEFAULT 10000,
+      ADD COLUMN IF NOT EXISTS bot_cycle_cooldown_min_ms INTEGER NOT NULL DEFAULT 120000,
+      ADD COLUMN IF NOT EXISTS bot_cycle_cooldown_max_ms INTEGER NOT NULL DEFAULT 240000,
+      ADD COLUMN IF NOT EXISTS refresh_every_cycles INTEGER NOT NULL DEFAULT 20,
+      ADD COLUMN IF NOT EXISTS rate_limit_cooldown_minutes INTEGER NOT NULL DEFAULT 45;
 
     ALTER TABLE users
       ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ;
+  `);
+
+  await pool.query(`
+    ALTER TABLE agencies
+      ALTER COLUMN refresh_every_cycles SET DEFAULT 20;
+
+    UPDATE agencies
+       SET refresh_every_cycles = 20
+     WHERE refresh_every_cycles = 4;
   `);
 };
