@@ -552,6 +552,24 @@ td {
   color: var(--red);
 }
 
+.pill.amber {
+  background: #fff3d6;
+  color: var(--amber);
+}
+
+@keyframes needs-validation-blink {
+  0%, 100% {
+    background: transparent;
+  }
+  50% {
+    background: #fff3d6;
+  }
+}
+
+tr.needs-validation {
+  animation: needs-validation-blink 1.2s ease-in-out infinite;
+}
+
 .password-notice {
   background: #fff9e8;
   border-color: #e6a900;

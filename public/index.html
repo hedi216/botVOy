@@ -120,48 +120,57 @@
           </section>
 
           <section class="page" id="page-bot">
-            <section class="panel-section bot-control">
+            <section class="form-panel">
               <div>
-                <h2>Controle du bot</h2>
-                <p class="quiet">Lance un Chrome dedie au client, puis valide ici quand la page de rendez-vous est prete.</p>
+                <h2>Ajouter un bot</h2>
+                <p>Login et mot de passe ne sont jamais enregistres : ils servent uniquement a la connexion automatique du bot.</p>
               </div>
-              <div class="button-row">
-                <label class="bot-session-field">
-                  Bot actif
-                  <select id="botSelector"></select>
-                </label>
-                <label class="bot-name-field">
+              <form id="botForm" class="create-user-form">
+                <label>
                   Nom du bot
-                  <input id="botName" placeholder="Client 1">
+                  <input id="botFormName" placeholder="Bot 1" required>
                 </label>
-                <span class="bot-quota">Clients actifs <strong id="botActiveCount">0 / -</strong></span>
-                <button id="startBot" class="primary">Demarrer le bot</button>
-                <button id="continueBot" disabled>Valider / continuer</button>
-                <button id="stopBot" class="danger" disabled>Arreter</button>
-              </div>
+                <label>
+                  Categorie
+                  <select id="botFormCategory" required>
+                    <option value="" disabled selected>Choisir une categorie</option>
+                    <option value="Tourisme – privée – primo">Tourisme – privée – primo</option>
+                    <option value="Tourisme – privée – visé">Tourisme – privée – visé</option>
+                    <option value="Visite familiale – privée – primo">Visite familiale – privée – primo</option>
+                    <option value="Visite familiale – privée – visé">Visite familiale – privée – visé</option>
+                    <option value="Visite circulation">Visite circulation</option>
+                    <option value="Affaires et professionnel">Affaires et professionnel</option>
+                  </select>
+                </label>
+                <label>
+                  Login
+                  <input id="botFormLogin" placeholder="identifiant TLScontact" required>
+                </label>
+                <label>
+                  Mot de passe
+                  <input id="botFormPassword" type="password" placeholder="mot de passe" required>
+                </label>
+                <button id="startBot" class="primary" type="submit">Demarrer le bot</button>
+              </form>
+              <span class="bot-quota">Clients actifs <strong id="botActiveCount">0 / -</strong></span>
             </section>
 
-            <div class="metric-grid">
-              <article class="metric">
-                <span>Statut</span>
-                <strong id="status">Pret</strong>
-              </article>
-              <article class="metric">
-                <span>Port Chrome</span>
-                <strong id="chromePort">-</strong>
-              </article>
-              <article class="metric">
-                <span>Fichier log</span>
-                <strong id="logFile">-</strong>
-              </article>
-            </div>
+            <input id="botSearch" class="search-input" placeholder="Rechercher par login ou nom du bot...">
 
-            <section class="prompt-panel" id="promptBox" hidden>
-              <div>
-                <span class="muted-label">Action utilisateur</span>
-                <p id="promptText"></p>
-              </div>
-              <button id="promptContinue" class="primary" disabled>Valider</button>
+            <section class="table-panel">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Nom</th>
+                    <th>Categorie</th>
+                    <th>Login</th>
+                    <th>Statut</th>
+                    <th>Port</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="botTableBody"></tbody>
+              </table>
             </section>
           </section>
 

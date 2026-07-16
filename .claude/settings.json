@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue | Select-Object LocalPort,OwningProcess\")",
+      "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=16344\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 16344,7704 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(npm run *)",
+      "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=2316\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 2316,25836 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=16628\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 16628,26172 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=21700\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 21700,13032 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=27260\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 27260,28044 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=16856\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 16856,16492 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=16904\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 16904,30160 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=28044\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 28044,28364 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=9392\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 9392,25436 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=16772\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 16772,5756 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=3976\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 3976,28560 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter \\\\\"name='node.exe'\\\\\" | Select-Object ProcessId, CommandLine\")"
+    ]
+  }
+}

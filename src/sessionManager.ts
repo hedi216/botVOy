@@ -6,12 +6,20 @@ import path from "node:path";
 import { Browser, Page } from "playwright";
 import { launchBrowser } from "./browser.js";
 import { loadConfig } from "./config.js";
+import { clickBookNewAppointment, clickSeConnecter, clickSelectTravelGroup, fillLoginForm } from "./loginFlow.js";
 import { logger } from "./logger.js";
 import { monitorAppointments, waitForUserToStart } from "./monitor.js";
+import { takeTimestampedScreenshot } from "./screenshot.js";
 import { AppConfig, MonitorEventLevel } from "./types.js";
 import { MonitoringSettings } from "./userService.js";
 
-export type SessionStatus = "created" | "starting" | "waiting" | "monitoring" | "stopped" | "error";
+export type SessionStatus = "created" | "starting" | "waiting" | "monitoring" | "paused" | "stopped" | "error";
+
+export type BotCredentials = {
+  login?: string;
+  password?: string;
+  category?: string;
+};
 
 export type SessionEvent = {
   level: MonitorEventLevel;
@@ -37,12 +45,18 @@ export type BotSessionSnapshot = {
 const isTargetClosedMessage = (message: string): boolean =>
   /target page, context or browser has been closed|browser has been closed|context has been closed|page has been closed/i.test(message);
 const appointmentPagePattern = /\/workflow\/appointment-booking\//i;
+const authPagePattern = /i2-auth\.visas-fr\.tlscontact\.com/i;
+const travelGroupsPagePattern = /\/fr-fr\/travel-groups/i;
+const applicationSummaryPagePattern = /\/workflow\/application-summary/i;
+const HUMAN_VALIDATION_TIMEOUT_MS = 2 * 60 * 1000;
 
 export class BotSession {
   private browser?: Browser;
   private chromeProcess?: ChildProcess;
   private page?: Page;
   private pendingContinue?: () => void;
+  private pauseGate?: Promise<void>;
+  private resolvePause?: () => void;
   private status: SessionStatus = "created";
   private stopRequested = false;
   private logStream: WriteStream;
@@ -53,7 +67,8 @@ export class BotSession {
     private readonly port: number,
     private readonly profileDir: string,
     private readonly callbacks: SessionCallbacks,
-    private readonly monitoringSettings?: MonitoringSettings
+    private readonly monitoringSettings?: MonitoringSettings,
+    private readonly credentials?: BotCredentials
   ) {
     mkdirSync(path.join(process.cwd(), "artifacts", "logs"), { recursive: true });
     this.logStream = createWriteStream(this.logFile, { flags: "a" });
@@ -90,8 +105,35 @@ export class BotSession {
     resolve();
   }
 
+  pause(): void {
+    if (this.pauseGate || !this.isActive() || this.status === "paused") {
+      return;
+    }
+
+    this.pauseGate = new Promise((resolve) => {
+      this.resolvePause = resolve;
+    });
+    this.setStatus("paused");
+    this.log("warn", "Bot mis en pause.");
+  }
+
+  resume(): void {
+    if (!this.pauseGate) {
+      return;
+    }
+
+    this.resolvePause?.();
+    this.pauseGate = undefined;
+    this.resolvePause = undefined;
+    this.setStatus("monitoring");
+    this.log("info", "Bot repris.");
+  }
+
+  private waitWhilePaused = (): Promise<void> => this.pauseGate ?? Promise.resolve();
+
   async stop(): Promise<void> {
     this.stopRequested = true;
+    this.resolvePause?.();
     this.setStatus("stopped");
     await this.browser?.close().catch(() => undefined);
     this.chromeProcess?.kill();
@@ -108,7 +150,6 @@ export class BotSession {
       ...this.monitoringSettings,
       connectToExistingChrome: true,
       chromeDebugUrl: `http://127.0.0.1:${this.port}`,
-      targetUrl: "about:blank",
       headless: false
     };
 
@@ -127,18 +168,33 @@ export class BotSession {
 
     try {
       this.setStatus("waiting");
-      await waitForUserToStart({
-        log: (level, message) => this.log(level, message),
-        waitForUser: (message) => this.waitForUser(message)
-      });
+      const pendingValidationTimer = setTimeout(() => {
+        this.log(
+          "warn",
+          "Validation humaine en attente depuis plus de 2 minutes. Ouvrez le navigateur du bot pour terminer la connexion, puis validez dans l'application."
+        );
+      }, HUMAN_VALIDATION_TIMEOUT_MS);
+
+      try {
+        await waitForUserToStart({
+          log: (level, message) => this.log(level, message),
+          waitForUser: (message) => this.waitForUser(message)
+        });
+      } finally {
+        clearTimeout(pendingValidationTimer);
+      }
+
+      await this.attemptAutoLogin();
 
       const monitoredPage = await this.waitForAppointmentPage();
       this.setStatus("monitoring");
       await monitorAppointments(monitoredPage, config, {
         botName: this.name,
+        category: this.credentials?.category,
         log: (level, message) => this.log(level, message),
         waitForUser: (message) => this.waitForUser(message),
-        recoverPage: (preferredUrl) => this.recoverPage(preferredUrl)
+        recoverPage: (preferredUrl) => this.recoverPage(preferredUrl),
+        waitWhileNotPaused: () => this.waitWhilePaused()
       });
 
       this.setStatus("stopped");
@@ -229,8 +285,148 @@ export class BotSession {
     return page;
   }
 
+  private async attemptAutoLogin(): Promise<void> {
+    if (!this.page || this.page.isClosed()) {
+      return;
+    }
+
+    const url = this.page.url();
+    if (appointmentPagePattern.test(url)) {
+      return;
+    }
+
+    if (!authPagePattern.test(url)) {
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const clicked = await clickSeConnecter(this.page, (level, message) => this.log(level, message))
+          .catch((error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            this.log("warn", `Clic automatique sur 'Se connecter' impossible: ${message}`);
+            return false;
+          });
+
+        if (clicked) {
+          await this.page?.waitForURL(authPagePattern, { timeout: 8_000 }).catch(() => undefined);
+        }
+
+        if (this.page.isClosed() || authPagePattern.test(this.page.url())) {
+          break;
+        }
+
+        if (attempt === 1) {
+          this.log("info", "Nouvelle tentative de clic sur 'Se connecter' dans 3s.");
+          await new Promise((resolve) => setTimeout(resolve, 3_000));
+        }
+      }
+
+      if (!this.page.isClosed() && !authPagePattern.test(this.page.url())) {
+        this.log("warn", "Page de connexion non atteinte apres les tentatives automatiques.");
+        await takeTimestampedScreenshot(this.page, "auto-login-failed").catch(() => undefined);
+      }
+    }
+
+    if (!this.credentials?.login || !this.credentials?.password || this.page.isClosed()) {
+      return;
+    }
+
+    if (!authPagePattern.test(this.page.url())) {
+      return;
+    }
+
+    await fillLoginForm(this.page, this.credentials.login, this.credentials.password, (level, message) => this.log(level, message))
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.log("warn", `Remplissage automatique du formulaire de connexion impossible: ${message}`);
+        return false;
+      });
+
+    if (this.page.isClosed()) {
+      return;
+    }
+
+    // Meme si fillLoginForm n'a pas pu confirmer le clic (bouton non trouve, soumission
+    // via Entree, etc.), la page a pu naviguer quand meme: on verifie l'URL resultante
+    // plutot que de s'arreter sur la seule valeur de retour.
+    await this.page.waitForURL((current) => !authPagePattern.test(current.toString()), { timeout: 20_000 })
+      .catch(() => undefined);
+
+    if (this.page.isClosed() || appointmentPagePattern.test(this.page.url())) {
+      return;
+    }
+
+    if (authPagePattern.test(this.page.url())) {
+      this.log("warn", "Toujours sur la page de connexion apres soumission automatique.");
+      await takeTimestampedScreenshot(this.page, "auto-fill-login-failed").catch(() => undefined);
+      return;
+    }
+
+    if (!travelGroupsPagePattern.test(this.page.url())) {
+      return;
+    }
+
+    const selected = await clickSelectTravelGroup(this.page, (level, message) => this.log(level, message))
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.log("warn", `Selection automatique de la demande impossible: ${message}`);
+        return false;
+      });
+
+    // La navigation apres "Selectionner" est cote SPA et peut enchainer plusieurs
+    // etapes intermediaires (applicants-information, etc.) sans rechargement complet:
+    // waitForLoadState("domcontentloaded") ne l'attend pas. On poll l'URL jusqu'a ce
+    // qu'elle quitte reellement travel-groups, avec une marge large pour les enchainements.
+    if (selected) {
+      await this.waitForUrlAway(travelGroupsPagePattern, 15_000);
+    }
+
+    if (this.page.isClosed() || appointmentPagePattern.test(this.page.url())) {
+      return;
+    }
+
+    if (!applicationSummaryPagePattern.test(this.page.url())) {
+      return;
+    }
+
+    const booking = await clickBookNewAppointment(this.page, (level, message) => this.log(level, message))
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.log("warn", `Clic automatique sur 'Prendre un nouveau rendez-vous' impossible: ${message}`);
+        return false;
+      });
+
+    if (booking) {
+      await this.waitForUrlAway(applicationSummaryPagePattern, 15_000);
+    }
+  }
+
+  private async waitForUrlAway(currentPagePattern: RegExp, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (!this.page || this.page.isClosed()) {
+        return;
+      }
+
+      if (!currentPagePattern.test(this.page.url())) {
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
   private async waitForAppointmentPage(): Promise<Page> {
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
+    let attempt = 0;
+
+    // Pas de limite de tentatives : une procedure externe (file d'attente Cloudflare,
+    // OTP...) peut prendre plusieurs minutes. On ne renonce que si le navigateur est
+    // reellement ferme/deconnecte (verifie explicitement, pas par un compteur d'essais).
+    while (true) {
+      attempt += 1;
+
+      if (!this.browser?.isConnected()) {
+        throw new Error("Navigateur du bot deconnecte.");
+      }
+
       const page = await this.recoverPage();
       if (page && appointmentPagePattern.test(page.url())) {
         this.log("success", `Onglet rendez-vous selectionne: ${page.url()}`);
@@ -238,18 +434,11 @@ export class BotSession {
       }
 
       const currentUrl = page?.url() ?? "aucun onglet";
-      this.log("warn", `Onglet rendez-vous introuvable. Onglet actuel: ${currentUrl}`);
+      this.log("warn", `Onglet rendez-vous introuvable (tentative ${attempt}). Onglet actuel: ${currentUrl}`);
       await this.waitForUser(
         "Fermez les onglets/fenetres extra, gardez seulement la page de rendez-vous, puis validez."
       );
     }
-
-    const page = await this.recoverPage();
-    if (!page || !appointmentPagePattern.test(page.url())) {
-      throw new Error("Impossible de trouver l'onglet de prise de rendez-vous apres validation.");
-    }
-
-    return page;
   }
 
   private async waitForChromeDebug(): Promise<void> {
@@ -316,12 +505,13 @@ const getFreePort = async (): Promise<number> => new Promise((resolve, reject) =
 export const createBotSession = async (
   callbacks: SessionCallbacks,
   displayName?: string,
-  monitoringSettings?: MonitoringSettings
+  monitoringSettings?: MonitoringSettings,
+  credentials?: BotCredentials
 ): Promise<BotSession> => {
   const id = `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const name = displayName?.trim() || id;
   const port = await getFreePort();
   const profileDir = path.join(process.cwd(), "artifacts", "chrome-profiles", id);
 
-  return new BotSession(id, name, port, profileDir, callbacks, monitoringSettings);
+  return new BotSession(id, name, port, profileDir, callbacks, monitoringSettings, credentials);
 };

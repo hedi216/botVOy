@@ -20,15 +20,18 @@ import { AppConfig, CandidateElementResult, MonitorEventLevel, MonitorRuntime } 
 
 type ResolvedMonitorRuntime = {
   botName?: string;
+  category?: string;
   log: (level: MonitorEventLevel, message: string) => void;
   waitForUser: (message: string) => Promise<void>;
   recoverPage: (preferredUrl?: string) => Promise<Page | null>;
+  waitWhileNotPaused: () => Promise<void>;
 };
 
 const defaultRuntime: ResolvedMonitorRuntime = {
   log: (level: MonitorEventLevel, message: string) => logger[level](message),
   waitForUser: async (message: string) => askEnter(message),
-  recoverPage: async () => null
+  recoverPage: async () => null,
+  waitWhileNotPaused: async () => undefined
 };
 
 const askEnter = async (message: string): Promise<void> => {
@@ -42,9 +45,11 @@ const askEnter = async (message: string): Promise<void> => {
 
 const resolveRuntime = (runtime?: MonitorRuntime): ResolvedMonitorRuntime => ({
   botName: runtime?.botName,
+  category: runtime?.category,
   log: runtime?.log ?? defaultRuntime.log,
   waitForUser: runtime?.waitForUser ?? defaultRuntime.waitForUser,
-  recoverPage: runtime?.recoverPage ?? defaultRuntime.recoverPage
+  recoverPage: runtime?.recoverPage ?? defaultRuntime.recoverPage,
+  waitWhileNotPaused: runtime?.waitWhileNotPaused ?? defaultRuntime.waitWhileNotPaused
 });
 
 export const waitForUserToStart = async (runtime?: MonitorRuntime): Promise<void> => {
@@ -535,6 +540,7 @@ export const monitorAppointments = async (
   let attempts = 0;
 
   while (config.maxRefreshAttempts === 0 || attempts < config.maxRefreshAttempts) {
+    await resolved.waitWhileNotPaused();
     attempts += 1;
     lastKnownUrl = activePage.isClosed() ? lastKnownUrl : activePage.url();
     resolved.log("info", `Surveillance tentative ${attempts}.`);
@@ -557,9 +563,10 @@ export const monitorAppointments = async (
     }
 
     const domain = pageDomain(activePage);
+    const groupKey = resolved.category ? `${domain}::${resolved.category}` : domain;
     await waitForScanTurn({
       botName: resolved.botName,
-      domain,
+      domain: groupKey,
       settings: config,
       log: resolved.log
     });
@@ -571,7 +578,7 @@ export const monitorAppointments = async (
         await returnToFirstAccessibleMonth(activePage, config, resolved);
       }
     } finally {
-      releaseScanTurn(domain, resolved.log);
+      releaseScanTurn(groupKey, resolved.log);
     }
 
     if (availability.detected) {
@@ -580,7 +587,7 @@ export const monitorAppointments = async (
         resolved.log("warn", "Signal de disponibilite ignore: aucun horaire ou bouton cliquable fiable trouve.");
         resolved.log("info", "AUCUN_CRENEAU_DETECTE");
 
-        if (isAppointmentSignalActive(domain)) {
+        if (isAppointmentSignalActive(groupKey)) {
           resolved.log("warn", "Mode creneau actif: aucun element cliquable fiable. Refresh rapide et nouvelle recherche.");
           try {
             await refreshAndWaitForReady(activePage, resolved);
@@ -597,7 +604,7 @@ export const monitorAppointments = async (
           config.botCycleCooldownMaxMs,
           resolved.log,
           "Attente avant nouveau cycle",
-          domain,
+          groupKey,
           resolved.botName
         );
         continue;
@@ -606,7 +613,7 @@ export const monitorAppointments = async (
       resolved.log("success", "CRENEAU_POTENTIEL_DETECTE");
       resolved.log("info", `Date/heure: ${availability.dateTimeHint ?? candidate.text ?? "non determinee"}`);
       resolved.log("info", `Texte trouve: ${availability.textFound ?? candidate.text ?? "non determine"}`);
-      broadcastAppointmentSignal(domain, resolved.botName, resolved.log);
+      broadcastAppointmentSignal(groupKey, resolved.botName, resolved.log);
       await takeTimestampedScreenshot(activePage, "appointment-detected");
       await highlightElement(activePage, candidate.locator);
       process.stdout.write("\u0007");
@@ -617,7 +624,7 @@ export const monitorAppointments = async (
         if (reserveResult === "reserved") {
           resolved.log("success", "RENDEZ_VOUS_RESERVE_TEMPORAIRE");
           resolved.log("info", "Reservation confirmee: URL/contenu order-summary detecte.");
-          scheduleReservationHoldRecheck(domain, resolved.botName, resolved.log);
+          scheduleReservationHoldRecheck(groupKey, resolved.botName, resolved.log);
           await resolved.waitForUser("Rendez-vous reserve temporairement. Continuez manuellement les etapes suivantes, puis validez si vous voulez reprendre.");
           return;
         }
@@ -640,9 +647,9 @@ export const monitorAppointments = async (
 
     resolved.log("info", "AUCUN_CRENEAU_DETECTE");
 
-    if (isAppointmentSignalActive(domain)) {
+    if (isAppointmentSignalActive(groupKey)) {
       if (await hasNoSlotsMessage(activePage)) {
-        clearAppointmentSignal(domain, "message officiel aucun creneau disponible", resolved.log);
+        clearAppointmentSignal(groupKey, "message officiel aucun creneau disponible", resolved.log);
       } else {
         resolved.log("warn", "Mode creneau actif: aucun creneau confirme. Refresh rapide et nouveau balayage.");
         try {
@@ -697,7 +704,7 @@ export const monitorAppointments = async (
       config.botCycleCooldownMaxMs,
       resolved.log,
       "Attente avant nouveau cycle",
-      domain,
+      groupKey,
       resolved.botName
     );
   }
