@@ -42,7 +42,7 @@ import {
   updateExtensionLink,
   updateUser
 } from "./userService.js";
-import { notifyAgencyIfNeeded } from "./notifications.js";
+import { notifyUserIfNeeded } from "./notifications.js";
 import { sendAppAlert } from "./appAlertService.js";
 
 type SessionOwner = {
@@ -148,6 +148,7 @@ app.post("/api/users", requireAuth, requireAgencyManager, async (req: Authentica
     agencyId?: number;
     login?: string;
     name?: string;
+    email?: string;
     photoUrl?: string;
     role?: 1 | 2;
     isActive?: boolean;
@@ -159,11 +160,17 @@ app.post("/api/users", requireAuth, requireAgencyManager, async (req: Authentica
     return;
   }
 
+  if (!body.email || !body.email.trim()) {
+    res.status(400).json({ error: "L'adresse e-mail est obligatoire." });
+    return;
+  }
+
   res.json({
     ...(await createUser({
       agencyId,
       login: body.login ?? "",
       name: body.name ?? body.login ?? "",
+      email: body.email,
       photoUrl: body.photoUrl,
       role: body.role ?? 2,
       isActive: body.isActive ?? true
@@ -172,11 +179,12 @@ app.post("/api/users", requireAuth, requireAgencyManager, async (req: Authentica
 });
 
 app.patch("/api/users/:id", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
-  const body = req.body as { name?: string; photoUrl?: string; isActive?: boolean; role?: 1 | 2 };
+  const body = req.body as { name?: string; email?: string; photoUrl?: string; isActive?: boolean; role?: 1 | 2 };
   const role = body.role === 1 || body.role === 2 ? body.role : undefined;
   res.json({
     user: await updateUser(Number(req.params.id), {
       name: body.name,
+      email: body.email,
       photo_url: body.photoUrl,
       is_active: body.isActive,
       role
@@ -439,12 +447,21 @@ app.post("/api/email/test-alert", requireAuth, requireAdmin, async (req, res) =>
   }
 
   const body = req.body as { to?: string; subject?: string; message?: string };
+
+  if (!body.to || !body.to.trim()) {
+    res.status(400).json({
+      success: false,
+      provider: "brevo",
+      message: "Le champ 'to' est obligatoire."
+    });
+    return;
+  }
+
   const result = await sendAppAlert({
     type: "info",
     title: body.subject ?? "Test alerte RendezBot",
     message: body.message ?? "Ceci est un test d'alerte email depuis Brevo.",
     userEmail: body.to,
-    adminOnly: !body.to,
     data: {
       route: "/api/email/test-alert",
       sandbox: process.env.BREVO_SANDBOX ?? "true"
@@ -579,8 +596,8 @@ const recordLog = (owner: SessionOwner, event: SessionEvent, sessionKey: string)
   logHistory.unshift({ event: visibleEvent, owner, sessionKey });
   logHistory.splice(300);
   emitLogToAuthorizedSockets(owner, visibleEvent);
-  void notifyAgencyIfNeeded({
-    agencyId: owner.agencyId,
+  void notifyUserIfNeeded({
+    userId: owner.userId,
     level: event.level,
     message: event.message,
     sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey,
@@ -709,8 +726,8 @@ io.on("connection", (socket) => {
           activePrompts.set(sessionKey, { message, owner });
           selectedSessionBySocket.set(socket.id, sessionKey);
           emitPromptToAuthorizedSockets(owner, message, sessionKey);
-          void notifyAgencyIfNeeded({
-            agencyId: owner.agencyId,
+          void notifyUserIfNeeded({
+            userId: owner.userId,
             level: "warn",
             message,
             sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey,

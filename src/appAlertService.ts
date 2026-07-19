@@ -4,8 +4,7 @@ export type SendAppAlertInput = {
   type?: "appointment" | "human" | "system" | "warning" | "info";
   title: string;
   message: string;
-  userEmail?: string | string[];
-  adminOnly?: boolean;
+  userEmail: string | string[];
   data?: Record<string, unknown>;
 };
 
@@ -71,17 +70,15 @@ export const sendAppAlert = async ({
   title,
   message,
   userEmail,
-  adminOnly,
   data
 }: SendAppAlertInput): Promise<BrevoEmailResult> => {
-  const defaultTo = process.env.BREVO_ALERT_DEFAULT_TO;
-  const to = adminOnly ? defaultTo : (userEmail || defaultTo);
+  const to = userEmail;
 
-  if (!to) {
+  if (!to || (Array.isArray(to) && to.length === 0)) {
     return {
       success: false,
       provider: "brevo",
-      message: "Aucun destinataire: userEmail ou BREVO_ALERT_DEFAULT_TO requis."
+      message: "Aucun destinataire explicite fourni pour la notification."
     };
   }
 

@@ -8,6 +8,7 @@ export type DbUser = {
   agency_id: number | null;
   login: string;
   name: string;
+  email: string | null;
   photo_url: string | null;
   role: number;
   is_active: boolean;
@@ -154,6 +155,7 @@ export const ensureSchema = async (): Promise<void> => {
       login TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       name TEXT NOT NULL,
+      email TEXT,
       photo_url TEXT,
       role INTEGER NOT NULL CHECK (role IN (0, 1, 2)),
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -183,7 +185,21 @@ export const ensureSchema = async (): Promise<void> => {
     ALTER TABLE users
       ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS email TEXT;
+  `);
+
+  // Retrocompatibilite: preremplit users.email a partir de l'ancien email d'agence
+  // uniquement si l'utilisateur n'a pas deja une adresse renseignee. Idempotent.
+  await pool.query(`
+    UPDATE users u
+    SET email = LOWER(TRIM(a.notification_email))
+    FROM agencies a
+    WHERE u.agency_id = a.id
+      AND u.role IN (1, 2)
+      AND (u.email IS NULL OR TRIM(u.email) = '')
+      AND a.notification_email IS NOT NULL
+      AND TRIM(a.notification_email) <> '';
   `);
 
   await pool.query(`

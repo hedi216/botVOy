@@ -1,9 +1,10 @@
-import { getAgencyNotificationEmail } from "./userService.js";
+import { logger } from "./logger.js";
+import { getUserNotificationEmail } from "./userService.js";
 import { sendAppAlert } from "./appAlertService.js";
 import { MonitorEventLevel } from "./types.js";
 
 type NotificationInput = {
-  agencyId: number | null;
+  userId: number;
   level: MonitorEventLevel;
   message: string;
   sessionId?: string;
@@ -11,14 +12,14 @@ type NotificationInput = {
 };
 
 const recentNotifications = new Map<string, number>();
-const recentAppointmentByAgency = new Map<number, number>();
+const recentAppointmentByUser = new Map<number, number>();
 const blockedSince = new Map<string, number>();
 const DEDUPE_MS = 5 * 60 * 1000;
 const SUPPRESS_AFTER_APPOINTMENT_MS = 15 * 60 * 1000;
 // Le bot logue un blocage humain (captcha, session expiree, onglet introuvable...)
 // des sa detection, mais la plupart se resolvent seuls en quelques dizaines de
 // secondes. On laisse une fenetre de grace avant d'alerter par mail, pour ne pas
-// spammer l'agence a chaque micro-transition pendant la surveillance.
+// spammer l'utilisateur a chaque micro-transition pendant la surveillance.
 export const HUMAN_BLOCK_GRACE_MS = 4 * 60 * 1000;
 
 const stripTechnicalNoise = (message: string): string => message
@@ -128,15 +129,15 @@ const notificationMessage = (category: NotificationCategory, message: string, bo
   return `Rendez-vous reserve temporairement pour le bot "${botName}".\n${message}`;
 };
 
-export const notifyAgencyIfNeeded = async ({
-  agencyId,
+export const notifyUserIfNeeded = async ({
+  userId,
   level,
   message,
   sessionId,
   botName
 }: NotificationInput): Promise<void> => {
   const category = classifyNotification(message);
-  const blockKey = sessionId ?? (agencyId ? `agency:${agencyId}:${botName ?? ""}` : null);
+  const blockKey = sessionId ?? `user:${userId}:${botName ?? ""}`;
 
   // Un log "success" signale que le blocage est leve : on remet le compteur de
   // grace a zero pour que le prochain blocage reparte d'une fenetre complete.
@@ -144,7 +145,7 @@ export const notifyAgencyIfNeeded = async ({
     blockedSince.delete(blockKey);
   }
 
-  if (!agencyId || !category) {
+  if (!category) {
     return;
   }
 
@@ -159,15 +160,16 @@ export const notifyAgencyIfNeeded = async ({
     }
   }
 
-  const email = await getAgencyNotificationEmail(agencyId);
+  const email = await getUserNotificationEmail(userId);
   if (!email) {
+    logger.warn(`Notification ignoree: aucune adresse e-mail configuree pour l'utilisateur ${userId}.`);
     return;
   }
 
   if (isAppointmentMessage(category)) {
-    recentAppointmentByAgency.set(agencyId, Date.now());
+    recentAppointmentByUser.set(userId, Date.now());
   } else {
-    const lastAppointment = recentAppointmentByAgency.get(agencyId) ?? 0;
+    const lastAppointment = recentAppointmentByUser.get(userId) ?? 0;
     if (Date.now() - lastAppointment < SUPPRESS_AFTER_APPOINTMENT_MS) {
       return;
     }
@@ -177,7 +179,7 @@ export const notifyAgencyIfNeeded = async ({
   const subject = botName
     ? `${notificationSubject(category)} - ${botName}`
     : notificationSubject(category);
-  const dedupeKey = `${agencyId}:${subject}:${cleanMessage}`;
+  const dedupeKey = `${userId}:${subject}:${cleanMessage}`;
   const lastSent = recentNotifications.get(dedupeKey) ?? 0;
   if (Date.now() - lastSent < DEDUPE_MS) {
     return;

@@ -27,7 +27,13 @@
       "Bash(powershell -NoProfile -Command \"Stop-Process -Id 3976,28560 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
       "Bash(powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter \\\\\"name='node.exe'\\\\\" | Select-Object ProcessId, CommandLine\")",
       "Bash(powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\\\"ProcessId=8660\\\\\" | Select-Object ProcessId, ParentProcessId, CommandLine\")",
-      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 8660,8476 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")"
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 8660,8476 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue\")",
+      "Bash(echo \"exit:$?\")",
+      "Bash(node -e ' *)",
+      "Bash(node \"C:/Users/marzo/AppData/Local/Temp/claude/c--Users-marzo-Desktop-APPS-RendezBOT/6d3e5e07-db02-4b2c-aadb-cb90b26f37f8/scratchpad/check_missing_emails.cjs\")",
+      "Bash(cp \"C:/Users/marzo/AppData/Local/Temp/claude/c--Users-marzo-Desktop-APPS-RendezBOT/6d3e5e07-db02-4b2c-aadb-cb90b26f37f8/scratchpad/check_missing_emails.cjs\" ./_tmp_check_missing_emails.cjs)",
+      "Bash(node ./_tmp_check_missing_emails.cjs)",
+      "Bash(rm ./_tmp_check_missing_emails.cjs)"
     ]
   }
 }

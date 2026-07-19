@@ -67,6 +67,7 @@ const els = {
   userForm: $("#userForm"),
   userLogin: $("#userLogin"),
   userName: $("#userName"),
+  userEmail: $("#userEmail"),
   userAgency: $("#userAgency"),
   userAgencyLabel: $("#userAgencyLabel"),
   userRole: $("#userRole"),
@@ -100,6 +101,7 @@ const els = {
   profileName: $("#profileName"),
   profileLogin: $("#profileLogin"),
   profileLoginValue: $("#profileLoginValue"),
+  profileEmail: $("#profileEmail"),
   profileRole: $("#profileRole"),
   profileStatus: $("#profileStatus"),
   profileLastLogin: $("#profileLastLogin"),
@@ -452,6 +454,7 @@ const renderUsers = () => {
     const text = [
       user.login,
       user.name,
+      user.email || "",
       roleLabel(user.role),
       user.is_active ? "active" : "inactive"
     ].join(" ").toLowerCase();
@@ -462,6 +465,7 @@ const renderUsers = () => {
     const row = document.createElement("tr");
     addCell(row, user.login, "strong-cell");
     addCell(row, user.name);
+    addCell(row, user.email || "-");
 
     const roleCell = document.createElement("td");
     roleCell.append(makeBadge(roleLabel(user.role), roleClass(user.role)));
@@ -491,6 +495,14 @@ const renderUsers = () => {
     reset.dataset.userId = String(user.id);
     reset.textContent = "Reset pwd";
     actions.append(reset);
+
+    const editEmail = document.createElement("button");
+    editEmail.className = "outline";
+    editEmail.dataset.userAction = "edit-email";
+    editEmail.dataset.userId = String(user.id);
+    editEmail.dataset.currentEmail = user.email || "";
+    editEmail.textContent = "Modifier email";
+    actions.append(editEmail);
 
     const level = document.createElement("button");
     level.className = "outline";
@@ -522,6 +534,7 @@ const renderProfile = () => {
   els.profileName.textContent = user.name;
   els.profileLogin.textContent = user.login;
   els.profileLoginValue.textContent = user.login;
+  els.profileEmail.textContent = user.email || "Non renseigne";
   els.profileRole.textContent = roleLabel(user.role);
   els.profileStatus.textContent = user.is_active ? "Active" : "Inactive";
   els.profileLastLogin.textContent = formatDate(user.last_login_at);
@@ -926,6 +939,7 @@ els.userForm.addEventListener("submit", async (event) => {
   const body = {
     login: els.userLogin.value.trim(),
     name: els.userName.value.trim(),
+    email: els.userEmail.value.trim(),
     role: Number(els.userRole.value),
     isActive: true
   };
@@ -955,26 +969,42 @@ els.userTableBody.addEventListener("click", async (event) => {
   const userId = button.dataset.userId;
   const action = button.dataset.userAction;
 
-  if (action === "toggle-active") {
-    await requestJson(`/api/users/${userId}`, {
-      method: "PATCH",
-      body: JSON.stringify({ isActive: button.dataset.active === "true" })
-    });
-  }
+  try {
+    if (action === "toggle-active") {
+      await requestJson(`/api/users/${userId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ isActive: button.dataset.active === "true" })
+      });
+    }
 
-  if (action === "change-role") {
-    await requestJson(`/api/users/${userId}`, {
-      method: "PATCH",
-      body: JSON.stringify({ role: Number(button.dataset.role) })
-    });
-  }
+    if (action === "change-role") {
+      await requestJson(`/api/users/${userId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ role: Number(button.dataset.role) })
+      });
+    }
 
-  if (action === "reset-password") {
-    const result = await requestJson(`/api/users/${userId}/reset-password`, { method: "POST" });
-    showTemporaryPassword(`Mot de passe reinitialise pour ${result.user.login}.`, result.temporaryPassword);
-  }
+    if (action === "reset-password") {
+      const result = await requestJson(`/api/users/${userId}/reset-password`, { method: "POST" });
+      showTemporaryPassword(`Mot de passe reinitialise pour ${result.user.login}.`, result.temporaryPassword);
+    }
 
-  await loadUsers();
+    if (action === "edit-email") {
+      const nextEmail = window.prompt("Email notifications utilisateur", button.dataset.currentEmail || "");
+      if (nextEmail === null) {
+        return;
+      }
+
+      await requestJson(`/api/users/${userId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ email: nextEmail.trim() })
+      });
+    }
+
+    await loadUsers();
+  } catch (error) {
+    window.alert(error.message);
+  }
 });
 
 els.copyPassword.addEventListener("click", async () => {

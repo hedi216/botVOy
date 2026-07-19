@@ -8,6 +8,7 @@ export type CreateUserInput = {
   agencyId: number;
   login: string;
   name: string;
+  email: string;
   photoUrl?: string | null;
   role: 1 | 2;
   isActive?: boolean;
@@ -201,6 +202,7 @@ export const sanitizeUser = (user: DbUser): DbUser => ({
   agency_id: user.agency_id,
   login: user.login,
   name: user.name,
+  email: user.email,
   photo_url: user.photo_url,
   role: user.role,
   is_active: user.is_active,
@@ -511,14 +513,6 @@ export const updateAgency = async (
   return result.rows[0];
 };
 
-export const getAgencyNotificationEmail = async (agencyId: number): Promise<string | null> => {
-  const result = await pool.query<{ notification_email: string | null }>(
-    "SELECT notification_email FROM agencies WHERE id = $1",
-    [agencyId]
-  );
-  return result.rows[0]?.notification_email ?? null;
-};
-
 export const listUsersForRequester = async (requester: DbUser): Promise<DbUser[]> => {
   const query = requester.role === 0
     ? "SELECT * FROM users WHERE role IN (1, 2) ORDER BY id"
@@ -554,6 +548,34 @@ const assertAgencyCapacity = async (agencyId: number): Promise<void> => {
   }
 };
 
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export const normalizeUserEmail = (value: unknown): string => {
+  const raw = typeof value === "string" ? value.trim().toLowerCase() : "";
+
+  if (!raw) {
+    throw new Error("L'adresse e-mail est obligatoire.");
+  }
+
+  if (raw.length > 254) {
+    throw new Error("L'adresse e-mail est trop longue.");
+  }
+
+  if (!EMAIL_PATTERN.test(raw)) {
+    throw new Error("L'adresse e-mail est invalide.");
+  }
+
+  return raw;
+};
+
+export const getUserNotificationEmail = async (userId: number): Promise<string | null> => {
+  const result = await pool.query<{ email: string | null }>(
+    "SELECT email FROM users WHERE id = $1",
+    [userId]
+  );
+  return result.rows[0]?.email ?? null;
+};
+
 export const generateTemporaryPassword = (): string => {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%";
   const bytes = randomBytes(14);
@@ -565,16 +587,18 @@ export const createUser = async (input: CreateUserInput): Promise<CreateUserResu
     await assertAgencyCapacity(input.agencyId);
   }
 
+  const email = normalizeUserEmail(input.email);
   const temporaryPassword = generateTemporaryPassword();
   const result = await pool.query<DbUser>(
-    `INSERT INTO users (agency_id, login, password_hash, name, photo_url, role, is_active)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `INSERT INTO users (agency_id, login, password_hash, name, email, photo_url, role, is_active)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING *`,
     [
       input.agencyId,
       input.login,
       await hashPassword(temporaryPassword),
       input.name,
+      email,
       input.photoUrl ?? null,
       input.role,
       input.isActive ?? true
@@ -588,7 +612,7 @@ export const createUser = async (input: CreateUserInput): Promise<CreateUserResu
 
 export const updateUser = async (
   userId: number,
-  patch: Partial<Pick<DbUser, "name" | "photo_url" | "is_active" | "role">>,
+  patch: Partial<Pick<DbUser, "name" | "photo_url" | "is_active" | "role" | "email">>,
   requester: DbUser
 ): Promise<DbUser> => {
   const targetResult = await pool.query<DbUser>("SELECT * FROM users WHERE id = $1", [userId]);
@@ -618,16 +642,19 @@ export const updateUser = async (
     await assertAgencyCapacity(target.agency_id);
   }
 
+  const email = "email" in patch && patch.email !== undefined ? normalizeUserEmail(patch.email) : null;
+
   const result = await pool.query<DbUser>(
     `UPDATE users
      SET name = COALESCE($2, name),
          photo_url = COALESCE($3, photo_url),
          is_active = COALESCE($4, is_active),
          role = COALESCE($5, role),
+         email = COALESCE($6, email),
          failed_login_attempts = CASE WHEN COALESCE($4, is_active) = TRUE THEN 0 ELSE failed_login_attempts END
      WHERE id = $1
      RETURNING *`,
-    [userId, patch.name ?? null, patch.photo_url ?? null, patch.is_active ?? null, patch.role ?? null]
+    [userId, patch.name ?? null, patch.photo_url ?? null, patch.is_active ?? null, patch.role ?? null, email]
   );
 
   return sanitizeUser(result.rows[0]);

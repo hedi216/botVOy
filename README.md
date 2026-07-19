@@ -70,7 +70,6 @@ MAX_CLIENTS_PER_VM=15
 BREVO_API_KEY=
 BREVO_SENDER_EMAIL=notif.noreply@rendezbot.xyz
 BREVO_SENDER_NAME=RendezBot
-BREVO_ALERT_DEFAULT_TO=rendezbot.app@gmail.com
 BREVO_SANDBOX=true
 EMAIL_NOTIFY_NO_SLOT=false
 ```
@@ -89,7 +88,6 @@ EMAIL_NOTIFY_NO_SLOT=false
 - `BREVO_API_KEY` : cle API Brevo, cote backend uniquement. Ne jamais la mettre dans le frontend.
 - `BREVO_SENDER_EMAIL` : expediteur verifie dans Brevo. Pour RendezBot : `notif.noreply@rendezbot.xyz`.
 - `BREVO_SENDER_NAME` : nom expediteur, par defaut `RendezBot`.
-- `BREVO_ALERT_DEFAULT_TO` : email de fallback si aucune agence ou aucun destinataire n'est fourni.
 - `BREVO_SANDBOX=true` : ajoute `X-Sib-Sandbox: drop`, Brevo accepte la requete mais ne livre pas l'email.
 - `EMAIL_NOTIFY_NO_SLOT` : si `true`, envoie aussi une notification quand aucun creneau n'est detecte. Laisse `false` pour eviter les emails repetitifs.
 
@@ -103,7 +101,18 @@ POST https://api.brevo.com/v3/smtp/email
 
 Le domaine `rendezbot.xyz` et l'expediteur `RendezBot <notif.noreply@rendezbot.xyz>` sont deja configures cote Brevo.
 
-Chaque agence peut avoir un email de notification. Cet email recoit uniquement les evenements importants :
+Chaque alerte produite par un bot est envoyee exclusivement a l'adresse e-mail (`users.email`)
+de l'utilisateur proprietaire du bot (le SessionOwner qui l'a demarre), jamais a une autre
+adresse de l'agence ni a un utilisateur qui consulte simplement ce bot. L'e-mail se definit
+lors de la creation ou de la modification de l'utilisateur, dans la gestion des utilisateurs.
+Si aucun e-mail n'est renseigne pour un utilisateur, ses notifications sont ignorees (avec un
+avertissement dans les logs serveur) plutot que d'etre envoyees ailleurs.
+
+L'agence conserve egalement son propre email de notification (`agencies.notification_email`),
+gere depuis la page Agences, mais celui-ci n'est plus utilise pour les alertes individuelles
+des bots : il reste reserve a d'eventuelles notifications generales destinees a toute l'agence.
+
+Ces e-mails recoivent uniquement les evenements importants :
 
 - intervention humaine requise ;
 - validation humaine ou blocage detecte ;

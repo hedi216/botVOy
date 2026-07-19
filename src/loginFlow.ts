@@ -106,8 +106,12 @@ const isRecaptchaSolved = (page: Page): Promise<boolean> => page.evaluate(() => 
   return Boolean(field && field.value && field.value.length > 0);
 }).catch(() => false);
 
+// Le badge reCAPTCHA v3 invisible (iframe ancre avec `size=invisible`) est present
+// sur quasiment toutes les pages sans exiger la moindre action humaine : son jeton
+// se remplit seul. On ne le compte donc pas comme un captcha bloquant, contrairement
+// a la checkbox v2 visible (`size=normal`/`size=compact`) ou au popup de defi (bframe).
 const isRecaptchaPresent = (page: Page): Promise<boolean> => page.locator(
-  'iframe[src*="recaptcha"], textarea[name="g-recaptcha-response"], .g-recaptcha'
+  'iframe[src*="recaptcha"]:not([src*="size=invisible"])'
 ).first().count().then((count) => count > 0).catch(() => false);
 
 // Un autre bot (ou un humain) resout le reCAPTCHA pendant ce temps. On ne clique

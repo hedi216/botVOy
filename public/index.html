@@ -329,6 +329,10 @@
                   Nom affiche
                   <input id="userName" placeholder="Nom utilisateur" required>
                 </label>
+                <label>
+                  Email notifications
+                  <input id="userEmail" type="email" placeholder="utilisateur@agence.com" required>
+                </label>
                 <label id="userAgencyLabel">
                   Agence
                   <select id="userAgency"></select>
@@ -352,6 +356,7 @@
                   <tr>
                     <th>Login</th>
                     <th>Nom</th>
+                    <th>Email notifications</th>
                     <th>Niveau</th>
                     <th>Statut</th>
                     <th>Dernier login</th>
@@ -412,6 +417,7 @@
               </div>
               <dl class="profile-grid">
                 <div><dt>Login</dt><dd id="profileLoginValue">-</dd></div>
+                <div><dt>Email</dt><dd id="profileEmail">-</dd></div>
                 <div><dt>Niveau</dt><dd id="profileRole">-</dd></div>
                 <div><dt>Statut</dt><dd id="profileStatus">-</dd></div>
                 <div><dt>Dernier login</dt><dd id="profileLastLogin">-</dd></div>
