@@ -4,6 +4,7 @@ import { mkdir } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { Browser, Page } from "playwright";
+import { BrowserProfileLease, pinInstalledExtensions } from "./browserProfileService.js";
 import { launchBrowser } from "./browser.js";
 import { loadConfig } from "./config.js";
 import { clickBookNewAppointment, clickSeConnecter, clickSelectTravelGroup, fillLoginForm } from "./loginFlow.js";
@@ -11,7 +12,7 @@ import { logger } from "./logger.js";
 import { monitorAppointments, waitForUserToStart } from "./monitor.js";
 import { takeTimestampedScreenshot } from "./screenshot.js";
 import { AppConfig, MonitorEventLevel } from "./types.js";
-import { MonitoringSettings } from "./userService.js";
+import { ExtensionLink, MonitoringSettings } from "./userService.js";
 
 export type SessionStatus = "created" | "starting" | "waiting" | "monitoring" | "paused" | "stopped" | "error";
 
@@ -39,6 +40,8 @@ export type BotSessionSnapshot = {
   port: number;
   status: SessionStatus;
   profileDir: string;
+  profileId: number;
+  profileKey: string;
   logFile: string;
 };
 
@@ -59,16 +62,18 @@ export class BotSession {
   private resolvePause?: () => void;
   private status: SessionStatus = "created";
   private stopRequested = false;
+  private profileReleased = false;
   private logStream: WriteStream;
 
   constructor(
     private readonly id: string,
     private readonly name: string,
     private readonly port: number,
-    private readonly profileDir: string,
+    private readonly profileLease: BrowserProfileLease,
     private readonly callbacks: SessionCallbacks,
     private readonly monitoringSettings?: MonitoringSettings,
-    private readonly credentials?: BotCredentials
+    private readonly credentials?: BotCredentials,
+    private readonly extensionLinks: ExtensionLink[] = []
   ) {
     mkdirSync(path.join(process.cwd(), "artifacts", "logs"), { recursive: true });
     this.logStream = createWriteStream(this.logFile, { flags: "a" });
@@ -78,6 +83,10 @@ export class BotSession {
     return path.join("artifacts", "logs", `${this.id}.log`);
   }
 
+  private get profileDir(): string {
+    return this.profileLease.profile.directory_path;
+  }
+
   snapshot(): BotSessionSnapshot {
     return {
       id: this.id,
@@ -85,6 +94,8 @@ export class BotSession {
       port: this.port,
       status: this.status,
       profileDir: this.profileDir,
+      profileId: this.profileLease.profile.id,
+      profileKey: this.profileLease.profile.profile_key,
       logFile: this.logFile
     };
   }
@@ -137,36 +148,39 @@ export class BotSession {
     this.setStatus("stopped");
     await this.browser?.close().catch(() => undefined);
     this.chromeProcess?.kill();
+    this.releaseProfile();
     this.logStream.end();
   }
 
   async start(): Promise<void> {
-    this.setStatus("starting");
-    await mkdir(this.profileDir, { recursive: true });
-    await this.launchChrome();
-
-    const config: AppConfig = {
-      ...loadConfig(),
-      ...this.monitoringSettings,
-      connectToExistingChrome: true,
-      chromeDebugUrl: `http://127.0.0.1:${this.port}`,
-      headless: false
-    };
-
-    const { browser, page } = await launchBrowser(config);
-    this.browser = browser;
-    this.page = page;
-    this.browser.on("disconnected", () => {
-      if (!this.stopRequested && this.isActive()) {
-        this.log("warn", "Navigateur du bot ferme ou deconnecte. Session arretee.");
-        this.pendingContinue?.();
-        this.pendingContinue = undefined;
-        this.setStatus("stopped");
-      }
-    });
-    this.log("success", `Chrome client demarre sur le port ${this.port}.`);
-
     try {
+      this.setStatus("starting");
+      await mkdir(this.profileDir, { recursive: true });
+      await this.launchChrome("about:blank");
+
+      const config: AppConfig = {
+        ...loadConfig(),
+        ...this.monitoringSettings,
+        connectToExistingChrome: true,
+        chromeDebugUrl: `http://127.0.0.1:${this.port}`,
+        headless: false
+      };
+
+      const { browser, page } = await launchBrowser(config);
+      this.browser = browser;
+      this.page = page;
+      this.browser.on("disconnected", () => {
+        if (!this.stopRequested && this.isActive()) {
+          this.log("warn", "Navigateur du bot ferme ou deconnecte. Session arretee.");
+          this.pendingContinue?.();
+          this.pendingContinue = undefined;
+          this.setStatus("stopped");
+          this.releaseProfile();
+        }
+      });
+      this.log("success", `Chrome client demarre sur le port ${this.port}. Profil: ${this.profileLease.profile.profile_key}.`);
+      await this.openExtensionLinks();
+
       this.setStatus("waiting");
       const pendingValidationTimer = setTimeout(() => {
         this.log(
@@ -212,14 +226,26 @@ export class BotSession {
 
       this.setStatus("error");
       this.log("error", message);
+    } finally {
+      this.releaseProfile();
     }
   }
 
-  private async launchChrome(): Promise<void> {
+  private releaseProfile(): void {
+    if (this.profileReleased) {
+      return;
+    }
+
+    this.profileReleased = true;
+    this.profileLease.release();
+  }
+
+  private async launchChrome(initialUrl: string): Promise<void> {
     const chromePath = process.env.CHROME_EXECUTABLE_PATH
       || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+    const pinnedExtensionCount = pinInstalledExtensions(this.profileDir);
 
-    this.log("info", `Lancement Chrome: port=${this.port}`);
+    this.log("info", `Lancement Chrome: port=${this.port}, profil=${this.profileLease.profile.profile_key}, extensions epinglees=${pinnedExtensionCount}`);
     this.chromeProcess = spawn(chromePath, [
       `--remote-debugging-port=${this.port}`,
       `--user-data-dir=${this.profileDir}`,
@@ -228,10 +254,14 @@ export class BotSession {
       "--disable-default-apps",
       "--disable-search-engine-choice-screen",
       "--new-window",
-      "about:blank"
+      initialUrl
     ], {
       stdio: "ignore",
       windowsHide: false
+    });
+
+    const startupError = new Promise<never>((_resolve, reject) => {
+      this.chromeProcess?.once("error", reject);
     });
 
     this.chromeProcess.once("exit", (code) => {
@@ -243,7 +273,28 @@ export class BotSession {
       }
     });
 
-    await this.waitForChromeDebug();
+    await Promise.race([this.waitForChromeDebug(), startupError]);
+  }
+
+  private async openExtensionLinks(): Promise<void> {
+    const links = this.extensionLinks.filter((link) => link.isActive);
+    if (!this.browser?.isConnected() || links.length === 0) {
+      return;
+    }
+
+    const context = this.browser.contexts()[0] ?? await this.browser.newContext();
+    for (const link of links) {
+      const extensionPage = await context.newPage();
+      extensionPage.setDefaultTimeout(8_000);
+      await extensionPage.goto(link.installUrl, { waitUntil: "domcontentloaded" })
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          this.log("warn", `Ouverture du lien extension '${link.name}' impossible: ${message}`);
+        });
+    }
+
+    await this.page?.bringToFront().catch(() => undefined);
+    this.log("info", `${links.length} lien(s) d'extension ouvert(s). Installez-les dans Chrome, puis validez le bot.`);
   }
 
   private async recoverPage(preferredUrl?: string): Promise<Page | null> {
@@ -371,11 +422,12 @@ export class BotSession {
       });
 
     // La navigation apres "Selectionner" est cote SPA et peut enchainer plusieurs
-    // etapes intermediaires (applicants-information, etc.) sans rechargement complet:
-    // waitForLoadState("domcontentloaded") ne l'attend pas. On poll l'URL jusqu'a ce
-    // qu'elle quitte reellement travel-groups, avec une marge large pour les enchainements.
+    // etapes intermediaires silencieuses (applicants-information, recapitulatif de
+    // commande, paiement...) avant d'atteindre application-summary. Attendre juste
+    // "quitter travel-groups" s'arrete au premier saut ; on attend plutot d'atteindre
+    // une des pages qu'on sait gerer, avec une marge large pour tenir la chaine entiere.
     if (selected) {
-      await this.waitForUrlAway(travelGroupsPagePattern, 15_000);
+      await this.waitForAnyUrl([applicationSummaryPagePattern, appointmentPagePattern], 40_000);
     }
 
     if (this.page.isClosed() || appointmentPagePattern.test(this.page.url())) {
@@ -407,6 +459,22 @@ export class BotSession {
       }
 
       if (!currentPagePattern.test(this.page.url())) {
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  private async waitForAnyUrl(patterns: RegExp[], timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (!this.page || this.page.isClosed()) {
+        return;
+      }
+
+      if (patterns.some((pattern) => pattern.test(this.page!.url()))) {
         return;
       }
 
@@ -504,14 +572,15 @@ const getFreePort = async (): Promise<number> => new Promise((resolve, reject) =
 
 export const createBotSession = async (
   callbacks: SessionCallbacks,
+  profileLease: BrowserProfileLease,
   displayName?: string,
   monitoringSettings?: MonitoringSettings,
-  credentials?: BotCredentials
+  credentials?: BotCredentials,
+  extensionLinks: ExtensionLink[] = []
 ): Promise<BotSession> => {
   const id = `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const name = displayName?.trim() || id;
   const port = await getFreePort();
-  const profileDir = path.join(process.cwd(), "artifacts", "chrome-profiles", id);
 
-  return new BotSession(id, name, port, profileDir, callbacks, monitoringSettings, credentials);
+  return new BotSession(id, name, port, profileLease, callbacks, monitoringSettings, credentials, extensionLinks);
 };

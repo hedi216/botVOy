@@ -10,7 +10,8 @@ const state = {
   agencyActiveCount: 0,
   agencyMaxClients: null,
   sessions: [],
-  prompts: {}
+  prompts: {},
+  extensions: []
 };
 
 let dashboardPromptSessionId = null;
@@ -87,6 +88,14 @@ const els = {
   refreshEveryCycles: $("#refreshEveryCycles"),
   rateLimitCooldownMinutes: $("#rateLimitCooldownMinutes"),
   settingsMessage: $("#settingsMessage"),
+  extensionForm: $("#extensionForm"),
+  extensionAgencyLabel: $("#extensionAgencyLabel"),
+  extensionAgency: $("#extensionAgency"),
+  extensionName: $("#extensionName"),
+  extensionUrl: $("#extensionUrl"),
+  extensionActive: $("#extensionActive"),
+  extensionMessage: $("#extensionMessage"),
+  extensionTableBody: $("#extensionTableBody"),
   profileInitial: $("#profileInitial"),
   profileName: $("#profileName"),
   profileLogin: $("#profileLogin"),
@@ -108,6 +117,7 @@ const pageMeta = {
   logs: ["Logs", "Historique important pour support et maintenance."],
   maintenance: ["Maintenance", "Sessions Chrome et serveur web local."],
   settings: ["Parametres", "Orchestration et rythme de surveillance des bots."],
+  extensions: ["Extensions", "Liens ouverts au demarrage des bots pour installation manuelle."],
   users: ["User Management", "Gestion des comptes utilisateurs et activation."],
   agencies: ["Agences", "Limites clients et activation des agences."],
   profile: ["Profil", "Informations du compte et securite."]
@@ -126,7 +136,18 @@ const requestJson = async (url, options = {}) => {
   }
 
   const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
+  let data = {};
+
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      const looksLikeHtml = text.trim().startsWith("<");
+      throw new Error(looksLikeHtml
+        ? "Le serveur ne reconnait pas cette route API. Redemarrez RendezBot pour charger la derniere version."
+        : "Reponse serveur invalide.");
+    }
+  }
 
   if (!response.ok) {
     throw new Error(data.error || "Erreur serveur");
@@ -189,6 +210,9 @@ const showPage = async (page) => {
   if (page === "settings" && ![0, 1].includes(state.user?.role)) {
     page = "dashboard";
   }
+  if (page === "extensions" && ![0, 1].includes(state.user?.role)) {
+    page = "dashboard";
+  }
 
   state.page = page;
   $$(".page").forEach((el) => el.classList.toggle("active", el.id === `page-${page}`));
@@ -207,6 +231,9 @@ const showPage = async (page) => {
   }
   if (page === "settings") {
     await loadMonitoringSettings();
+  }
+  if (page === "extensions") {
+    await loadExtensions();
   }
 };
 
@@ -311,6 +338,96 @@ const loadMonitoringSettings = async () => {
   els.rateLimitCooldownMinutes.value = String(settings.rateLimitCooldownMinutes);
   els.settingsMessage.textContent = "";
   els.settingsMessage.className = "form-message";
+};
+
+const currentSettingsAgencyId = () => state.user?.role === 0 ? Number(els.settingsAgency.value) : undefined;
+
+const currentExtensionAgencyId = () => state.user?.role === 0 ? Number(els.extensionAgency.value) : undefined;
+
+const extensionAgencyQuery = () => {
+  const agencyId = currentExtensionAgencyId();
+  return agencyId ? `?agencyId=${encodeURIComponent(agencyId)}` : "";
+};
+
+const loadExtensions = async () => {
+  if (![0, 1].includes(state.user?.role)) {
+    return;
+  }
+
+  if (state.user.role === 0 && state.agencies.length === 0) {
+    await loadAgencies();
+  }
+
+  els.extensionAgencyLabel.hidden = state.user.role !== 0;
+  els.extensionAgency.replaceChildren();
+  if (state.user.role === 0) {
+    for (const agency of state.agencies) {
+      const option = document.createElement("option");
+      option.value = String(agency.id);
+      option.textContent = agency.name;
+      els.extensionAgency.append(option);
+    }
+  }
+
+  const { extensions } = await requestJson(`/api/extensions${extensionAgencyQuery()}`);
+  state.extensions = extensions || [];
+  renderExtensions();
+};
+
+const renderExtensions = () => {
+  els.extensionTableBody.replaceChildren();
+
+  if (state.extensions.length === 0) {
+    const row = document.createElement("tr");
+    addCell(row, "Aucun lien", "strong-cell");
+    addCell(row, "-");
+    addCell(row, "-");
+    addCell(row, "-");
+    addCell(row, "-");
+    els.extensionTableBody.append(row);
+    return;
+  }
+
+  for (const extension of state.extensions) {
+    const row = document.createElement("tr");
+    addCell(row, extension.name, "strong-cell");
+    addCell(row, extension.installUrl);
+    const statusCell = document.createElement("td");
+    statusCell.append(makeBadge(extension.isActive ? "Active" : "Inactive", extension.isActive ? "green" : "red"));
+    row.append(statusCell);
+    addCell(row, formatDate(extension.createdAt));
+
+    const actions = document.createElement("td");
+    actions.className = "action-cell";
+
+    const toggle = document.createElement("button");
+    toggle.className = extension.isActive ? "outline danger-text" : "outline success-text";
+    toggle.dataset.extensionAction = "toggle";
+    toggle.dataset.extensionId = String(extension.id);
+    toggle.dataset.active = String(!extension.isActive);
+    toggle.textContent = extension.isActive ? "Desactiver" : "Activer";
+    actions.append(toggle);
+
+    const edit = document.createElement("button");
+    edit.className = "outline";
+    edit.dataset.extensionAction = "edit";
+    edit.dataset.extensionId = String(extension.id);
+    edit.dataset.name = extension.name;
+    edit.dataset.url = extension.installUrl;
+    edit.textContent = "Modifier";
+    actions.append(edit);
+
+    const remove = document.createElement("button");
+    remove.className = "outline danger-text";
+    remove.dataset.extensionAction = "delete";
+    remove.dataset.extensionId = String(extension.id);
+    remove.dataset.name = extension.name;
+    remove.textContent = "Supprimer";
+    actions.append(remove);
+
+    row.append(actions);
+    els.extensionTableBody.append(row);
+  }
 };
 
 const loadUsers = async () => {
@@ -434,6 +551,24 @@ const statusPillClass = (status) => ({
   paused: "amber",
   error: "red",
   stopped: "red"
+}[status] || "blue");
+
+const profileStatusLabel = (status) => ({
+  not_configured: "Non configure",
+  pending: "A preparer",
+  preparing: "Preparation",
+  intervention_required: "Intervention requise",
+  ready: "Pret",
+  error: "Erreur"
+}[status] || status);
+
+const profileStatusClass = (status) => ({
+  ready: "green",
+  preparing: "blue",
+  intervention_required: "amber",
+  pending: "amber",
+  error: "red",
+  not_configured: "blue"
 }[status] || "blue");
 
 const dashboardPrompt = () => {
@@ -681,6 +816,104 @@ els.settingsForm.addEventListener("submit", async (event) => {
     els.settingsMessage.textContent = error.message;
     els.settingsMessage.classList.add("error");
   }
+});
+
+els.extensionForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  els.extensionMessage.textContent = "";
+  els.extensionMessage.className = "form-message";
+
+  try {
+    await requestJson("/api/extensions", {
+      method: "POST",
+      body: JSON.stringify({
+        agencyId: currentExtensionAgencyId(),
+        name: els.extensionName.value.trim(),
+        installUrl: els.extensionUrl.value.trim(),
+        isActive: els.extensionActive.value === "true"
+      })
+    });
+    els.extensionForm.reset();
+    els.extensionActive.value = "true";
+    els.extensionMessage.textContent = "Lien d'extension ajoute.";
+    els.extensionMessage.classList.add("success");
+    await loadExtensions();
+  } catch (error) {
+    els.extensionMessage.textContent = error.message;
+    els.extensionMessage.classList.add("error");
+  }
+});
+
+els.extensionTableBody.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-extension-action]");
+  if (!button) {
+    return;
+  }
+
+  const action = button.dataset.extensionAction;
+  const extensionId = button.dataset.extensionId;
+  els.extensionMessage.textContent = "";
+  els.extensionMessage.className = "form-message";
+
+  try {
+    if (action === "delete") {
+      const name = button.dataset.name;
+      const confirmation = window.confirm(`Supprimer le lien d'extension "${name}" ?`);
+      if (!confirmation) {
+        return;
+      }
+
+      await requestJson(`/api/extensions/${extensionId}${extensionAgencyQuery()}`, {
+        method: "DELETE"
+      });
+      els.extensionMessage.textContent = "Lien supprime.";
+      els.extensionMessage.classList.add("success");
+    }
+
+    if (action === "toggle") {
+      await requestJson(`/api/extensions/${extensionId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          agencyId: currentExtensionAgencyId(),
+          isActive: button.dataset.active === "true"
+        })
+      });
+      els.extensionMessage.textContent = "Statut modifie.";
+      els.extensionMessage.classList.add("success");
+    }
+
+    if (action === "edit") {
+      const name = window.prompt("Nom de l'extension", button.dataset.name || "");
+      if (name === null) {
+        return;
+      }
+
+      const installUrl = window.prompt("Lien d'installation", button.dataset.url || "");
+      if (installUrl === null) {
+        return;
+      }
+
+      await requestJson(`/api/extensions/${extensionId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          agencyId: currentExtensionAgencyId(),
+          name,
+          installUrl
+        })
+      });
+      els.extensionMessage.textContent = "Lien modifie.";
+      els.extensionMessage.classList.add("success");
+    }
+
+    await loadExtensions();
+  } catch (error) {
+    els.extensionMessage.textContent = error.message;
+    els.extensionMessage.classList.add("error");
+  }
+});
+
+els.extensionAgency.addEventListener("change", () => {
+  void loadExtensions();
 });
 
 els.settingsAgency.addEventListener("change", () => {

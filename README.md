@@ -191,6 +191,84 @@ npm.cmd run build
 npm.cmd start
 ```
 
+## Extensions d'enregistrement par agence
+
+Chaque agence peut configurer une extension d'enregistrement d'ecran depuis `Parametres`, section `Extension d'enregistrement d'ecran`.
+
+Champs disponibles :
+
+- activation de l'extension pour l'agence ;
+- lien d'installation fourni par le prestataire ;
+- nom informatif de l'extension ;
+- type de licence informatif : non renseignee, gratuite ou payante.
+
+Le lien doit etre une URL `http://` ou `https://`. RendezBot conserve le lien original du fournisseur, y compris si ce lien redirige vers Chrome Web Store ou contient une activation specifique. Les chemins locaux, `file:`, `javascript:`, `data:` et autres schemas ne sont pas acceptes.
+
+RendezBot ne calcule pas de quota de minutes et ne pilote pas le fonctionnement interne de l'extension. Le demarrage automatique de l'enregistrement depend de l'extension installee, de sa licence et de ses propres autorisations.
+
+### Profils Chrome persistants
+
+Les bots utilisent des profils Chrome persistants par agence :
+
+```text
+artifacts/
+  chrome-profiles/
+    agency-<agencyId>/
+      profile-01/
+      profile-02/
+      profile-03/
+```
+
+Un profil conserve l'extension installee, la licence, les connexions, autorisations, parametres et stockage local Chrome. Un meme profil n'est jamais attribue simultanement a deux processus Chrome. L'occupation en cours est suivie en memoire, et RendezBot verifie aussi les verrous `Singleton*` laisses par Chrome sur disque.
+
+Si un profil reste bloque apres un crash ou une fermeture brutale, ferme toutes les fenetres Chrome liees a cette agence, verifie qu'aucun processus `chrome.exe` correspondant ne tourne encore, puis relance RendezBot. Si Chrome a laisse un verrou abandonne dans le dossier du profil, nettoie-le seulement apres avoir confirme qu'aucun Chrome n'utilise ce profil.
+
+### Preparation d'un profil avec extension
+
+Parcours normal :
+
+1. Dans `Parametres`, active l'extension et enregistre le lien fourni par le prestataire.
+2. Clique `Preparer / installer l'extension`.
+3. RendezBot ouvre Google Chrome visible avec un profil persistant dedie a l'agence.
+4. Le lien d'installation est ouvert dans ce Chrome.
+5. Termine manuellement l'installation, la connexion, la licence et les autorisations si Chrome ou le fournisseur le demande.
+6. Clique `Installation terminee` dans RendezBot.
+7. Le profil est marque `Pret` et pourra etre utilise par un prochain bot.
+
+Ne clique pas `Installation terminee` tant que l'installation n'est pas reellement finie. RendezBot ne marque jamais un profil comme pret uniquement parce que la page d'installation a ete ouverte.
+
+Boutons disponibles :
+
+- `Preparer / installer l'extension` : ouvre Chrome avec le profil selectionne ou cree.
+- `Installation terminee` : ferme le Chrome de preparation et marque le profil pret.
+- `Annuler` : ferme le Chrome de preparation et laisse le profil en intervention requise.
+
+### Limites connues Chrome Web Store
+
+RendezBot ne contourne pas les protections de Google Chrome et ne clique pas automatiquement sur `Ajouter a Chrome`. Une confirmation Chrome Web Store peut etre necessaire. Les installations silencieuses via politiques Chrome/Windows globales ne sont pas configurees automatiquement, car elles peuvent affecter tous les profils de la machine et toutes les agences.
+
+Si l'extension est activee pour une agence mais qu'aucun profil pret et libre n'existe, le demarrage du bot est refuse avec un message explicite. Prepare un profil supplementaire pour lancer plusieurs bots simultanes avec l'extension. Si l'extension est desactivee, les bots continuent de fonctionner avec des profils persistants standards et aucun lien d'installation n'est ouvert.
+
+### Validation manuelle recommandee
+
+1. Agence sans extension configuree : demarrer un bot et verifier qu'un profil `not_configured` est cree.
+2. Extension desactivee avec un lien enregistre : demarrer un bot et verifier qu'aucun lien d'installation ne s'ouvre.
+3. Lien invalide (`file:`, `javascript:`, texte libre) : verifier l'erreur francaise.
+4. Lien fournisseur `https://...` : enregistrer puis lancer `Preparer / installer l'extension`.
+5. Premier profil : verifier la creation de `artifacts/chrome-profiles/agency-<id>/profile-01`.
+6. Preparation reussie : installer manuellement, cliquer `Installation terminee`, verifier l'etat `Pret`.
+7. Annulation : lancer une preparation puis `Annuler`, verifier `Intervention requise`.
+8. Bot avec profil pret : demarrer et verifier que le profil pret est utilise.
+9. Deux bots simultanes : preparer deux profils puis verifier deux dossiers/profils distincts.
+10. Aucun profil libre : occuper tous les profils prets puis verifier le message d'erreur.
+11. Fermeture manuelle Chrome : fermer la fenetre du bot et verifier l'arret/liberation de session.
+12. Arret depuis RendezBot : utiliser `Arreter` et verifier que le profil redevient disponible.
+13. Crash Chrome : tuer le processus Chrome et verifier le log d'arret.
+14. Changement de lien : modifier le lien et verifier que les profils `Pret` passent a `A preparer`.
+15. Deux agences : configurer deux liens differents et verifier les dossiers `agency-<id>` separes.
+16. Droits : verifier qu'un niveau 2 ne voit pas les parametres et qu'un niveau 1 ne voit que son agence.
+17. Redemarrage complet : relancer RendezBot et verifier que profils et etats persistent.
+
 ## Workflow manuel
 
 1. Le bot lance Chromium visible.

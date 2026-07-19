@@ -278,7 +278,10 @@ const bookAppointmentTextPattern = /prendre un nouveau rendez-vous/i;
 // On ne clique que si ce statut "non reserve" est confirme, pour ne jamais toucher a
 // une reservation deja existante.
 export const clickBookNewAppointment = async (page: Page, log: LogFn): Promise<boolean> => {
-  const notReserved = await page.getByText(notReservedTextPattern).first().isVisible().catch(() => false);
+  const notReserved = await page.getByText(notReservedTextPattern).first()
+    .waitFor({ state: "visible", timeout: 10_000 })
+    .then(() => true)
+    .catch(() => false);
 
   if (!notReserved) {
     return false;

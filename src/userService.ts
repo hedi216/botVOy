@@ -1,4 +1,4 @@
-import { ADMIN_LOGIN, ADMIN_PASSWORD, DbAgency, DbUser, ensureDatabaseExists, ensureSchema, pool } from "./db.js";
+import { ADMIN_LOGIN, ADMIN_PASSWORD, DbAgency, DbExtensionLink, DbUser, ensureDatabaseExists, ensureSchema, pool } from "./db.js";
 import { loadConfig } from "./config.js";
 import { hashPassword, verifyPassword } from "./password.js";
 import { randomBytes } from "node:crypto";
@@ -29,6 +29,37 @@ export type MonitoringSettings = Pick<
   | "rateLimitCooldownMinutes"
 >;
 
+export type RecordingExtensionLicenseType = "" | "free" | "paid";
+
+export type RecordingExtensionSettings = {
+  enabled: boolean;
+  installUrl: string | null;
+  name: string | null;
+  licenseType: RecordingExtensionLicenseType;
+  updatedAt: string | null;
+};
+
+export type AgencySettings = MonitoringSettings & {
+  recordingExtension: RecordingExtensionSettings;
+};
+
+export type ExtensionLinkInput = {
+  agencyId: number;
+  name: string;
+  installUrl: string;
+  isActive?: boolean;
+};
+
+export type ExtensionLink = {
+  id: number;
+  agencyId: number;
+  name: string;
+  installUrl: string;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string | null;
+};
+
 const defaultMonitoringSettings = (): MonitoringSettings => {
   const config = loadConfig();
   return {
@@ -58,6 +89,14 @@ const agencyToMonitoringSettings = (agency: DbAgency | null): MonitoringSettings
     rateLimitCooldownMinutes: agency.rate_limit_cooldown_minutes ?? defaults.rateLimitCooldownMinutes
   };
 };
+
+export const agencyToRecordingExtensionSettings = (agency: DbAgency | null): RecordingExtensionSettings => ({
+  enabled: agency?.recording_extension_enabled ?? false,
+  installUrl: agency?.recording_extension_install_url ?? null,
+  name: agency?.recording_extension_name ?? null,
+  licenseType: (agency?.recording_extension_license_type as RecordingExtensionLicenseType | null) ?? "",
+  updatedAt: agency?.recording_extension_updated_at ?? null
+});
 
 const clampInt = (value: unknown, fallback: number, min: number, max: number): number => {
   const numberValue = Number(value);
@@ -92,6 +131,13 @@ export const initUserModule = async (): Promise<void> => {
   await ensureDatabaseExists();
   await ensureSchema();
 
+  await pool.query(
+    `UPDATE browser_profiles
+     SET recording_extension_status = 'intervention_required',
+         last_error = 'Preparation interrompue par un arret de RendezBot.'
+     WHERE recording_extension_status = 'preparing'`
+  );
+
   const admin = await pool.query("SELECT id FROM users WHERE login = $1", [ADMIN_LOGIN]);
   if (admin.rowCount === 0) {
     await pool.query(
@@ -104,8 +150,12 @@ export const initUserModule = async (): Promise<void> => {
 
 export const authenticateUser = async (login: string, password: string): Promise<DbUser | null> => {
   const result = await pool.query<DbUser & { password_hash: string }>(
-    "SELECT * FROM users WHERE login = $1",
-    [login]
+    `SELECT *
+     FROM users
+     WHERE lower(login) = lower($1)
+     ORDER BY CASE WHEN login = $1 THEN 0 ELSE 1 END
+     LIMIT 1`,
+    [login.trim()]
   );
   const user = result.rows[0];
 
@@ -196,6 +246,14 @@ export const getAgencyMonitoringSettings = async (agencyId: number | null): Prom
   return agencyToMonitoringSettings(await getAgency(agencyId));
 };
 
+export const getAgencySettings = async (agencyId: number | null): Promise<AgencySettings> => {
+  const agency = agencyId ? await getAgency(agencyId) : null;
+  return {
+    ...agencyToMonitoringSettings(agency),
+    recordingExtension: agencyToRecordingExtensionSettings(agency)
+  };
+};
+
 export const updateAgencyMonitoringSettings = async (
   agencyId: number,
   patch: Partial<MonitoringSettings>
@@ -226,6 +284,202 @@ export const updateAgencyMonitoringSettings = async (
   );
 
   return agencyToMonitoringSettings(result.rows[0]);
+};
+
+const validateInstallUrl = (value: unknown): string | null => {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) {
+    return null;
+  }
+
+  if (raw.length > 2_000) {
+    throw new Error("Le lien d'installation est trop long.");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("Le lien d'installation doit etre une URL valide.");
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Le lien d'installation doit commencer par http:// ou https://.");
+  }
+
+  return raw;
+};
+
+const normalizeOptionalText = (value: unknown, maxLength: number, fieldLabel: string): string | null => {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) {
+    return null;
+  }
+
+  if (raw.length > maxLength) {
+    throw new Error(`${fieldLabel} est trop long.`);
+  }
+
+  return raw;
+};
+
+export const updateAgencyRecordingExtensionSettings = async (
+  agencyId: number,
+  patch: {
+    enabled?: boolean;
+    installUrl?: string | null;
+    name?: string | null;
+    licenseType?: string | null;
+  }
+): Promise<RecordingExtensionSettings & { linkChanged: boolean }> => {
+  const current = await getAgency(agencyId);
+  if (!current) {
+    throw new Error("Agence introuvable.");
+  }
+
+  const enabled = typeof patch.enabled === "boolean" ? patch.enabled : current.recording_extension_enabled;
+  const installUrl = "installUrl" in patch
+    ? validateInstallUrl(patch.installUrl)
+    : current.recording_extension_install_url;
+  const name = "name" in patch
+    ? normalizeOptionalText(patch.name, 160, "Le nom de l'extension")
+    : current.recording_extension_name;
+  const licenseType = "licenseType" in patch
+    ? (patch.licenseType || null)
+    : current.recording_extension_license_type;
+
+  if (licenseType && !["free", "paid"].includes(licenseType)) {
+    throw new Error("Type de licence invalide.");
+  }
+
+  if (enabled && !installUrl) {
+    throw new Error("Un lien d'installation valide est requis pour activer l'extension.");
+  }
+
+  const linkChanged = installUrl !== current.recording_extension_install_url;
+  const configChanged = linkChanged
+    || enabled !== current.recording_extension_enabled
+    || name !== current.recording_extension_name
+    || licenseType !== current.recording_extension_license_type;
+  const result = await pool.query<DbAgency>(
+    `UPDATE agencies
+     SET recording_extension_enabled = $2,
+         recording_extension_install_url = $3,
+         recording_extension_name = $4,
+         recording_extension_license_type = $5,
+         recording_extension_updated_at = CASE
+           WHEN $6 THEN NOW()
+           ELSE recording_extension_updated_at
+         END
+     WHERE id = $1
+     RETURNING *`,
+    [agencyId, enabled, installUrl, name, licenseType, configChanged]
+  );
+
+  if (linkChanged) {
+    await pool.query(
+      `UPDATE browser_profiles
+       SET recording_extension_status = CASE
+             WHEN recording_extension_status = 'ready' THEN 'pending'
+             ELSE recording_extension_status
+           END,
+           last_error = CASE
+             WHEN recording_extension_status = 'ready' THEN 'Lien d''installation modifie: preparation requise.'
+             ELSE last_error
+           END
+       WHERE agency_id = $1`,
+      [agencyId]
+    );
+  }
+
+  return {
+    ...agencyToRecordingExtensionSettings(result.rows[0]),
+    linkChanged
+  };
+};
+
+const extensionLinkFromDb = (row: DbExtensionLink): ExtensionLink => ({
+  id: row.id,
+  agencyId: row.agency_id,
+  name: row.name,
+  installUrl: row.install_url,
+  isActive: row.is_active,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at
+});
+
+export const listExtensionLinks = async (agencyId: number, activeOnly = false): Promise<ExtensionLink[]> => {
+  const result = await pool.query<DbExtensionLink>(
+    `SELECT * FROM extension_links
+     WHERE agency_id = $1 AND ($2::boolean = FALSE OR is_active = TRUE)
+     ORDER BY id`,
+    [agencyId, activeOnly]
+  );
+  return result.rows.map(extensionLinkFromDb);
+};
+
+export const createExtensionLink = async (input: ExtensionLinkInput): Promise<ExtensionLink> => {
+  const installUrl = validateInstallUrl(input.installUrl);
+  if (!installUrl) {
+    throw new Error("Le lien d'installation est requis.");
+  }
+
+  const name = normalizeOptionalText(input.name, 160, "Le nom de l'extension") ?? "Extension";
+  const result = await pool.query<DbExtensionLink>(
+    `INSERT INTO extension_links (agency_id, name, install_url, is_active)
+     VALUES ($1, $2, $3, $4)
+     RETURNING *`,
+    [input.agencyId, name, installUrl, input.isActive ?? true]
+  );
+  return extensionLinkFromDb(result.rows[0]);
+};
+
+export const updateExtensionLink = async (
+  agencyId: number,
+  extensionId: number,
+  patch: Partial<Pick<ExtensionLinkInput, "name" | "installUrl" | "isActive">>
+): Promise<ExtensionLink> => {
+  const current = await pool.query<DbExtensionLink>(
+    "SELECT * FROM extension_links WHERE agency_id = $1 AND id = $2",
+    [agencyId, extensionId]
+  );
+  if (!current.rows[0]) {
+    throw new Error("Lien d'extension introuvable.");
+  }
+
+  const installUrl = "installUrl" in patch
+    ? validateInstallUrl(patch.installUrl)
+    : current.rows[0].install_url;
+  if (!installUrl) {
+    throw new Error("Le lien d'installation est requis.");
+  }
+
+  const name = "name" in patch
+    ? normalizeOptionalText(patch.name, 160, "Le nom de l'extension") ?? "Extension"
+    : current.rows[0].name;
+  const isActive = typeof patch.isActive === "boolean" ? patch.isActive : current.rows[0].is_active;
+
+  const result = await pool.query<DbExtensionLink>(
+    `UPDATE extension_links
+     SET name = $3,
+         install_url = $4,
+         is_active = $5,
+         updated_at = NOW()
+     WHERE agency_id = $1 AND id = $2
+     RETURNING *`,
+    [agencyId, extensionId, name, installUrl, isActive]
+  );
+  return extensionLinkFromDb(result.rows[0]);
+};
+
+export const deleteExtensionLink = async (agencyId: number, extensionId: number): Promise<void> => {
+  const result = await pool.query(
+    "DELETE FROM extension_links WHERE agency_id = $1 AND id = $2",
+    [agencyId, extensionId]
+  );
+  if (result.rowCount === 0) {
+    throw new Error("Lien d'extension introuvable.");
+  }
 };
 
 export const setAgencyActive = async (agencyId: number, isActive: boolean): Promise<DbAgency> => {

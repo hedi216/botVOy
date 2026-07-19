@@ -50,6 +50,7 @@
           <button class="nav-item" data-page-target="logs">Logs</button>
           <button class="nav-item" data-page-target="maintenance">Maintenance</button>
           <button class="nav-item settings-nav" data-page-target="settings" hidden>Parametres</button>
+          <button class="nav-item settings-nav" data-page-target="extensions" hidden>Extensions</button>
 
           <p class="admin-nav" hidden>ADMINISTRATION</p>
           <button class="nav-item admin-nav" data-page-target="users" hidden>Utilisateurs</button>
@@ -256,6 +257,52 @@
                 <button class="primary" type="submit">Enregistrer</button>
               </form>
               <p id="settingsMessage" class="form-message"></p>
+            </section>
+
+          </section>
+
+          <section class="page" id="page-extensions">
+            <section class="form-panel">
+              <h2>Ajouter un lien d'extension</h2>
+              <p>Au lancement d'un bot, RendezBot ouvre ces liens dans le Chrome du bot. L'utilisateur installe manuellement puis valide le bot.</p>
+              <form id="extensionForm" class="create-user-form">
+                <label id="extensionAgencyLabel" class="admin-only" hidden>
+                  Agence
+                  <select id="extensionAgency"></select>
+                </label>
+                <label>
+                  Nom
+                  <input id="extensionName" placeholder="Screen recorder" required>
+                </label>
+                <label>
+                  Lien d'installation
+                  <input id="extensionUrl" placeholder="https://chromewebstore.google.com/..." required>
+                </label>
+                <label>
+                  Statut
+                  <select id="extensionActive">
+                    <option value="true">Active</option>
+                    <option value="false">Inactive</option>
+                  </select>
+                </label>
+                <button class="primary" type="submit">Ajouter</button>
+              </form>
+              <p id="extensionMessage" class="form-message"></p>
+            </section>
+
+            <section class="table-panel">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Nom</th>
+                    <th>Lien</th>
+                    <th>Statut</th>
+                    <th>Creation</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="extensionTableBody"></tbody>
+              </table>
             </section>
           </section>
 

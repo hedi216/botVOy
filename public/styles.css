@@ -34,6 +34,11 @@ select {
   font: inherit;
 }
 
+input[type="checkbox"] {
+  min-height: auto;
+  width: auto;
+}
+
 button {
   align-items: center;
   border: 1px solid #b9c4d4;
@@ -429,6 +434,26 @@ td {
   gap: 10px;
 }
 
+.checkbox-label {
+  align-items: center;
+  display: flex;
+  gap: 9px;
+}
+
+.extension-actions {
+  align-items: center;
+  border-top: 1px solid var(--line);
+  display: flex;
+  gap: 18px;
+  justify-content: space-between;
+  margin-top: 18px;
+  padding-top: 18px;
+}
+
+.compact-table {
+  margin-top: 14px;
+}
+
 .bot-name-field,
 .bot-session-field {
   min-width: 180px;
@@ -710,7 +735,8 @@ tr.needs-validation {
 
   .topbar,
   .panel-section,
-  .prompt-panel {
+  .prompt-panel,
+  .extension-actions {
     align-items: stretch;
     flex-direction: column;
   }

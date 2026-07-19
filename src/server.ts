@@ -6,6 +6,19 @@ import http from "node:http";
 import path from "node:path";
 import { Server, Socket } from "socket.io";
 import { createBotSession, BotSession, SessionEvent, SessionStatus } from "./sessionManager.js";
+import {
+  deleteBrowserProfileForAgency,
+  listBrowserProfiles,
+  reserveStandardProfileForBot
+} from "./browserProfileService.js";
+import {
+  cancelRecordingExtensionPreparation,
+  confirmRecordingExtensionPreparation,
+  getActivePreparation,
+  startProfileExtensionManagement,
+  startRecordingExtensionPreparation,
+  stopProfileExtensionManagement
+} from "./recordingExtensionService.js";
 import { logger } from "./logger.js";
 import { AuthenticatedRequest, createSession, destroySession, getSessionUser, requireAdmin, requireAgencyManager, requireAuth } from "./auth.js";
 import { DbUser } from "./db.js";
@@ -14,14 +27,19 @@ import {
   changeOwnPassword,
   createAgency,
   createUser,
+  createExtensionLink,
+  deleteExtensionLink,
   getAgency,
-  getAgencyMonitoringSettings,
+  getAgencySettings,
   initUserModule,
   listAgencies,
+  listExtensionLinks,
   listUsersForRequester,
   resetUserPassword,
   updateAgency,
   updateAgencyMonitoringSettings,
+  updateAgencyRecordingExtensionSettings,
+  updateExtensionLink,
   updateUser
 } from "./userService.js";
 import { notifyAgencyIfNeeded } from "./notifications.js";
@@ -180,7 +198,7 @@ app.get("/api/monitoring-settings", requireAuth, async (req: AuthenticatedReques
     return;
   }
 
-  res.json({ settings: await getAgencyMonitoringSettings(agencyId) });
+  res.json({ settings: await getAgencySettings(agencyId) });
 });
 
 app.patch("/api/monitoring-settings", requireAuth, async (req: AuthenticatedRequest, res) => {
@@ -197,6 +215,217 @@ app.patch("/api/monitoring-settings", requireAuth, async (req: AuthenticatedRequ
   res.json({
     settings: await updateAgencyMonitoringSettings(agencyId, req.body)
   });
+});
+
+const getSettingsAgencyId = (user: DbUser, value?: unknown): number | null => {
+  if (![0, 1].includes(user.role)) {
+    return null;
+  }
+
+  if (user.role === 0) {
+    const agencyId = Number(value);
+    return agencyId ? agencyId : null;
+  }
+
+  return user.agency_id ? Number(user.agency_id) : null;
+};
+
+app.get("/api/extensions", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, req.query.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  res.json({ extensions: await listExtensionLinks(agencyId) });
+});
+
+app.post("/api/extensions", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const body = req.body as { agencyId?: number; name?: string; installUrl?: string; isActive?: boolean };
+  const agencyId = getSettingsAgencyId(req.user!, body.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  res.json({
+    extension: await createExtensionLink({
+      agencyId,
+      name: body.name ?? "Extension",
+      installUrl: body.installUrl ?? "",
+      isActive: body.isActive ?? true
+    })
+  });
+});
+
+app.patch("/api/extensions/:id", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const body = req.body as { agencyId?: number; name?: string; installUrl?: string; isActive?: boolean };
+  const agencyId = getSettingsAgencyId(req.user!, body.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  res.json({
+    extension: await updateExtensionLink(agencyId, Number(req.params.id), body)
+  });
+});
+
+app.delete("/api/extensions/:id", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, req.query.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  await deleteExtensionLink(agencyId, Number(req.params.id));
+  res.json({ ok: true });
+});
+
+app.patch("/api/recording-extension/settings", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const body = req.body as {
+    agencyId?: number;
+    enabled?: boolean;
+    installUrl?: string | null;
+    name?: string | null;
+    licenseType?: string | null;
+  };
+  const agencyId = getSettingsAgencyId(req.user!, body.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  const settings = await updateAgencyRecordingExtensionSettings(agencyId, body);
+  res.json({
+    settings,
+    warning: settings.linkChanged
+      ? "Lien modifie: les profils precedemment prets devront etre prepares a nouveau. Les sessions deja ouvertes ne sont pas modifiees."
+      : "Les modifications s'appliquent aux prochains demarrages des bots."
+  });
+});
+
+app.get("/api/recording-extension/profiles", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, req.query.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  res.json({
+    profiles: await listBrowserProfiles(agencyId),
+    activePreparation: getActivePreparation(agencyId)
+  });
+});
+
+app.post("/api/recording-extension/prepare", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  const settings = (await getAgencySettings(agencyId)).recordingExtension;
+  const snapshot = await startRecordingExtensionPreparation(agencyId, settings, {
+    onEvent: (level, message, prepareSnapshot) => {
+      emitRecordingExtensionStatus(agencyId, {
+        level,
+        message,
+        preparation: prepareSnapshot ?? null
+      });
+    }
+  });
+  emitRecordingExtensionStatus(agencyId, { level: "warn", message: snapshot.message, preparation: snapshot });
+  res.json({ preparation: snapshot });
+});
+
+app.post("/api/recording-extension/confirm", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  const profile = await confirmRecordingExtensionPreparation(agencyId);
+  emitRecordingExtensionStatus(agencyId, {
+    level: "success",
+    message: `Profil ${profile.profile_key} marque comme pret apres confirmation utilisateur.`,
+    profile
+  });
+  res.json({ profile });
+});
+
+app.post("/api/recording-extension/cancel", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  const profile = await cancelRecordingExtensionPreparation(agencyId);
+  emitRecordingExtensionStatus(agencyId, {
+    level: "warn",
+    message: `Preparation annulee pour ${profile.profile_key}.`,
+    profile
+  });
+  res.json({ profile });
+});
+
+app.post("/api/recording-extension/profiles/:id/manage", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  const preparation = await startProfileExtensionManagement(agencyId, Number(req.params.id));
+  emitRecordingExtensionStatus(agencyId, {
+    level: "info",
+    message: `Gestion des extensions ouverte pour ${preparation.profile.profile_key}.`
+  });
+  res.json({ preparation });
+});
+
+app.post("/api/recording-extension/profiles/:id/stop-management", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  stopProfileExtensionManagement(Number(req.params.id));
+  emitRecordingExtensionStatus(agencyId, {
+    level: "info",
+    message: "Fenetre de gestion demandee a la fermeture."
+  });
+  res.json({ ok: true });
+});
+
+app.delete("/api/recording-extension/profiles/:id", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, req.query.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  await deleteBrowserProfileForAgency(agencyId, Number(req.params.id));
+  emitRecordingExtensionStatus(agencyId, {
+    level: "warn",
+    message: "Profil Chrome supprime avec son dossier."
+  });
+  res.json({ ok: true });
 });
 
 app.post("/api/email/test-alert", requireAuth, requireAdmin, async (req, res) => {
@@ -300,6 +529,18 @@ const canSeeOwner = (user: DbUser, owner: SessionOwner): boolean => {
   return user.role === 0
     || user.id === owner.userId
     || (Boolean(user.agency_id) && user.agency_id === owner.agencyId);
+};
+
+const canManageAgencySettings = (user: DbUser, agencyId: number): boolean =>
+  user.role === 0 || (user.role === 1 && user.agency_id === agencyId);
+
+const emitRecordingExtensionStatus = (agencyId: number, payload: Record<string, unknown>): void => {
+  for (const [socketId, socket] of io.sockets.sockets) {
+    const user = socketUsers.get(socketId);
+    if (user && canManageAgencySettings(user, agencyId)) {
+      socket.emit("recording-extension-status", { agencyId, ...payload });
+    }
+  }
 };
 
 const emitLogToAuthorizedSockets = (owner: SessionOwner, event: SessionEvent): void => {
@@ -457,40 +698,50 @@ io.on("connection", (socket) => {
     }
 
     let sessionKey = "";
-    const monitoringSettings = await getAgencyMonitoringSettings(owner.agencyId);
-    const session = await createBotSession({
-      onLog: (event) => recordLog(owner, event, sessionKey),
-      onPrompt: (message) => {
-        activePrompts.set(sessionKey, { message, owner });
-        selectedSessionBySocket.set(socket.id, sessionKey);
-        emitPromptToAuthorizedSockets(owner, message, sessionKey);
-        void notifyAgencyIfNeeded({
-          agencyId: owner.agencyId,
-          level: "warn",
-          message,
-          sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey,
-          botName: owner.botName
-        });
-      },
-      onStatus: (status) => {
-        emitStatusToAuthorizedSockets(owner, sessionKey, status);
-        if (status === "stopped" || status === "error") {
-          sessions.delete(sessionKey);
-          sessionOwners.delete(sessionKey);
-          selectedSessionBySocket.delete(socket.id);
-          activePrompts.delete(sessionKey);
-          emitMaintenance();
-        }
-      }
-    }, botName, monitoringSettings, { login, password, category });
+    try {
+      const agencySettings = await getAgencySettings(owner.agencyId);
+      const profileLease = await reserveStandardProfileForBot(owner.agencyId);
+      const extensionLinks = owner.agencyId ? await listExtensionLinks(owner.agencyId, true) : [];
 
-    sessionKey = session.snapshot().id;
-    sessions.set(sessionKey, session);
-    sessionOwners.set(sessionKey, owner);
-    selectedSessionBySocket.set(socket.id, sessionKey);
-    socket.emit("bot-session", { ...session.snapshot(), category, login });
-    emitMaintenance();
-    void session.start();
+      const session = await createBotSession({
+        onLog: (event) => recordLog(owner, event, sessionKey),
+        onPrompt: (message) => {
+          activePrompts.set(sessionKey, { message, owner });
+          selectedSessionBySocket.set(socket.id, sessionKey);
+          emitPromptToAuthorizedSockets(owner, message, sessionKey);
+          void notifyAgencyIfNeeded({
+            agencyId: owner.agencyId,
+            level: "warn",
+            message,
+            sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey,
+            botName: owner.botName
+          });
+        },
+        onStatus: (status) => {
+          emitStatusToAuthorizedSockets(owner, sessionKey, status);
+          if (status === "stopped" || status === "error") {
+            sessions.delete(sessionKey);
+            sessionOwners.delete(sessionKey);
+            selectedSessionBySocket.delete(socket.id);
+            activePrompts.delete(sessionKey);
+            emitMaintenance();
+          }
+        }
+      }, profileLease, botName, agencySettings, { login, password, category }, extensionLinks);
+
+      sessionKey = session.snapshot().id;
+      sessions.set(sessionKey, session);
+      sessionOwners.set(sessionKey, owner);
+      selectedSessionBySocket.set(socket.id, sessionKey);
+      socket.emit("bot-session", { ...session.snapshot(), category, login });
+      emitMaintenance();
+      void session.start();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      socket.emit("bot-status", { status: "error" });
+      emitOwnedLog(socket, owner, makeEvent("error", message));
+      emitMaintenance();
+    }
   });
 
   socket.on("select-session", ({ sessionId }: { sessionId?: string }) => {
