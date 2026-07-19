@@ -52,6 +52,12 @@ const authPagePattern = /i2-auth\.visas-fr\.tlscontact\.com/i;
 const travelGroupsPagePattern = /\/fr-fr\/travel-groups/i;
 const applicationSummaryPagePattern = /\/workflow\/application-summary/i;
 const HUMAN_VALIDATION_TIMEOUT_MS = 2 * 60 * 1000;
+// Fenetre pendant laquelle le bot retente seul la suite du parcours (connexion,
+// selection de la demande, clic "Prendre un nouveau rendez-vous"...) avant de
+// solliciter l'humain. Beaucoup de blocages (captcha resolu entre-temps, etc.)
+// se resolvent dans cette fenetre sans aucune intervention.
+const SILENT_RECOVERY_GRACE_MS = 4 * 60 * 1000;
+const SILENT_RECOVERY_RETRY_INTERVAL_MS = 10_000;
 
 export class BotSession {
   private browser?: Browser;
@@ -383,12 +389,7 @@ export class BotSession {
       return;
     }
 
-    await fillLoginForm(this.page, this.credentials.login, this.credentials.password, (level, message) => this.log(level, message))
-      .catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        this.log("warn", `Remplissage automatique du formulaire de connexion impossible: ${message}`);
-        return false;
-      });
+    await this.tryFillLoginForm();
 
     if (this.page.isClosed()) {
       return;
@@ -414,12 +415,7 @@ export class BotSession {
       return;
     }
 
-    const selected = await clickSelectTravelGroup(this.page, (level, message) => this.log(level, message))
-      .catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        this.log("warn", `Selection automatique de la demande impossible: ${message}`);
-        return false;
-      });
+    const selected = await this.trySelectTravelGroup();
 
     // La navigation apres "Selectionner" est cote SPA et peut enchainer plusieurs
     // etapes intermediaires silencieuses (applicants-information, recapitulatif de
@@ -438,16 +434,104 @@ export class BotSession {
       return;
     }
 
-    const booking = await clickBookNewAppointment(this.page, (level, message) => this.log(level, message))
+    const booking = await this.tryBookAppointment();
+
+    if (booking) {
+      await this.waitForUrlAway(applicationSummaryPagePattern, 15_000);
+    }
+  }
+
+  private async tryFillLoginForm(): Promise<boolean> {
+    if (!this.page || this.page.isClosed() || !this.credentials?.login || !this.credentials?.password) {
+      return false;
+    }
+
+    return fillLoginForm(this.page, this.credentials.login, this.credentials.password, (level, message) => this.log(level, message))
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.log("warn", `Remplissage automatique du formulaire de connexion impossible: ${message}`);
+        return false;
+      });
+  }
+
+  private async trySelectTravelGroup(): Promise<boolean> {
+    if (!this.page || this.page.isClosed()) {
+      return false;
+    }
+
+    return clickSelectTravelGroup(this.page, (level, message) => this.log(level, message))
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.log("warn", `Selection automatique de la demande impossible: ${message}`);
+        return false;
+      });
+  }
+
+  private async tryBookAppointment(): Promise<boolean> {
+    if (!this.page || this.page.isClosed()) {
+      return false;
+    }
+
+    return clickBookNewAppointment(this.page, (level, message) => this.log(level, message))
       .catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
         this.log("warn", `Clic automatique sur 'Prendre un nouveau rendez-vous' impossible: ${message}`);
         return false;
       });
+  }
 
-    if (booking) {
-      await this.waitForUrlAway(applicationSummaryPagePattern, 15_000);
+  // Contrairement au premier bloc de attemptAutoLogin (qui force une navigation vers
+  // /fr-fr/login via clickSeConnecter), cette methode ne reagit qu'a des etats DEJA
+  // reconnus sans jamais rien forcer: si la page est dans un etat ambigu (captcha,
+  // file d'attente Cloudflare, ecran de chargement...), elle ne fait rien pour ne
+  // jamais interrompre une action manuelle de l'humain en cours.
+  private async resumeIfRecognizedState(): Promise<boolean> {
+    if (!this.page || this.page.isClosed()) {
+      return false;
     }
+
+    const url = this.page.url();
+
+    if (authPagePattern.test(url)) {
+      if (!this.credentials?.login || !this.credentials?.password) {
+        return false;
+      }
+      await this.tryFillLoginForm();
+      return true;
+    }
+
+    if (travelGroupsPagePattern.test(url)) {
+      await this.trySelectTravelGroup();
+      return true;
+    }
+
+    if (applicationSummaryPagePattern.test(url)) {
+      await this.tryBookAppointment();
+      return true;
+    }
+
+    return false;
+  }
+
+  private async retryNavigationSilently(): Promise<boolean> {
+    const deadline = Date.now() + SILENT_RECOVERY_GRACE_MS;
+
+    while (Date.now() < deadline) {
+      if (!this.browser?.isConnected()) {
+        return false;
+      }
+
+      await this.resumeIfRecognizedState();
+
+      const page = await this.recoverPage();
+      if (page && appointmentPagePattern.test(page.url())) {
+        return true;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, SILENT_RECOVERY_RETRY_INTERVAL_MS));
+    }
+
+    return false;
   }
 
   private async waitForUrlAway(currentPagePattern: RegExp, timeoutMs: number): Promise<void> {
@@ -503,8 +587,21 @@ export class BotSession {
 
       const currentUrl = page?.url() ?? "aucun onglet";
       this.log("warn", `Onglet rendez-vous introuvable (tentative ${attempt}). Onglet actuel: ${currentUrl}`);
+
+      // Avant de solliciter l'humain, on retente seul la suite du parcours pendant
+      // quelques minutes (connexion, selection de la demande, clic "Prendre un
+      // nouveau rendez-vous"...): beaucoup de blocages se resolvent sans aucune
+      // intervention (captcha resolu entre-temps, page qui finit de charger...).
+      if (await this.retryNavigationSilently()) {
+        continue;
+      }
+
+      this.log(
+        "warn",
+        `Bot toujours bloque apres ${SILENT_RECOVERY_GRACE_MS / 60_000} min de tentatives automatiques.`
+      );
       await this.waitForUser(
-        "Fermez les onglets/fenetres extra, gardez seulement la page de rendez-vous, puis validez."
+        "Le bot n'arrive pas a atteindre la page de rendez-vous (captcha, connexion ou navigation bloquee). Verifiez le navigateur du bot, corrigez si besoin, puis validez."
       );
     }
   }

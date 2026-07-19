@@ -12,8 +12,14 @@ type NotificationInput = {
 
 const recentNotifications = new Map<string, number>();
 const recentAppointmentByAgency = new Map<number, number>();
+const blockedSince = new Map<string, number>();
 const DEDUPE_MS = 5 * 60 * 1000;
 const SUPPRESS_AFTER_APPOINTMENT_MS = 15 * 60 * 1000;
+// Le bot logue un blocage humain (captcha, session expiree, onglet introuvable...)
+// des sa detection, mais la plupart se resolvent seuls en quelques dizaines de
+// secondes. On laisse une fenetre de grace avant d'alerter par mail, pour ne pas
+// spammer l'agence a chaque micro-transition pendant la surveillance.
+export const HUMAN_BLOCK_GRACE_MS = 4 * 60 * 1000;
 
 const stripTechnicalNoise = (message: string): string => message
   .replace(/\u001b\[[0-9;]*m/g, "")
@@ -130,9 +136,27 @@ export const notifyAgencyIfNeeded = async ({
   botName
 }: NotificationInput): Promise<void> => {
   const category = classifyNotification(message);
+  const blockKey = sessionId ?? (agencyId ? `agency:${agencyId}:${botName ?? ""}` : null);
+
+  // Un log "success" signale que le blocage est leve : on remet le compteur de
+  // grace a zero pour que le prochain blocage reparte d'une fenetre complete.
+  if (blockKey && level === "success") {
+    blockedSince.delete(blockKey);
+  }
 
   if (!agencyId || !category) {
     return;
+  }
+
+  if (category === "human-blocked" && blockKey) {
+    const firstSeen = blockedSince.get(blockKey);
+    if (!firstSeen) {
+      blockedSince.set(blockKey, Date.now());
+      return;
+    }
+    if (Date.now() - firstSeen < HUMAN_BLOCK_GRACE_MS) {
+      return;
+    }
   }
 
   const email = await getAgencyNotificationEmail(agencyId);

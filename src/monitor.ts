@@ -60,17 +60,66 @@ export const waitForUserToStart = async (runtime?: MonitorRuntime): Promise<void
   await resolved.waitForUser("Validez quand la page de rendez-vous est prete.");
 };
 
-export const pauseForHuman = async (reason: string, runtime?: MonitorRuntime): Promise<void> => {
+const HUMAN_BLOCK_GRACE_MS = 4 * 60 * 1000;
+const HUMAN_RECHECK_INTERVAL_MS = 15_000;
+
+// La plupart des blocages (captcha, transition de session...) se resolvent seuls
+// en quelques dizaines de secondes. On sonde silencieusement pendant la fenetre
+// de grace: si la condition qui a declenche la pause disparait d'elle-meme, on
+// reprend sans jamais afficher de prompt ni solliciter l'humain.
+const waitForConditionToClear = async (
+  page: Page,
+  isStillBlocked: () => Promise<boolean>
+): Promise<boolean> => {
+  const deadline = Date.now() + HUMAN_BLOCK_GRACE_MS;
+
+  while (Date.now() < deadline) {
+    if (page.isClosed()) {
+      return true;
+    }
+
+    if (!(await isStillBlocked().catch(() => false))) {
+      return true;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, HUMAN_RECHECK_INTERVAL_MS));
+  }
+
+  return false;
+};
+
+export const pauseForHuman = async (
+  reason: string,
+  runtime?: MonitorRuntime,
+  page?: Page,
+  isStillBlocked?: () => Promise<boolean>
+): Promise<void> => {
   const resolved = resolveRuntime(runtime);
-  resolved.log("warn", `Intervention humaine requise: ${reason}`);
+  resolved.log("warn", `Intervention humaine potentiellement requise: ${reason}`);
+
+  if (page && isStillBlocked) {
+    const cleared = await waitForConditionToClear(page, isStillBlocked);
+    if (cleared) {
+      resolved.log("success", "Situation resolue automatiquement, reprise de la surveillance sans intervention.");
+      return;
+    }
+
+    resolved.log("warn", `Toujours bloque apres ${HUMAN_BLOCK_GRACE_MS / 60_000} min: ${reason}`);
+  }
+
   await resolved.waitForUser("Validez pour reprendre la surveillance.");
 };
 
-const alertAndPause = async (reason: string, runtime: ResolvedMonitorRuntime): Promise<void> => {
+const alertAndPause = async (
+  reason: string,
+  runtime: ResolvedMonitorRuntime,
+  page?: Page,
+  isStillBlocked?: () => Promise<boolean>
+): Promise<void> => {
   runtime.log("error", "ALERTE_UTILISATEUR");
   runtime.log("error", reason);
   process.stdout.write("\u0007");
-  await pauseForHuman(reason, runtime);
+  await pauseForHuman(reason, runtime, page, isStillBlocked);
 };
 
 const isTargetClosedError = (error: unknown): boolean => {
@@ -548,7 +597,12 @@ export const monitorAppointments = async (
     const validation = await detectHumanValidation(activePage);
     if (validation.detected) {
       await takeTimestampedScreenshot(activePage, "human-validation");
-      await pauseForHuman(validation.reason ?? "Validation humaine ou blocage detecte.", resolved);
+      await pauseForHuman(
+        validation.reason ?? "Validation humaine ou blocage detecte.",
+        resolved,
+        activePage,
+        () => detectHumanValidation(activePage).then((result) => result.detected)
+      );
       continue;
     }
 
@@ -558,7 +612,12 @@ export const monitorAppointments = async (
         applyRateLimitCooldown(pageDomain(activePage), config.rateLimitCooldownMinutes, resolved.log);
       }
       await safeScreenshot(activePage, "unexpected-page");
-      await alertAndPause(unexpectedReason, resolved);
+      await alertAndPause(
+        unexpectedReason,
+        resolved,
+        activePage,
+        () => detectUnexpectedPageReason(activePage).then((result) => result !== null)
+      );
       continue;
     }
 
