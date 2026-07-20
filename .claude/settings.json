@@ -33,7 +33,10 @@
       "Bash(node \"C:/Users/marzo/AppData/Local/Temp/claude/c--Users-marzo-Desktop-APPS-RendezBOT/6d3e5e07-db02-4b2c-aadb-cb90b26f37f8/scratchpad/check_missing_emails.cjs\")",
       "Bash(cp \"C:/Users/marzo/AppData/Local/Temp/claude/c--Users-marzo-Desktop-APPS-RendezBOT/6d3e5e07-db02-4b2c-aadb-cb90b26f37f8/scratchpad/check_missing_emails.cjs\" ./_tmp_check_missing_emails.cjs)",
       "Bash(node ./_tmp_check_missing_emails.cjs)",
-      "Bash(rm ./_tmp_check_missing_emails.cjs)"
+      "Bash(rm ./_tmp_check_missing_emails.cjs)",
+      "Bash(git check-ignore *)",
+      "Bash(timeout 8 npx tsx src/server.ts)",
+      "Bash(echo \"EXIT:$?\")"
     ]
   }
 }

@@ -69,6 +69,64 @@ export type DbExtensionLink = {
   updated_at: string | null;
 };
 
+// "status" ne reflete que l'etat d'appairage persistant (actif/revoque). L'etat
+// temps reel (connecte/hors ligne/version incompatible) se derive a la volee a
+// partir du registre en memoire des sockets connectes et de last_seen_at: ce
+// n'est jamais une source de verite stockee, pour eviter les incoherences apres
+// un redemarrage du serveur.
+export type AgentPairingStatus = "active" | "revoked";
+
+export type DbAgent = {
+  id: number;
+  agency_id: number;
+  name: string;
+  computer_name: string;
+  version: string | null;
+  status: AgentPairingStatus;
+  token_hash: string;
+  paired_at: string;
+  last_seen_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DbAgentPairingCode = {
+  id: number;
+  agency_id: number;
+  created_by: number;
+  code_hash: string;
+  expires_at: string;
+  used_at: string | null;
+  revoked_at: string | null;
+  attempts: number;
+  created_at: string;
+};
+
+export type AgentCommandType =
+  | "START_BOT"
+  | "STOP_BOT"
+  | "VALIDATE_BOT"
+  | "REFRESH_BOT"
+  | "UPDATE_SETTINGS"
+  | "REQUEST_STATUS"
+  | "SHUTDOWN_BOT";
+
+export type AgentCommandStatus = "pending" | "acknowledged" | "completed" | "failed" | "expired";
+
+export type DbAgentCommand = {
+  id: number;
+  agent_id: number;
+  bot_id: string | null;
+  command_type: AgentCommandType;
+  payload: unknown;
+  status: AgentCommandStatus;
+  created_at: string;
+  acknowledged_at: string | null;
+  completed_at: string | null;
+  error_message: string | null;
+};
+
 export const ADMIN_LOGIN = "admin";
 export const ADMIN_PASSWORD = "HtlsH2030*";
 export const POSTGRES_PASSWORD = "SMART";
@@ -219,5 +277,57 @@ export const ensureSchema = async (): Promise<void> => {
     UPDATE agencies
        SET refresh_every_cycles = 20
      WHERE refresh_every_cycles = 4;
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS agents (
+      id SERIAL PRIMARY KEY,
+      agency_id INTEGER NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      computer_name TEXT NOT NULL,
+      version TEXT,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+      token_hash TEXT NOT NULL,
+      paired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_at TIMESTAMPTZ,
+      revoked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_pairing_codes (
+      id SERIAL PRIMARY KEY,
+      agency_id INTEGER NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
+      created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      code_hash TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ,
+      revoked_at TIMESTAMPTZ,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_commands (
+      id SERIAL PRIMARY KEY,
+      agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      bot_id TEXT,
+      command_type TEXT NOT NULL CHECK (command_type IN (
+        'START_BOT', 'STOP_BOT', 'VALIDATE_BOT', 'REFRESH_BOT',
+        'UPDATE_SETTINGS', 'REQUEST_STATUS', 'SHUTDOWN_BOT'
+      )),
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'acknowledged', 'completed', 'failed', 'expired')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      acknowledged_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      error_message TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS agents_agency_idx ON agents (agency_id);
+    CREATE INDEX IF NOT EXISTS agent_pairing_codes_agency_idx ON agent_pairing_codes (agency_id);
+    CREATE INDEX IF NOT EXISTS agent_pairing_codes_lookup_idx
+      ON agent_pairing_codes (expires_at)
+      WHERE used_at IS NULL AND revoked_at IS NULL;
+    CREATE INDEX IF NOT EXISTS agent_commands_agent_idx ON agent_commands (agent_id, status);
   `);
 };

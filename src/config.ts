@@ -26,6 +26,22 @@ const booleanEnv = (key: string, fallback: boolean): boolean => {
   return ["1", "true", "yes", "y"].includes(raw.toLowerCase());
 };
 
+export type AgentGatewayConfig = {
+  heartbeatIntervalMs: number;
+  offlineTimeoutMs: number;
+  minAgentVersion: string;
+  pairingCodeTtlMinutes: number;
+  pairingMaxAttemptsPerCode: number;
+};
+
+export const loadAgentGatewayConfig = (): AgentGatewayConfig => ({
+  heartbeatIntervalMs: numberEnv("AGENT_HEARTBEAT_INTERVAL_MS", 10_000),
+  offlineTimeoutMs: numberEnv("AGENT_OFFLINE_TIMEOUT_MS", 40_000),
+  minAgentVersion: process.env.AGENT_MIN_VERSION?.trim() || "0.1.0",
+  pairingCodeTtlMinutes: numberEnv("AGENT_PAIRING_CODE_TTL_MINUTES", 10),
+  pairingMaxAttemptsPerCode: numberEnv("AGENT_PAIRING_MAX_ATTEMPTS", 5)
+});
+
 export const loadConfig = (): AppConfig => ({
   targetUrl: process.env.TARGET_URL?.trim() || "about:blank",
   connectToExistingChrome: booleanEnv("CONNECT_TO_EXISTING_CHROME", false),

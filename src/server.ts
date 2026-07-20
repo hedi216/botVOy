@@ -44,6 +44,9 @@ import {
 } from "./userService.js";
 import { notifyUserIfNeeded } from "./notifications.js";
 import { sendAppAlert } from "./appAlertService.js";
+import { loadAgentGatewayConfig } from "./config.js";
+import { createPairingCode, listAgentsForAgency, renameAgent, revokeAgent } from "./agentService.js";
+import { AgentSnapshot, getSnapshotForAgent, registerAgentNamespace } from "./agentGateway.js";
 
 type SessionOwner = {
   userId: number;
@@ -64,6 +67,7 @@ const server = http.createServer(app);
 const io = new Server(server);
 const preferredPort = Number(process.env.WEB_PORT ?? 3000);
 const maxClients = Number(process.env.MAX_CLIENTS_PER_VM ?? 15);
+const agentGatewayConfig = loadAgentGatewayConfig();
 const sessions = new Map<string, BotSession>();
 const sessionOwners = new Map<string, SessionOwner>();
 const socketUsers = new Map<string, DbUser>();
@@ -471,6 +475,76 @@ app.post("/api/email/test-alert", requireAuth, requireAdmin, async (req, res) =>
   res.status(result.success ? 200 : 400).json(result);
 });
 
+const resolveViewAgencyId = (user: DbUser, value?: unknown): number | null => {
+  if (user.role === 0) {
+    const agencyId = Number(value);
+    return agencyId ? agencyId : null;
+  }
+
+  return user.agency_id ? Number(user.agency_id) : null;
+};
+
+app.get("/api/agents", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = resolveViewAgencyId(req.user!, req.query.agencyId);
+
+  if (!agencyId) {
+    res.status(400).json({ error: "Agence requise." });
+    return;
+  }
+
+  const agents = await listAgentsForAgency(agencyId);
+  const snapshots = await Promise.all(agents.map((agent) => getSnapshotForAgent(agent.id, agentGatewayConfig)));
+  res.json({ agents: snapshots.filter((snapshot): snapshot is AgentSnapshot => snapshot !== null) });
+});
+
+app.post("/api/agents/pairing-codes", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  const pairing = await createPairingCode(agencyId, req.user!.id, agentGatewayConfig);
+  res.json({ pairing });
+});
+
+app.patch("/api/agents/:id", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
+  const body = req.body as { agencyId?: number; name?: string };
+  const agencyId = getSettingsAgencyId(req.user!, body.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  const agent = await renameAgent(agencyId, Number(req.params.id), body.name ?? "");
+  res.json({ agent });
+});
+
+app.post("/api/agents/:id/revoke", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  const agent = await revokeAgent(agencyId, Number(req.params.id));
+  emitAgentStatusToAuthorizedSockets(agencyId, {
+    agentId: agent.id,
+    agencyId,
+    name: agent.name,
+    computerName: agent.computer_name,
+    version: agent.version,
+    status: "REVOKED",
+    pairedAt: agent.paired_at,
+    lastSeenAt: agent.last_seen_at,
+    activeBotCount: 0
+  });
+  res.json({ agent });
+});
+
 app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   logger.error(`API error: ${error.message}`);
   res.status(400).json({ error: error.message });
@@ -559,6 +633,20 @@ const emitRecordingExtensionStatus = (agencyId: number, payload: Record<string, 
     }
   }
 };
+
+const canSeeAgencyAgentStatus = (user: DbUser, agencyId: number): boolean =>
+  user.role === 0 || user.agency_id === agencyId;
+
+const emitAgentStatusToAuthorizedSockets = (agencyId: number, snapshot: AgentSnapshot): void => {
+  for (const [socketId, socket] of io.sockets.sockets) {
+    const user = socketUsers.get(socketId);
+    if (user && canSeeAgencyAgentStatus(user, agencyId)) {
+      socket.emit("agent-status", snapshot);
+    }
+  }
+};
+
+registerAgentNamespace(io, agentGatewayConfig, emitAgentStatusToAuthorizedSockets);
 
 const emitLogToAuthorizedSockets = (owner: SessionOwner, event: SessionEvent): void => {
   for (const [socketId, socket] of io.sockets.sockets) {
