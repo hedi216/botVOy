@@ -51,7 +51,13 @@
       "Bash(taskkill //PID 693 //F //T)",
       "Bash(rm -f \"c:/Users/marzo/Desktop/APPS/RendezBOT/.agent-test-credentials.json\")",
       "Bash(rm -f /tmp/rendezbot-server-test.log /tmp/reconnect-test.log /tmp/rdv-cookies.txt)",
-      "Bash(taskkill //PID 24836 //F //T)"
+      "Bash(taskkill //PID 24836 //F //T)",
+      "Bash(cd \"c:/Users/marzo/Desktop/APPS/RendezBOT\" && cp src/agentService.ts /tmp/agentService.ts.bak)",
+      "Bash(cp /tmp/agentService.ts.bak \"c:/Users/marzo/Desktop/APPS/RendezBOT/src/agentService.ts\")",
+      "Bash(rm /tmp/agentService.ts.bak)"
+    ],
+    "additionalDirectories": [
+      "\\tmp"
     ]
   }
 }

@@ -9,7 +9,43 @@ export type AgentLiveStatus =
   | "VERSION_INCOMPATIBLE"
   | "REVOKED";
 
-export type AgentWithLiveStatus = DbAgent & { liveStatus: AgentLiveStatus };
+// Liste blanche stricte: seule fonction autorisee a transformer une ligne
+// agents (qui contient token_hash) en objet exposable au frontend ou a un
+// evenement socket cote interface web. Toute nouvelle sortie publique doit
+// passer par ici plutot que de spreader/retourner un DbAgent directement.
+export type PublicAgent = {
+  agentId: number;
+  agencyId: number;
+  name: string;
+  computerName: string;
+  version: string | null;
+  status: AgentLiveStatus;
+  pairedAt: string;
+  lastSeenAt: string | null;
+  activeBotCount: number;
+  createdAt: string;
+  updatedAt: string;
+  revokedAt: string | null;
+};
+
+export const toPublicAgent = (
+  agent: DbAgent,
+  liveStatus: AgentLiveStatus,
+  activeBotCount = 0
+): PublicAgent => ({
+  agentId: agent.id,
+  agencyId: agent.agency_id,
+  name: agent.name,
+  computerName: agent.computer_name,
+  version: agent.version,
+  status: liveStatus,
+  pairedAt: agent.paired_at,
+  lastSeenAt: agent.last_seen_at,
+  activeBotCount: Math.max(0, Math.trunc(activeBotCount)),
+  createdAt: agent.created_at,
+  updatedAt: agent.updated_at,
+  revokedAt: agent.revoked_at
+});
 
 // Alphabet sans caracteres ambigus (pas de 0/O, 1/I/L) pour que le code reste
 // lisible et saisissable a la main sans confusion.

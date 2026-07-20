@@ -519,7 +519,8 @@ app.patch("/api/agents/:id", requireAuth, requireAgencyManager, async (req: Auth
   }
 
   const agent = await renameAgent(agencyId, Number(req.params.id), body.name ?? "");
-  res.json({ agent });
+  const snapshot = await getSnapshotForAgent(agent.id, agentGatewayConfig);
+  res.json({ agent: snapshot });
 });
 
 app.post("/api/agents/:id/revoke", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
@@ -531,18 +532,11 @@ app.post("/api/agents/:id/revoke", requireAuth, requireAgencyManager, async (req
   }
 
   const agent = await revokeAgent(agencyId, Number(req.params.id));
-  emitAgentStatusToAuthorizedSockets(agencyId, {
-    agentId: agent.id,
-    agencyId,
-    name: agent.name,
-    computerName: agent.computer_name,
-    version: agent.version,
-    status: "REVOKED",
-    pairedAt: agent.paired_at,
-    lastSeenAt: agent.last_seen_at,
-    activeBotCount: 0
-  });
-  res.json({ agent });
+  const snapshot = await getSnapshotForAgent(agent.id, agentGatewayConfig);
+  if (snapshot) {
+    emitAgentStatusToAuthorizedSockets(agencyId, snapshot);
+  }
+  res.json({ agent: snapshot });
 });
 
 app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

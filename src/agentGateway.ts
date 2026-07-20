@@ -6,8 +6,9 @@ import {
   getAgentById,
   redeemPairingCode,
   touchAgentSeen,
+  toPublicAgent,
   verifyAgentToken,
-  AgentLiveStatus
+  PublicAgent
 } from "./agentService.js";
 import { logger } from "./logger.js";
 
@@ -15,17 +16,10 @@ type PairAuth = { mode: "pair"; pairingCode: string; computerName: string; versi
 type ReconnectAuth = { mode: "reconnect"; agentId: number; token: string; computerName?: string; version: string };
 type AgentHandshakeAuth = PairAuth | ReconnectAuth;
 
-export type AgentSnapshot = {
-  agentId: number;
-  agencyId: number;
-  name: string;
-  computerName: string;
-  version: string | null;
-  status: AgentLiveStatus;
-  pairedAt: string;
-  lastSeenAt: string | null;
-  activeBotCount: number;
-};
+// Alias conserve pour les modules qui importaient deja ce nom: la forme reelle
+// (liste blanche stricte, jamais de token/token_hash) vient de toPublicAgent
+// dans agentService.ts, source unique de verite pour toute sortie publique.
+export type AgentSnapshot = PublicAgent;
 
 type ConnectedAgent = {
   socket: Socket;
@@ -54,17 +48,12 @@ const isIpRateLimited = (ip: string): boolean => {
   return entry.count > PAIRING_IP_MAX_ATTEMPTS;
 };
 
-const snapshotFromAgent = (agent: DbAgent, config: AgentGatewayConfig): AgentSnapshot => ({
-  agentId: agent.id,
-  agencyId: agent.agency_id,
-  name: agent.name,
-  computerName: agent.computer_name,
-  version: agent.version,
-  status: computeLiveStatus(agent, connectedAgents.has(agent.id), config),
-  pairedAt: agent.paired_at,
-  lastSeenAt: agent.last_seen_at,
-  activeBotCount: connectedAgents.get(agent.id)?.activeBotCount ?? 0
-});
+const snapshotFromAgent = (agent: DbAgent, config: AgentGatewayConfig): AgentSnapshot =>
+  toPublicAgent(
+    agent,
+    computeLiveStatus(agent, connectedAgents.has(agent.id), config),
+    connectedAgents.get(agent.id)?.activeBotCount ?? 0
+  );
 
 export const isAgentConnected = (agentId: number): boolean => connectedAgents.has(agentId);
 
