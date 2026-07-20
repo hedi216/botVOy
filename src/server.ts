@@ -242,6 +242,25 @@ const getSettingsAgencyId = (user: DbUser, value?: unknown): number | null => {
   return user.agency_id ? Number(user.agency_id) : null;
 };
 
+// Centralise la resolution de l'agence pour les routes qui agissent "pour son
+// agence" (revocation, actions sur un agent...): lit body/query de facon
+// defensive (req.body peut etre undefined si la requete n'a pas de payload
+// JSON, ex. un POST d'action sans corps) et ecrit elle-meme la reponse 400
+// controlee si aucun rattachement n'existe, plutot que de laisser un acces
+// direct type `req.body!.agencyId` planter en TypeError.
+const requireAgencyId = (req: AuthenticatedRequest, res: express.Response): number | null => {
+  const bodyAgencyId = (req.body as { agencyId?: unknown } | undefined)?.agencyId;
+  const queryAgencyId = req.query?.agencyId;
+  const agencyId = getSettingsAgencyId(req.user!, bodyAgencyId ?? queryAgencyId);
+
+  if (!agencyId) {
+    res.status(400).json({ error: "Agence requise." });
+    return null;
+  }
+
+  return agencyId;
+};
+
 app.get("/api/extensions", requireAuth, async (req: AuthenticatedRequest, res) => {
   const agencyId = getSettingsAgencyId(req.user!, req.query.agencyId);
 
@@ -337,7 +356,7 @@ app.get("/api/recording-extension/profiles", requireAuth, async (req: Authentica
 });
 
 app.post("/api/recording-extension/prepare", requireAuth, async (req: AuthenticatedRequest, res) => {
-  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number } | undefined)?.agencyId);
 
   if (!agencyId) {
     res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
@@ -359,7 +378,7 @@ app.post("/api/recording-extension/prepare", requireAuth, async (req: Authentica
 });
 
 app.post("/api/recording-extension/confirm", requireAuth, async (req: AuthenticatedRequest, res) => {
-  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number } | undefined)?.agencyId);
 
   if (!agencyId) {
     res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
@@ -376,7 +395,7 @@ app.post("/api/recording-extension/confirm", requireAuth, async (req: Authentica
 });
 
 app.post("/api/recording-extension/cancel", requireAuth, async (req: AuthenticatedRequest, res) => {
-  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number } | undefined)?.agencyId);
 
   if (!agencyId) {
     res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
@@ -393,7 +412,7 @@ app.post("/api/recording-extension/cancel", requireAuth, async (req: Authenticat
 });
 
 app.post("/api/recording-extension/profiles/:id/manage", requireAuth, async (req: AuthenticatedRequest, res) => {
-  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number } | undefined)?.agencyId);
 
   if (!agencyId) {
     res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
@@ -409,7 +428,7 @@ app.post("/api/recording-extension/profiles/:id/manage", requireAuth, async (req
 });
 
 app.post("/api/recording-extension/profiles/:id/stop-management", requireAuth, async (req: AuthenticatedRequest, res) => {
-  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
+  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number } | undefined)?.agencyId);
 
   if (!agencyId) {
     res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
@@ -498,10 +517,8 @@ app.get("/api/agents", requireAuth, async (req: AuthenticatedRequest, res) => {
 });
 
 app.post("/api/agents/pairing-codes", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
-  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
-
-  if (!agencyId) {
-    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+  const agencyId = requireAgencyId(req, res);
+  if (agencyId === null) {
     return;
   }
 
@@ -510,28 +527,42 @@ app.post("/api/agents/pairing-codes", requireAuth, requireAgencyManager, async (
 });
 
 app.patch("/api/agents/:id", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
-  const body = req.body as { agencyId?: number; name?: string };
-  const agencyId = getSettingsAgencyId(req.user!, body.agencyId);
-
-  if (!agencyId) {
-    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+  const agencyId = requireAgencyId(req, res);
+  if (agencyId === null) {
     return;
   }
 
-  const agent = await renameAgent(agencyId, Number(req.params.id), body.name ?? "");
+  // Body toujours defensif (peut etre absent): seul le nom est encore lu ici,
+  // agencyId est deja resolu par requireAgencyId ci-dessus.
+  const body = (req.body ?? {}) as { name?: unknown };
+  if (typeof body.name !== "string" || !body.name.trim()) {
+    res.status(400).json({ error: "Nom requis." });
+    return;
+  }
+
+  const agent = await renameAgent(agencyId, Number(req.params.id), body.name);
   const snapshot = await getSnapshotForAgent(agent.id, agentGatewayConfig);
   res.json({ agent: snapshot });
 });
 
 app.post("/api/agents/:id/revoke", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
-  const agencyId = getSettingsAgencyId(req.user!, (req.body as { agencyId?: number }).agencyId);
-
-  if (!agencyId) {
-    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+  const agencyId = requireAgencyId(req, res);
+  if (agencyId === null) {
     return;
   }
 
-  const agent = await revokeAgent(agencyId, Number(req.params.id));
+  const agentId = Number(req.params.id);
+  let agent: Awaited<ReturnType<typeof revokeAgent>>;
+  try {
+    // revokeAgent filtre par "id = ... AND agency_id = ..." (voir agentService.ts):
+    // un agent inexistant et un agent d'une autre agence produisent tous les deux
+    // ce meme echec, sans jamais distinguer les deux cas dans la reponse.
+    agent = await revokeAgent(agencyId, agentId);
+  } catch {
+    res.status(404).json({ error: "Agent introuvable." });
+    return;
+  }
+
   const snapshot = await getSnapshotForAgent(agent.id, agentGatewayConfig);
   if (snapshot) {
     emitAgentStatusToAuthorizedSockets(agencyId, snapshot);
@@ -541,6 +572,18 @@ app.post("/api/agents/:id/revoke", requireAuth, requireAgencyManager, async (req
 
 app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   logger.error(`API error: ${error.message}`);
+
+  // Le code metier de ce fichier leve systematiquement des `Error` simples avec
+  // un message francais destine a l'utilisateur (ex: "Agent introuvable.").
+  // TypeError/RangeError signalent au contraire un acces non defensif (bug),
+  // jamais une erreur volontaire: leur message technique ne doit jamais
+  // atteindre le client, meme si l'analyse ci-dessus (requireAgencyId, etc.)
+  // a deja neutralise les cas connus.
+  if (error instanceof TypeError || error instanceof RangeError) {
+    res.status(400).json({ error: "Requete invalide." });
+    return;
+  }
+
   res.status(400).json({ error: error.message });
 });
 

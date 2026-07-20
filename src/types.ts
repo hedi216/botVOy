@@ -43,5 +43,6 @@ export type MonitorRuntime = {
   log?: (level: MonitorEventLevel, message: string) => void;
   waitForUser?: (message: string) => Promise<void>;
   recoverPage?: (preferredUrl?: string) => Promise<Page | null>;
+  recoverWorkflow?: (reason?: string) => Promise<Page | null>;
   waitWhileNotPaused?: () => Promise<void>;
 };

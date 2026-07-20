@@ -52,11 +52,13 @@ const authPagePattern = /i2-auth\.visas-fr\.tlscontact\.com/i;
 const travelGroupsPagePattern = /\/fr-fr\/travel-groups/i;
 const applicationSummaryPagePattern = /\/workflow\/application-summary/i;
 const HUMAN_VALIDATION_TIMEOUT_MS = 2 * 60 * 1000;
-// Fenetre pendant laquelle le bot retente seul la suite du parcours (connexion,
-// selection de la demande, clic "Prendre un nouveau rendez-vous"...) avant de
-// solliciter l'humain. Beaucoup de blocages (captcha resolu entre-temps, etc.)
-// se resolvent dans cette fenetre sans aucune intervention.
-const SILENT_RECOVERY_GRACE_MS = 4 * 60 * 1000;
+// Le bot retente seul la suite du parcours avant de solliciter l'humain:
+// 3 tentatives courtes, attente de 5 minutes, puis une 4e tentative finale.
+// Si aucune page reconnue n'est retrouvee apres cela, le flux d'alerte existant
+// prend le relais et declenche la notification.
+const SILENT_RECOVERY_ATTEMPTS_BEFORE_WAIT = 3;
+const SILENT_RECOVERY_FINAL_ATTEMPT = 4;
+const SILENT_RECOVERY_LONG_WAIT_MS = 5 * 60 * 1000;
 const SILENT_RECOVERY_RETRY_INTERVAL_MS = 10_000;
 
 export class BotSession {
@@ -204,6 +206,11 @@ export class BotSession {
         clearTimeout(pendingValidationTimer);
       }
 
+      const activeTlsPage = await this.recoverPage();
+      if (activeTlsPage) {
+        await this.closeExtraPages(activeTlsPage);
+      }
+
       await this.attemptAutoLogin();
 
       const monitoredPage = await this.waitForAppointmentPage();
@@ -214,6 +221,7 @@ export class BotSession {
         log: (level, message) => this.log(level, message),
         waitForUser: (message) => this.waitForUser(message),
         recoverPage: (preferredUrl) => this.recoverPage(preferredUrl),
+        recoverWorkflow: (reason) => this.recoverWorkflow(reason),
         waitWhileNotPaused: () => this.waitWhilePaused()
       });
 
@@ -301,6 +309,92 @@ export class BotSession {
 
     await this.page?.bringToFront().catch(() => undefined);
     this.log("info", `${links.length} lien(s) d'extension ouvert(s). Installez-les dans Chrome, puis validez le bot.`);
+  }
+
+  private async closeExtraPages(keepPage: Page): Promise<void> {
+    const pages = this.browser?.contexts().flatMap((context) => context.pages()) ?? [];
+    await Promise.all(pages.map(async (candidate) => {
+      if (candidate === keepPage || candidate.isClosed()) {
+        return;
+      }
+
+      const url = candidate.url();
+      if (url.startsWith("devtools://") || url.startsWith("chrome://") || url.startsWith("chrome-extension://")) {
+        return;
+      }
+
+      await candidate.close().catch(() => undefined);
+    }));
+  }
+
+  private async recoverWorkflow(reason?: string): Promise<Page | null> {
+    this.log("warn", `Tentative de reprise automatique du workflow TLS${reason ? `: ${reason}` : "."}`);
+
+    for (let attempt = 1; attempt <= SILENT_RECOVERY_FINAL_ATTEMPT; attempt += 1) {
+      if (attempt === SILENT_RECOVERY_FINAL_ATTEMPT) {
+        this.log("warn", `Trois tentatives sans page reconnue. Attente de ${SILENT_RECOVERY_LONG_WAIT_MS / 60_000} minutes avant la tentative finale.`);
+        await new Promise((resolve) => setTimeout(resolve, SILENT_RECOVERY_LONG_WAIT_MS));
+      }
+
+      const recoveredPage = await this.tryRecoverWorkflowOnce(attempt, reason);
+      if (recoveredPage) {
+        return recoveredPage;
+      }
+
+      if (attempt < SILENT_RECOVERY_ATTEMPTS_BEFORE_WAIT) {
+        await new Promise((resolve) => setTimeout(resolve, SILENT_RECOVERY_RETRY_INTERVAL_MS));
+      }
+    }
+
+    this.log(
+      "error",
+      `Reprise automatique impossible apres ${SILENT_RECOVERY_FINAL_ATTEMPT} tentatives. Notification et intervention humaine requises.`
+    );
+    return null;
+  }
+
+  private async tryRecoverWorkflowOnce(attempt: number, reason?: string): Promise<Page | null> {
+    if (!this.browser?.isConnected()) {
+      return null;
+    }
+
+    this.log("info", `Tentative reprise workflow ${attempt}/${SILENT_RECOVERY_FINAL_ATTEMPT}${reason ? ` depuis etat inattendu` : ""}.`);
+
+    let page = await this.recoverPage();
+    if (!page || page.isClosed()) {
+      return null;
+    }
+
+    await this.closeExtraPages(page);
+    this.page = page;
+
+    if (appointmentPagePattern.test(page.url())) {
+      return page;
+    }
+
+    await this.resumeIfRecognizedState();
+    page = await this.recoverPage();
+    if (page && appointmentPagePattern.test(page.url())) {
+      return page;
+    }
+
+    const targetUrl = loadConfig().targetUrl;
+    if (targetUrl && targetUrl !== "about:blank" && this.page && !this.page.isClosed()) {
+      this.log("info", `Retour automatique vers TARGET_URL: ${targetUrl}`);
+      await this.page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20_000 })
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          this.log("warn", `Navigation TARGET_URL impossible: ${message}`);
+        });
+    }
+
+    await this.attemptAutoLogin();
+    page = await this.recoverPage();
+    if (page && appointmentPagePattern.test(page.url())) {
+      return page;
+    }
+
+    return null;
   }
 
   private async recoverPage(preferredUrl?: string): Promise<Page | null> {
@@ -514,23 +608,23 @@ export class BotSession {
   }
 
   private async retryNavigationSilently(): Promise<boolean> {
-    const deadline = Date.now() + SILENT_RECOVERY_GRACE_MS;
-
-    while (Date.now() < deadline) {
-      if (!this.browser?.isConnected()) {
-        return false;
+    for (let attempt = 1; attempt <= SILENT_RECOVERY_FINAL_ATTEMPT; attempt += 1) {
+      if (attempt === SILENT_RECOVERY_FINAL_ATTEMPT) {
+        this.log("warn", `Trois tentatives sans page de rendez-vous. Attente de ${SILENT_RECOVERY_LONG_WAIT_MS / 60_000} minutes avant la tentative finale.`);
+        await new Promise((resolve) => setTimeout(resolve, SILENT_RECOVERY_LONG_WAIT_MS));
       }
 
-      await this.resumeIfRecognizedState();
-
-      const page = await this.recoverPage();
+      const page = await this.tryRecoverWorkflowOnce(attempt);
       if (page && appointmentPagePattern.test(page.url())) {
         return true;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, SILENT_RECOVERY_RETRY_INTERVAL_MS));
+      if (attempt < SILENT_RECOVERY_ATTEMPTS_BEFORE_WAIT) {
+        await new Promise((resolve) => setTimeout(resolve, SILENT_RECOVERY_RETRY_INTERVAL_MS));
+      }
     }
 
+    this.log("error", `Page de rendez-vous introuvable apres ${SILENT_RECOVERY_FINAL_ATTEMPT} tentatives. Notification et intervention humaine requises.`);
     return false;
   }
 
@@ -598,7 +692,7 @@ export class BotSession {
 
       this.log(
         "warn",
-        `Bot toujours bloque apres ${SILENT_RECOVERY_GRACE_MS / 60_000} min de tentatives automatiques.`
+        `Bot toujours bloque apres ${SILENT_RECOVERY_FINAL_ATTEMPT} tentatives de reprise automatique.`
       );
       await this.waitForUser(
         "Le bot n'arrive pas a atteindre la page de rendez-vous (captcha, connexion ou navigation bloquee). Verifiez le navigateur du bot, corrigez si besoin, puis validez."

@@ -54,7 +54,8 @@
       "Bash(taskkill //PID 24836 //F //T)",
       "Bash(cd \"c:/Users/marzo/Desktop/APPS/RendezBOT\" && cp src/agentService.ts /tmp/agentService.ts.bak)",
       "Bash(cp /tmp/agentService.ts.bak \"c:/Users/marzo/Desktop/APPS/RendezBOT/src/agentService.ts\")",
-      "Bash(rm /tmp/agentService.ts.bak)"
+      "Bash(rm /tmp/agentService.ts.bak)",
+      "Bash(grep -n 'getSettingsAgencyId\\(req.user!, \\(req.body as { agencyId?: number }\\).agencyId\\)' src/server.ts)"
     ],
     "additionalDirectories": [
       "\\tmp"

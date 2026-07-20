@@ -24,6 +24,7 @@ type ResolvedMonitorRuntime = {
   log: (level: MonitorEventLevel, message: string) => void;
   waitForUser: (message: string) => Promise<void>;
   recoverPage: (preferredUrl?: string) => Promise<Page | null>;
+  recoverWorkflow: (reason?: string) => Promise<Page | null>;
   waitWhileNotPaused: () => Promise<void>;
 };
 
@@ -31,6 +32,7 @@ const defaultRuntime: ResolvedMonitorRuntime = {
   log: (level: MonitorEventLevel, message: string) => logger[level](message),
   waitForUser: async (message: string) => askEnter(message),
   recoverPage: async () => null,
+  recoverWorkflow: async () => null,
   waitWhileNotPaused: async () => undefined
 };
 
@@ -49,6 +51,7 @@ const resolveRuntime = (runtime?: MonitorRuntime): ResolvedMonitorRuntime => ({
   log: runtime?.log ?? defaultRuntime.log,
   waitForUser: runtime?.waitForUser ?? defaultRuntime.waitForUser,
   recoverPage: runtime?.recoverPage ?? defaultRuntime.recoverPage,
+  recoverWorkflow: runtime?.recoverWorkflow ?? defaultRuntime.recoverWorkflow,
   waitWhileNotPaused: runtime?.waitWhileNotPaused ?? defaultRuntime.waitWhileNotPaused
 });
 
@@ -610,6 +613,13 @@ export const monitorAppointments = async (
     if (unexpectedReason) {
       if (isRateLimitReason(unexpectedReason)) {
         applyRateLimitCooldown(pageDomain(activePage), config.rateLimitCooldownMinutes, resolved.log);
+      }
+      const recoveredPage = await resolved.recoverWorkflow(unexpectedReason);
+      if (recoveredPage) {
+        activePage = recoveredPage;
+        lastKnownUrl = activePage.url();
+        resolved.log("success", "Page de rendez-vous retrouvee automatiquement. Surveillance reprise.");
+        continue;
       }
       await safeScreenshot(activePage, "unexpected-page");
       await alertAndPause(
