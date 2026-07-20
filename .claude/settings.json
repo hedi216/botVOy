@@ -55,7 +55,11 @@
       "Bash(cd \"c:/Users/marzo/Desktop/APPS/RendezBOT\" && cp src/agentService.ts /tmp/agentService.ts.bak)",
       "Bash(cp /tmp/agentService.ts.bak \"c:/Users/marzo/Desktop/APPS/RendezBOT/src/agentService.ts\")",
       "Bash(rm /tmp/agentService.ts.bak)",
-      "Bash(grep -n 'getSettingsAgencyId\\(req.user!, \\(req.body as { agencyId?: number }\\).agencyId\\)' src/server.ts)"
+      "Bash(grep -n 'getSettingsAgencyId\\(req.user!, \\(req.body as { agencyId?: number }\\).agencyId\\)' src/server.ts)",
+      "Bash(timeout 6 npx tsx src/server.ts)",
+      "Bash(node --check public/agentContext.js)",
+      "Bash(node --check public/app.js)",
+      "Bash(node --check public/agentUi.js)"
     ],
     "additionalDirectories": [
       "\\tmp"

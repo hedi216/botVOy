@@ -44,7 +44,7 @@ import {
 } from "./userService.js";
 import { notifyUserIfNeeded } from "./notifications.js";
 import { sendAppAlert } from "./appAlertService.js";
-import { loadAgentGatewayConfig } from "./config.js";
+import { loadAgentGatewayConfig, loadPhase2FeatureFlags } from "./config.js";
 import { createPairingCode, listAgentsForAgency, renameAgent, revokeAgent } from "./agentService.js";
 import { AgentSnapshot, getSnapshotForAgent, registerAgentNamespace } from "./agentGateway.js";
 
@@ -68,6 +68,7 @@ const io = new Server(server);
 const preferredPort = Number(process.env.WEB_PORT ?? 3000);
 const maxClients = Number(process.env.MAX_CLIENTS_PER_VM ?? 15);
 const agentGatewayConfig = loadAgentGatewayConfig();
+const featureFlags = loadPhase2FeatureFlags();
 const sessions = new Map<string, BotSession>();
 const sessionOwners = new Map<string, SessionOwner>();
 const socketUsers = new Map<string, DbUser>();
@@ -79,6 +80,16 @@ let currentPort = preferredPort;
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
 app.use(express.static(path.join(process.cwd(), "public")));
+
+// Routes SPA pour les nouvelles pages Agent (aucun fichier statique
+// correspondant): ne servent index.html que si la fonctionnalite est
+// activee, pour que ces chemins restent inexistants (404) quand
+// AGENT_UI_ENABLED=false, exactement comme avant la Phase 2.
+if (featureFlags.agentUiEnabled) {
+  app.get(["/agent", "/agent/setup"], (_req, res) => {
+    res.sendFile(path.join(process.cwd(), "public", "index.html"));
+  });
+}
 
 app.post("/api/login", async (req, res) => {
   const { login, password } = req.body as { login?: string; password?: string };
@@ -105,6 +116,14 @@ app.post("/api/logout", (req, res) => {
 
 app.get("/api/me", requireAuth, (req: AuthenticatedRequest, res) => {
   res.json({ user: req.user });
+});
+
+app.get("/api/client-config", requireAuth, (_req, res) => {
+  res.json({
+    agentUiEnabled: featureFlags.agentUiEnabled,
+    agentDownloadUrl: featureFlags.agentDownloadUrl,
+    botExecutionMode: featureFlags.botExecutionMode
+  });
 });
 
 app.post("/api/profile/password", requireAuth, async (req: AuthenticatedRequest, res) => {
@@ -811,6 +830,21 @@ io.on("connection", (socket) => {
     const login = payload?.login?.trim() || "";
     const password = payload?.password || "";
     const owner: SessionOwner = { userId: user.id, agencyId: user.agency_id, botName, category, login };
+
+    // Phase 3 (protocole de commandes agent) n'est pas encore implementee: en
+    // mode "agent", aucun demarrage ne peut aboutir, quel que soit le statut
+    // d'un agent eventuellement connecte. Ce refus est applique cote serveur
+    // avant toute reservation de profil ou lancement de Chrome, pour qu'un
+    // appel direct a cet evenement (hors interface) soit refuse de la meme
+    // maniere qu'un clic utilisateur.
+    if (featureFlags.botExecutionMode === "agent") {
+      socket.emit("bot-status", { status: "error", code: "AGENT_EXECUTION_NOT_READY" });
+      emitOwnedLog(socket, owner, makeEvent(
+        "error",
+        "Le lancement via RendezBot Agent n'est pas encore disponible."
+      ));
+      return;
+    }
 
     if (user.role !== 0) {
       if (!user.agency_id) {

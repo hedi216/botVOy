@@ -122,7 +122,9 @@ const pageMeta = {
   extensions: ["Extensions", "Liens ouverts au demarrage des bots pour installation manuelle."],
   users: ["User Management", "Gestion des comptes utilisateurs et activation."],
   agencies: ["Agences", "Limites clients et activation des agences."],
-  profile: ["Profil", "Informations du compte et securite."]
+  profile: ["Profil", "Informations du compte et securite."],
+  "agent-setup": ["Configurer RendezBot Agent", "Detection et appairage de l'agent local."],
+  agent: ["Agent local", "Ordinateurs autorises a executer les navigateurs et bots de cette agence."]
 };
 
 const requestJson = async (url, options = {}) => {
@@ -202,6 +204,19 @@ const setAuthenticated = (user) => {
   renderProfile();
 };
 
+// Point d'extension Phase 2: si agentUi.js (charge apres ce fichier) a
+// enregistre un routeur, on lui delegue la navigation post-authentification
+// (detection d'agent, /agent/setup...). Sinon comportement historique
+// inchange: acces direct au dashboard.
+const routeAfterAuth = async () => {
+  if (window.AgentUi && typeof window.AgentUi.routeAfterAuth === "function") {
+    await window.AgentUi.routeAfterAuth();
+    return;
+  }
+
+  await showPage("dashboard");
+};
+
 const showPage = async (page) => {
   if (page === "users" && ![0, 1].includes(state.user?.role)) {
     page = "dashboard";
@@ -236,6 +251,10 @@ const showPage = async (page) => {
   }
   if (page === "extensions") {
     await loadExtensions();
+  }
+
+  if (window.AgentUi && typeof window.AgentUi.onShowPage === "function") {
+    await window.AgentUi.onShowPage(page);
   }
 };
 
@@ -731,7 +750,7 @@ els.loginForm.addEventListener("submit", async (event) => {
     setAuthenticated(user);
     socket.disconnect();
     socket.connect();
-    await showPage("dashboard");
+    await routeAfterAuth();
   } catch (error) {
     els.loginError.textContent = error.message;
   }
@@ -1044,8 +1063,32 @@ els.passwordForm.addEventListener("submit", async (event) => {
   }
 });
 
+// Compose les deux sources independantes de blocage du bouton Demarrer: le
+// quota de clients actifs (logique historique) et, si agentUi.js est charge
+// et actif, l'absence d'agent local connecte. Ni l'une ni l'autre ne doit
+// pouvoir reactiver le bouton a la place de l'autre: le calcul se refait a
+// chaque fois a partir des deux conditions.
+//
+// Le quota rend le bouton reellement indisponible (disabled): il n'y a rien
+// d'utile a communiquer de plus. L'absence d'agent, elle, ne doit desactiver
+// le bouton que VISUELLEMENT: un clic doit rester possible pour ouvrir la
+// modale explicative "RendezBot Agent requis" (sinon l'evenement submit ne
+// se declenche jamais et cette modale ne peut jamais s'afficher).
+const updateStartBotAvailability = () => {
+  const quotaOk = state.agencyMaxClients === null || state.agencyActiveCount < state.agencyMaxClients;
+  const agentOk = !(window.AgentUi && typeof window.AgentUi.canStartBot === "function") || window.AgentUi.canStartBot();
+  els.startBot.disabled = !quotaOk;
+  els.startBot.classList.toggle("agent-blocked", quotaOk && !agentOk);
+};
+
 els.botForm.addEventListener("submit", (event) => {
   event.preventDefault();
+
+  if (window.AgentUi && typeof window.AgentUi.canStartBot === "function" && !window.AgentUi.canStartBot()) {
+    window.AgentUi.showAgentRequiredModal();
+    return;
+  }
+
   els.startBot.disabled = true;
 
   const botName = els.botFormName.value.trim();
@@ -1057,11 +1100,7 @@ els.botForm.addEventListener("submit", (event) => {
   els.botForm.reset();
   els.botFormName.placeholder = `Bot ${state.agencyActiveCount + 2}`;
 
-  window.setTimeout(() => {
-    if (state.user && (state.agencyMaxClients === null || state.agencyActiveCount < state.agencyMaxClients)) {
-      els.startBot.disabled = false;
-    }
-  }, 1500);
+  window.setTimeout(updateStartBotAvailability, 1500);
 });
 
 els.dashboardContinue.addEventListener("click", () => continueBot(dashboardPromptSessionId));
@@ -1098,9 +1137,7 @@ els.shutdownServer.addEventListener("click", () => socket.emit("shutdown-server"
 
 socket.on("bot-session", (session) => {
   mergeSession(session);
-  if (state.agencyMaxClients === null || state.agencyActiveCount < state.agencyMaxClients) {
-    els.startBot.disabled = false;
-  }
+  updateStartBotAvailability();
 });
 
 socket.on("bot-status", ({ sessionId, status }) => {
@@ -1115,10 +1152,7 @@ socket.on("bot-status", ({ sessionId, status }) => {
   }
 
   renderBotTable();
-
-  if (state.agencyMaxClients === null || state.agencyActiveCount < state.agencyMaxClients) {
-    els.startBot.disabled = false;
-  }
+  updateStartBotAvailability();
 });
 
 socket.on("bot-prompt", ({ sessionId, message }) => {
@@ -1151,7 +1185,7 @@ socket.on("maintenance", ({ pid, port, maxClients, agencyActiveCount, agencyMaxC
   els.dashboardActiveCount.textContent = `${count} / ${limit}`;
   els.botActiveCount.textContent = `${count} / ${limit}`;
   els.botFormName.placeholder = `Bot ${count + 1}`;
-  els.startBot.disabled = count >= limit;
+  updateStartBotAvailability();
   state.sessions = activeSessions;
   const activeIds = new Set(activeSessions.map((session) => session.id));
   for (const promptSessionId of Object.keys(state.prompts)) {
@@ -1196,11 +1230,25 @@ const boot = async () => {
   try {
     const { user } = await requestJson("/api/me");
     setAuthenticated(user);
-    await showPage("dashboard");
+    await routeAfterAuth();
   } catch {
     els.loginScreen.hidden = false;
     els.appLayout.hidden = true;
   }
+};
+
+window.RendezBotApp = {
+  state,
+  els,
+  socket,
+  requestJson,
+  showPage,
+  formatDate,
+  makeBadge,
+  addCell,
+  updateStartBotAvailability,
+  $,
+  $$
 };
 
 void boot();

@@ -42,6 +42,24 @@ export const loadAgentGatewayConfig = (): AgentGatewayConfig => ({
   pairingMaxAttemptsPerCode: numberEnv("AGENT_PAIRING_MAX_ATTEMPTS", 5)
 });
 
+export type BotExecutionMode = "legacy_vm" | "agent";
+
+export type Phase2FeatureFlags = {
+  agentUiEnabled: boolean;
+  agentDownloadUrl: string;
+  botExecutionMode: BotExecutionMode;
+};
+
+// legacy_vm reste la valeur par defaut uniquement pour ne pas casser
+// l'environnement de developpement existant pendant la migration: ce n'est
+// jamais un fallback silencieux choisi a l'execution, seulement l'absence
+// explicite de la variable d'environnement.
+export const loadPhase2FeatureFlags = (): Phase2FeatureFlags => ({
+  agentUiEnabled: booleanEnv("AGENT_UI_ENABLED", false),
+  agentDownloadUrl: process.env.AGENT_DOWNLOAD_URL?.trim() || "",
+  botExecutionMode: process.env.BOT_EXECUTION_MODE?.trim() === "agent" ? "agent" : "legacy_vm"
+});
+
 export const loadConfig = (): AppConfig => ({
   targetUrl: process.env.TARGET_URL?.trim() || "about:blank",
   connectToExistingChrome: booleanEnv("CONNECT_TO_EXISTING_CHROME", false),

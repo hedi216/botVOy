@@ -51,6 +51,7 @@
           <button class="nav-item" data-page-target="maintenance">Maintenance</button>
           <button class="nav-item settings-nav" data-page-target="settings" hidden>Parametres</button>
           <button class="nav-item settings-nav" data-page-target="extensions" hidden>Extensions</button>
+          <button class="nav-item agent-nav" data-page-target="agent" hidden>Agent local</button>
 
           <p class="admin-nav" hidden>ADMINISTRATION</p>
           <button class="nav-item admin-nav" data-page-target="users" hidden>Utilisateurs</button>
@@ -86,8 +87,21 @@
           </div>
         </header>
 
+        <div id="agentBanner" class="agent-banner" hidden>
+          <p id="agentBannerMessage"></p>
+          <div class="button-row">
+            <button id="agentBannerConfigure" class="outline" type="button">Configurer l'agent</button>
+            <button id="agentBannerRedetect" class="outline" type="button">Detecter a nouveau</button>
+            <button id="agentBannerDismiss" class="agent-banner-close" type="button" aria-label="Fermer">&times;</button>
+          </div>
+        </div>
+
         <section class="content">
           <section class="page active" id="page-dashboard">
+            <div id="agentIndicatorDashboard" class="agent-indicator" hidden>
+              <span id="agentIndicatorDashboardBadge" class="pill grey"></span>
+              <span id="agentIndicatorDashboardText"></span>
+            </div>
             <div class="metric-grid">
               <article class="metric">
                 <span>Statut bot</span>
@@ -121,6 +135,10 @@
           </section>
 
           <section class="page" id="page-bot">
+            <div id="agentIndicatorBot" class="agent-indicator" hidden>
+              <span id="agentIndicatorBotBadge" class="pill grey"></span>
+              <span id="agentIndicatorBotText"></span>
+            </div>
             <section class="form-panel">
               <div>
                 <h2>Ajouter un bot</h2>
@@ -306,6 +324,83 @@
             </section>
           </section>
 
+          <section class="page" id="page-agent-setup">
+            <section class="form-panel narrow">
+              <h2>Configurer RendezBot Agent</h2>
+              <p>RendezBot Agent permet d'executer les navigateurs et les bots directement sur cet ordinateur.</p>
+
+              <div class="agent-status-row">
+                <span id="agentSetupBadge" class="pill grey">Verification</span>
+                <p id="agentSetupMessage" class="quiet">Detection de RendezBot Agent en cours...</p>
+              </div>
+
+              <div id="agentSetupPairingBox" class="agent-pairing-box" hidden>
+                <p class="quiet">Ce code est valable dix minutes et ne peut etre utilise qu'une seule fois.</p>
+                <div class="agent-pairing-code-row">
+                  <code id="agentSetupPairingCode">----</code>
+                  <button id="agentSetupCopyCode" class="outline" type="button">Copier</button>
+                </div>
+                <p id="agentSetupPairingExpiry" class="quiet"></p>
+              </div>
+
+              <p id="agentSetupDownloadNotice" class="quiet" hidden>L'installateur RendezBot Agent n'est pas encore disponible.</p>
+
+              <div class="button-row">
+                <button id="agentSetupDownload" class="primary" type="button">Telecharger RendezBot Agent</button>
+                <button id="agentSetupRedetect" class="outline" type="button">Detecter a nouveau</button>
+                <button id="agentSetupGenerateCode" class="outline agent-manager-only" type="button" hidden>Generer un code d'appairage</button>
+                <button id="agentSetupGoDashboard" class="outline" type="button" hidden>Acceder au tableau de bord</button>
+              </div>
+
+              <a id="agentSetupSkip" class="agent-skip-link" href="#">Ignorer la detection</a>
+            </section>
+          </section>
+
+          <section class="page" id="page-agent">
+            <section class="panel-section">
+              <div>
+                <h2>Agent local</h2>
+                <p class="quiet">Ordinateurs autorises a executer les navigateurs et bots de cette agence.</p>
+              </div>
+              <div class="button-row">
+                <label class="admin-only" id="agentPageAgencyLabel" hidden>
+                  Agence
+                  <select id="agentPageAgencySelect"></select>
+                </label>
+                <button id="agentPageRedetect" class="outline" type="button">Detecter a nouveau</button>
+                <button id="agentPageGenerateCode" class="outline agent-manager-only" type="button" hidden>Generer un code d'appairage</button>
+                <button id="agentPageDownload" class="outline" type="button">Telecharger l'agent</button>
+              </div>
+            </section>
+
+            <div id="agentPagePairingBox" class="agent-pairing-box" hidden>
+              <p class="quiet">Ce code est valable dix minutes et ne peut etre utilise qu'une seule fois.</p>
+              <div class="agent-pairing-code-row">
+                <code id="agentPagePairingCode">----</code>
+                <button id="agentPageCopyCode" class="outline" type="button">Copier</button>
+              </div>
+              <p id="agentPagePairingExpiry" class="quiet"></p>
+            </div>
+
+            <section class="table-panel">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Nom</th>
+                    <th>Ordinateur</th>
+                    <th>Version</th>
+                    <th>Statut</th>
+                    <th>Derniere activite</th>
+                    <th>Appaire le</th>
+                    <th>Bots actifs</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="agentTableBody"></tbody>
+              </table>
+            </section>
+          </section>
+
           <section class="page" id="page-users">
             <section id="passwordNotice" class="password-notice" hidden>
               <strong id="passwordNoticeTitle">Utilisateur cree.</strong>
@@ -449,7 +544,21 @@
       </section>
     </main>
 
+    <div id="agentModal" class="agent-modal-overlay" hidden>
+      <div class="agent-modal" role="dialog" aria-modal="true" aria-labelledby="agentModalTitle">
+        <h3 id="agentModalTitle">RendezBot Agent requis</h3>
+        <p id="agentModalMessage"></p>
+        <div class="button-row">
+          <button id="agentModalConfigure" class="primary" type="button">Configurer l'agent</button>
+          <button id="agentModalRedetect" class="outline" type="button">Detecter a nouveau</button>
+          <button id="agentModalCancel" class="outline" type="button">Annuler</button>
+        </div>
+      </div>
+    </div>
+
     <script src="/socket.io/socket.io.js"></script>
     <script src="/app.js"></script>
+    <script src="/agentContext.js"></script>
+    <script src="/agentUi.js"></script>
   </body>
 </html>
