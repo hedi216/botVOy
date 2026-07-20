@@ -36,7 +36,22 @@
       "Bash(rm ./_tmp_check_missing_emails.cjs)",
       "Bash(git check-ignore *)",
       "Bash(timeout 8 npx tsx src/server.ts)",
-      "Bash(echo \"EXIT:$?\")"
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(node -e \"console.log\\(require.resolve\\('socket.io-client'\\)\\)\")",
+      "Bash(npm install *)",
+      "Bash(npx tsx *)",
+      "Bash(WEB_PORT=3100 npx tsx src/server.ts)",
+      "Bash(echo \"SERVER_PID=$!\")",
+      "Read(//tmp/**)",
+      "Bash(rm -f .agent-test-credentials.json)",
+      "Bash(TEST_AGENT_SERVER_URL=http://localhost:3100 timeout 10 npx tsx scripts/test-agent-phase1.ts pair BEQ5-DGMV)",
+      "Bash(TEST_AGENT_SERVER_URL=http://localhost:3100 timeout 8 npx tsx scripts/test-agent-phase1.ts reconnect)",
+      "Bash(tasklist //FI \"IMAGENAME eq node.exe\")",
+      "Bash(wmic process *)",
+      "Bash(taskkill //PID 693 //F //T)",
+      "Bash(rm -f \"c:/Users/marzo/Desktop/APPS/RendezBOT/.agent-test-credentials.json\")",
+      "Bash(rm -f /tmp/rendezbot-server-test.log /tmp/reconnect-test.log /tmp/rdv-cookies.txt)",
+      "Bash(taskkill //PID 24836 //F //T)"
     ]
   }
 }

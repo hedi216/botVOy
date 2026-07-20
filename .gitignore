@@ -6,3 +6,4 @@ release/
 .browser-profile/
 .chrome-user/
 npm-debug.log*
+.agent-test-credentials.json
