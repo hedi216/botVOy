@@ -191,6 +191,26 @@
                 <tbody id="botTableBody"></tbody>
               </table>
             </section>
+
+            <section id="agentCommandsPanel" class="table-panel" hidden>
+              <div class="panel-header">
+                <div>
+                  <h2>Bots pilotes par l'agent</h2>
+                  <p class="quiet">Suivi des commandes envoyees a RendezBot Agent.</p>
+                </div>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Bot</th>
+                    <th>Statut</th>
+                    <th>Details</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="agentCommandsTableBody"></tbody>
+              </table>
+            </section>
           </section>
 
           <section class="page" id="page-logs">
@@ -552,6 +572,17 @@
           <button id="agentModalConfigure" class="primary" type="button">Configurer l'agent</button>
           <button id="agentModalRedetect" class="outline" type="button">Detecter a nouveau</button>
           <button id="agentModalCancel" class="outline" type="button">Annuler</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="agentSelectionModal" class="agent-modal-overlay" hidden>
+      <div class="agent-modal" role="dialog" aria-modal="true" aria-labelledby="agentSelectionTitle">
+        <h3 id="agentSelectionTitle">Selectionnez l'ordinateur</h3>
+        <p>Plusieurs ordinateurs sont connectes. Choisissez celui qui doit executer ce bot.</p>
+        <ul id="agentSelectionList" class="agent-selection-list"></ul>
+        <div class="button-row">
+          <button id="agentSelectionCancel" class="outline" type="button">Annuler</button>
         </div>
       </div>
     </div>

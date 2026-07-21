@@ -509,7 +509,14 @@ const run = async (): Promise<void> => {
     await contextB.close();
 
     // ===================== Serveur C: AGENT_UI_ENABLED=false, comportement historique =====================
-    const serverC = await startServer(3223, {});
+    // Valeurs explicites (pas juste omises): le .env reel du depot peut definir
+    // ces variables pour des tests manuels, et dotenv ne complete que les
+    // variables absentes du process enfant.
+    const serverC = await startServer(3223, {
+      BOT_EXECUTION_MODE: "legacy_vm",
+      AGENT_UI_ENABLED: "false",
+      AGENT_DOWNLOAD_URL: ""
+    });
     servers.push(serverC);
 
     const adminCookieC = await loginWithRetry(serverC.baseUrl, ADMIN_LOGIN, ADMIN_PASSWORD);

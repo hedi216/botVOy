@@ -263,10 +263,16 @@ const run = async (): Promise<void> => {
     const chromeAfterAgentMode = await listChromePids();
     const newChromePidsAgentMode = [...chromeAfterAgentMode].filter((pid) => !chromeBeforeAgentMode.has(pid));
 
+    // Phase 3 a remplace le garde-fou temporaire AGENT_EXECUTION_NOT_READY par
+    // un vrai dispatch (cf. scripts/test-phase3-backend.ts) : sans agent
+    // connecte, le refus attendu est desormais AGENT_NOT_CONNECTED. Ce test
+    // Phase 2 ne verifie plus que la partie encore valable de son intention
+    // d'origine, "aucun demarrage silencieux en mode agent, jamais de Chrome
+    // sur la VM" -- pas le code d'erreur exact du placeholder, retire depuis.
     const refusal = eventsAgent.find(
-      (event) => event.type === "bot-status" && (event.payload as { code?: string }).code === "AGENT_EXECUTION_NOT_READY"
+      (event) => event.type === "bot-status" && (event.payload as { code?: string }).code === "AGENT_NOT_CONNECTED"
     );
-    assert(Boolean(refusal), "start-bot emis directement en mode agent -> refuse avec le code AGENT_EXECUTION_NOT_READY");
+    assert(Boolean(refusal), "start-bot emis directement en mode agent sans agent connecte -> refuse avec le code AGENT_NOT_CONNECTED");
     assert(
       !eventsAgent.some((event) => event.type === "bot-session"),
       "Aucune session de bot creee en mode agent (appel direct)"
@@ -275,8 +281,17 @@ const run = async (): Promise<void> => {
 
     uiSocketAgent.disconnect();
 
-    // ===================== Serveur "legacy": valeurs par defaut =====================
-    const serverLegacy = await startServer(3232, {});
+    // ===================== Serveur "legacy": explicitement neutre =====================
+    // Valeurs explicites plutot que "par defaut": le fichier .env reel du
+    // depot peut definir BOT_EXECUTION_MODE/AGENT_UI_ENABLED pour des tests
+    // manuels (dotenv ne complete que les variables absentes de l'environnement
+    // du process enfant, donc une simple omission ici laisserait fuiter cette
+    // configuration ambiante dans un scenario cense rester neutre).
+    const serverLegacy = await startServer(3232, {
+      BOT_EXECUTION_MODE: "legacy_vm",
+      AGENT_UI_ENABLED: "false",
+      AGENT_DOWNLOAD_URL: ""
+    });
     servers.push(serverLegacy);
 
     const adminCookieLegacy = await loginWithRetry(serverLegacy.baseUrl, ADMIN_LOGIN, ADMIN_PASSWORD);
@@ -309,8 +324,11 @@ const run = async (): Promise<void> => {
     spawnedChromePidsToCleanup.push(...newChromePidsLegacy);
 
     assert(
-      !eventsLegacy.some((event) => event.type === "bot-status" && (event.payload as { code?: string }).code === "AGENT_EXECUTION_NOT_READY"),
-      "En legacy_vm, le garde-fou Phase 2 ne bloque jamais start-bot"
+      !eventsLegacy.some((event) => {
+        const code = (event.payload as { code?: string }).code;
+        return event.type === "bot-status" && (code === "AGENT_EXECUTION_NOT_READY" || code === "AGENT_NOT_CONNECTED");
+      }),
+      "En legacy_vm, aucun garde-fou lie a l'agent (Phase 2 ou Phase 3) ne bloque jamais start-bot"
     );
     assert(
       newChromePidsLegacy.length > 0,

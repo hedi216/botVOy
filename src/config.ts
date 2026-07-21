@@ -42,6 +42,18 @@ export const loadAgentGatewayConfig = (): AgentGatewayConfig => ({
   pairingMaxAttemptsPerCode: numberEnv("AGENT_PAIRING_MAX_ATTEMPTS", 5)
 });
 
+export type AgentCommandConfig = {
+  ackTimeoutMs: number;
+  ttlMs: number;
+  sweepIntervalMs: number;
+};
+
+export const loadAgentCommandConfig = (): AgentCommandConfig => ({
+  ackTimeoutMs: numberEnv("AGENT_COMMAND_ACK_TIMEOUT_MS", 10_000),
+  ttlMs: numberEnv("AGENT_COMMAND_TTL_MS", 60_000),
+  sweepIntervalMs: numberEnv("AGENT_COMMAND_SWEEP_INTERVAL_MS", 5_000)
+});
+
 export type BotExecutionMode = "legacy_vm" | "agent";
 
 export type Phase2FeatureFlags = {

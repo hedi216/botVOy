@@ -44,9 +44,29 @@ import {
 } from "./userService.js";
 import { notifyUserIfNeeded } from "./notifications.js";
 import { sendAppAlert } from "./appAlertService.js";
-import { loadAgentGatewayConfig, loadPhase2FeatureFlags } from "./config.js";
+import { loadAgentCommandConfig, loadAgentGatewayConfig, loadPhase2FeatureFlags } from "./config.js";
 import { createPairingCode, listAgentsForAgency, renameAgent, revokeAgent } from "./agentService.js";
-import { AgentSnapshot, getSnapshotForAgent, registerAgentNamespace } from "./agentGateway.js";
+import {
+  AgentSnapshot,
+  disconnectAgentSocket,
+  getConnectedAgentSocket,
+  getSnapshotForAgent,
+  registerAgentNamespace
+} from "./agentGateway.js";
+import {
+  BOT_STATUS_VALUES,
+  PublicAgentCommand,
+  dispatchAgentCommand,
+  failNonTerminalOnRevoke,
+  generateBotId,
+  getAgentBot,
+  getCommandForAgency,
+  listAgentBotsForAgency,
+  listAgentCommandsForAgency,
+  registerAgentBot,
+  toPublicAgentCommand,
+  toPublicAgentCommandDetail
+} from "./agentCommandService.js";
 
 type SessionOwner = {
   userId: number;
@@ -69,6 +89,7 @@ const preferredPort = Number(process.env.WEB_PORT ?? 3000);
 const maxClients = Number(process.env.MAX_CLIENTS_PER_VM ?? 15);
 const agentGatewayConfig = loadAgentGatewayConfig();
 const featureFlags = loadPhase2FeatureFlags();
+const agentCommandConfig = loadAgentCommandConfig();
 const sessions = new Map<string, BotSession>();
 const sessionOwners = new Map<string, SessionOwner>();
 const socketUsers = new Map<string, DbUser>();
@@ -535,6 +556,47 @@ app.get("/api/agents", requireAuth, async (req: AuthenticatedRequest, res) => {
   res.json({ agents: snapshots.filter((snapshot): snapshot is AgentSnapshot => snapshot !== null) });
 });
 
+// Section 17: non necessaires au temps reel (deja couvert par
+// agent-command-status), utilises pour recharger l'etat apres une
+// reconnexion de la page. DTO toujours passes par toPublicAgentCommand*.
+app.get("/api/agent-commands", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = resolveViewAgencyId(req.user!, req.query.agencyId);
+  if (!agencyId) {
+    res.status(400).json({ error: "Agence requise." });
+    return;
+  }
+
+  const query = req.query as Record<string, string | undefined>;
+  const commands = await listAgentCommandsForAgency(agencyId, {
+    agentId: query.agentId ? Number(query.agentId) : undefined,
+    botId: query.botId,
+    status: query.status as never,
+    commandType: query.commandType as never,
+    limit: query.limit ? Number(query.limit) : undefined,
+    offset: query.offset ? Number(query.offset) : undefined
+  });
+
+  res.json({
+    commands: commands.map((command) => toPublicAgentCommandDetail(command))
+  });
+});
+
+app.get("/api/agent-commands/:commandId", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = resolveViewAgencyId(req.user!, req.query.agencyId);
+  if (!agencyId) {
+    res.status(400).json({ error: "Agence requise." });
+    return;
+  }
+
+  const command = await getCommandForAgency(agencyId, String(req.params.commandId));
+  if (!command) {
+    res.status(404).json({ error: "Commande introuvable." });
+    return;
+  }
+
+  res.json({ command: toPublicAgentCommandDetail(command) });
+});
+
 app.post("/api/agents/pairing-codes", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
   const agencyId = requireAgencyId(req, res);
   if (agencyId === null) {
@@ -581,6 +643,17 @@ app.post("/api/agents/:id/revoke", requireAuth, requireAgencyManager, async (req
     res.status(404).json({ error: "Agent introuvable." });
     return;
   }
+
+  // Toute commande non terminale doit echouer avec un code distinct
+  // (AGENT_REVOKED) AVANT de couper le socket: la deconnexion qui suit
+  // declenche aussi son propre nettoyage (agentGateway.ts), mais les clauses
+  // WHERE status=... de ce dernier ne trouveront alors plus rien a modifier,
+  // sans jamais ecraser AGENT_REVOKED par AGENT_DISCONNECTED.
+  const revokedCommands = await failNonTerminalOnRevoke(agent.id);
+  for (const command of revokedCommands) {
+    emitAgentCommandStatusToAuthorizedSockets(command.agency_id, toPublicAgentCommand(command));
+  }
+  disconnectAgentSocket(agent.id);
 
   const snapshot = await getSnapshotForAgent(agent.id, agentGatewayConfig);
   if (snapshot) {
@@ -702,7 +775,151 @@ const emitAgentStatusToAuthorizedSockets = (agencyId: number, snapshot: AgentSna
   }
 };
 
-registerAgentNamespace(io, agentGatewayConfig, emitAgentStatusToAuthorizedSockets);
+// Meme portee de diffusion que le statut d'agent: un utilisateur voit les
+// commandes de sa propre agence (ou toutes, s'il est admin global), jamais
+// celles d'une autre agence.
+const emitAgentCommandStatusToAuthorizedSockets = (agencyId: number, publicCommand: PublicAgentCommand): void => {
+  for (const [socketId, socket] of io.sockets.sockets) {
+    const user = socketUsers.get(socketId);
+    if (user && canSeeAgencyAgentStatus(user, agencyId)) {
+      socket.emit("agent-command-status", publicCommand);
+    }
+  }
+};
+
+// Relie les statuts de bot remontes par un agent au systeme de logs existant
+// (page Logs, historique, alertes Brevo): un bot pilote par un agent est
+// traite comme un SessionOwner ordinaire pour cette diffusion, meme s'il n'a
+// pas de BotSession Playwright locale (cf. agentCommandService.ts).
+const emitBotLogFromAgent = (
+  agencyId: number,
+  botId: string,
+  botName: string,
+  level: "info" | "warn" | "error" | "success",
+  message: string
+): void => {
+  const bot = getAgentBot(botId);
+  const owner: SessionOwner = {
+    userId: bot?.ownerUserId ?? 0,
+    agencyId,
+    botName,
+    category: bot?.category ?? "",
+    login: ""
+  };
+  recordLog(owner, makeEvent(level, message), botId);
+};
+
+type AgentSelectionResult =
+  | { ok: true; agentId: number }
+  | { ok: false; code: "AGENT_NOT_CONNECTED" | "AGENT_VERSION_INCOMPATIBLE" | "AGENT_SELECTION_REQUIRED"; agents?: AgentSnapshot[] };
+
+const AGENT_SELECTION_ERROR_MESSAGES: Record<string, string> = {
+  AGENT_NOT_CONNECTED: "Aucun agent local autorise n'est actuellement connecte.",
+  AGENT_VERSION_INCOMPATIBLE: "La version de RendezBot Agent doit etre mise a jour avant de lancer un bot.",
+  AGENT_SELECTION_REQUIRED: "Plusieurs ordinateurs sont connectes: selectionnez celui qui doit executer ce bot."
+};
+
+// Section 6: choisit l'agent qui recevra la commande. Ne revele jamais qu'un
+// agentId demande appartient a une autre agence (meme code generique que
+// "non connecte"): la portee par agence vient de listAgentsForAgency, qui ne
+// retourne jamais que les agents de CETTE agence.
+const selectAgentForCommand = async (agencyId: number, requestedAgentId?: number): Promise<AgentSelectionResult> => {
+  const agents = await listAgentsForAgency(agencyId);
+  const snapshotsOrNull = await Promise.all(agents.map((agent) => getSnapshotForAgent(agent.id, agentGatewayConfig)));
+  const snapshots = snapshotsOrNull.filter((snapshot): snapshot is AgentSnapshot => snapshot !== null);
+
+  if (requestedAgentId) {
+    const requested = snapshots.find((snapshot) => snapshot.agentId === requestedAgentId);
+    if (!requested) {
+      return { ok: false, code: "AGENT_NOT_CONNECTED" };
+    }
+    if (requested.status === "VERSION_INCOMPATIBLE") {
+      return { ok: false, code: "AGENT_VERSION_INCOMPATIBLE" };
+    }
+    if (requested.status !== "CONNECTED") {
+      return { ok: false, code: "AGENT_NOT_CONNECTED" };
+    }
+    return { ok: true, agentId: requested.agentId };
+  }
+
+  const connected = snapshots.filter((snapshot) => snapshot.status === "CONNECTED");
+  if (connected.length === 1) {
+    return { ok: true, agentId: connected[0].agentId };
+  }
+  if (connected.length > 1) {
+    return { ok: false, code: "AGENT_SELECTION_REQUIRED", agents: snapshots };
+  }
+
+  if (snapshots.some((snapshot) => snapshot.status === "VERSION_INCOMPATIBLE")) {
+    return { ok: false, code: "AGENT_VERSION_INCOMPATIBLE" };
+  }
+
+  return { ok: false, code: "AGENT_NOT_CONNECTED" };
+};
+
+// Section 14: STOP_BOT/VALIDATE_BOT partagent le meme bus generique que
+// START_BOT plutot que d'inventer un evenement par type. Toujours envoyees a
+// l'agent proprietaire du bot (jamais une nouvelle selection), et refusees
+// silencieusement si ce bot n'est pas/plus connu (deja arrete, jamais
+// demarre en mode agent...).
+const dispatchOwnedAgentCommand = async (
+  socket: Socket,
+  type: "STOP_BOT" | "VALIDATE_BOT",
+  botId: string,
+  clientRequestId?: string
+): Promise<void> => {
+  const user = socketUsers.get(socket.id);
+  const bot = getAgentBot(botId);
+  if (!user || !bot) {
+    return;
+  }
+
+  const owner: SessionOwner = { userId: bot.ownerUserId, agencyId: bot.agencyId, botName: bot.botName, category: bot.category, login: "" };
+  if (!canSeeOwner(user, owner)) {
+    return;
+  }
+
+  const normalizedClientRequestId = typeof clientRequestId === "string" && clientRequestId.trim()
+    ? clientRequestId.trim().slice(0, 100)
+    : null;
+
+  try {
+    const { command } = await dispatchAgentCommand(
+      {
+        agencyId: bot.agencyId,
+        agentId: bot.agentId,
+        botId,
+        type,
+        publicPayload: {},
+        createdByUserId: user.id,
+        clientRequestId: normalizedClientRequestId
+      },
+      {
+        config: agentCommandConfig,
+        getAgentSocket: getConnectedAgentSocket,
+        onChange: (updatedCommand) => emitAgentCommandStatusToAuthorizedSockets(
+          updatedCommand.agency_id,
+          toPublicAgentCommand(updatedCommand)
+        )
+      }
+    );
+
+    emitOwnedLog(socket, owner, makeEvent(
+      "info",
+      `Commande ${type === "STOP_BOT" ? "d'arret" : "de validation"} envoyee a l'agent (id ${command.command_id.slice(0, 8)}).`
+    ));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error(`Echec du dispatch ${type}: ${message}`);
+    emitOwnedLog(socket, owner, makeEvent("error", "Erreur interne lors de l'envoi de la commande a l'agent."));
+  }
+};
+
+registerAgentNamespace(io, agentGatewayConfig, agentCommandConfig, {
+  onStatusChange: emitAgentStatusToAuthorizedSockets,
+  onCommandChange: emitAgentCommandStatusToAuthorizedSockets,
+  onBotLog: emitBotLogFromAgent
+});
 
 const emitLogToAuthorizedSockets = (owner: SessionOwner, event: SessionEvent): void => {
   for (const [socketId, socket] of io.sockets.sockets) {
@@ -816,7 +1033,14 @@ io.on("connection", (socket) => {
 
   void emitMaintenanceToSocket(socket, connectedUser);
 
-  socket.on("start-bot", async (payload?: { botName?: string; category?: string; login?: string; password?: string }) => {
+  socket.on("start-bot", async (payload?: {
+    botName?: string;
+    category?: string;
+    login?: string;
+    password?: string;
+    agentId?: number;
+    clientRequestId?: string;
+  }) => {
     const user = socketUsers.get(socket.id) ?? getUserFromSocket(socket);
     if (!user) {
       socket.emit("bot-log", makeEvent("error", "Connexion utilisateur requise pour demarrer un bot."));
@@ -831,18 +1055,92 @@ io.on("connection", (socket) => {
     const password = payload?.password || "";
     const owner: SessionOwner = { userId: user.id, agencyId: user.agency_id, botName, category, login };
 
-    // Phase 3 (protocole de commandes agent) n'est pas encore implementee: en
-    // mode "agent", aucun demarrage ne peut aboutir, quel que soit le statut
-    // d'un agent eventuellement connecte. Ce refus est applique cote serveur
-    // avant toute reservation de profil ou lancement de Chrome, pour qu'un
-    // appel direct a cet evenement (hors interface) soit refuse de la meme
-    // maniere qu'un clic utilisateur.
+    // Mode agent: plus de refus systematique (Phase 2) mais un vrai dispatch.
+    // Le moteur Chrome/Playwright reste hors de cette phase (Phase 4): aucune
+    // reservation de profil local ni aucun lancement de Chrome n'a lieu ici,
+    // uniquement la creation et l'envoi d'une commande START_BOT.
     if (featureFlags.botExecutionMode === "agent") {
-      socket.emit("bot-status", { status: "error", code: "AGENT_EXECUTION_NOT_READY" });
-      emitOwnedLog(socket, owner, makeEvent(
-        "error",
-        "Le lancement via RendezBot Agent n'est pas encore disponible."
-      ));
+      const agencyId = owner.agencyId;
+      if (!agencyId) {
+        emitOwnedLog(socket, owner, makeEvent("error", "Utilisateur sans agence: impossible de demarrer un bot."));
+        socket.emit("bot-status", { status: "error", code: "AGENT_NOT_CONNECTED" });
+        return;
+      }
+
+      // Toute la suite touche la base et le reseau (agent potentiellement
+      // deconnecte entre-temps, contrainte SQL, etc.): une erreur ici ne doit
+      // jamais devenir une rejection non geree susceptible d'arreter tout le
+      // process serveur, seulement un echec de ce demarrage precis.
+      try {
+        const requestedAgentId = payload?.agentId ? Number(payload.agentId) : undefined;
+        const selection = await selectAgentForCommand(agencyId, requestedAgentId);
+
+        if (!selection.ok) {
+          emitOwnedLog(socket, owner, makeEvent("error", AGENT_SELECTION_ERROR_MESSAGES[selection.code]));
+          socket.emit("bot-status", {
+            status: "error",
+            code: selection.code,
+            ...(selection.code === "AGENT_SELECTION_REQUIRED" ? { agents: selection.agents } : {})
+          });
+          return;
+        }
+
+        const botId = generateBotId();
+        registerAgentBot({
+          botId,
+          agentId: selection.agentId,
+          agencyId,
+          ownerUserId: owner.userId,
+          botName,
+          category,
+          latestCommandId: "",
+          botStatus: null,
+          updatedAt: new Date().toISOString()
+        });
+
+        const clientRequestId = typeof payload?.clientRequestId === "string" && payload.clientRequestId.trim()
+          ? payload.clientRequestId.trim().slice(0, 100)
+          : null;
+
+        const { command, alreadyExisted } = await dispatchAgentCommand(
+          {
+            agencyId,
+            agentId: selection.agentId,
+            botId,
+            type: "START_BOT",
+            // Solution A (section 5 Phase 3): aucun identifiant TLScontact tant
+            // que le moteur reel n'existe pas cote agent (Phase 4).
+            publicPayload: { botName, category },
+            createdByUserId: user.id,
+            clientRequestId
+          },
+          {
+            config: agentCommandConfig,
+            getAgentSocket: getConnectedAgentSocket,
+            onChange: (updatedCommand) => emitAgentCommandStatusToAuthorizedSockets(
+              updatedCommand.agency_id,
+              toPublicAgentCommand(updatedCommand)
+            )
+          }
+        );
+
+        emitOwnedLog(socket, owner, makeEvent(
+          "info",
+          alreadyExisted
+            ? `Commande de demarrage deja enregistree pour ce bot (id ${command.command_id.slice(0, 8)}).`
+            : `Commande de demarrage envoyee a l'agent (id ${command.command_id.slice(0, 8)}).`
+        ));
+        // Pas d'emission "agent-command-status" explicite ici: le callback
+        // onChange de dispatchAgentCommand a deja diffuse chaque transition
+        // (PENDING puis SENT) a tous les sockets autorises de l'agence, y
+        // compris celui-ci. Une emission de plus ici ne ferait que dupliquer
+        // le dernier evenement deja recu par ce socket.
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error(`Echec du dispatch START_BOT: ${message}`);
+        emitOwnedLog(socket, owner, makeEvent("error", "Erreur interne lors de l'envoi de la commande a l'agent."));
+        socket.emit("bot-status", { status: "error", code: "DISPATCH_ERROR" });
+      }
       return;
     }
 
@@ -942,7 +1240,13 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("continue-bot", ({ sessionId }: { sessionId?: string } = {}) => {
+  socket.on("continue-bot", (payload: { sessionId?: string; botId?: string; clientRequestId?: string } = {}) => {
+    if (featureFlags.botExecutionMode === "agent" && payload.botId) {
+      void dispatchOwnedAgentCommand(socket, "VALIDATE_BOT", payload.botId, payload.clientRequestId);
+      return;
+    }
+
+    const sessionId = payload.sessionId;
     const match = sessionId && sessions.has(sessionId) ? [sessionId, sessions.get(sessionId)!] as [string, BotSession] : findSessionForSocket(socket.id);
     if (!match) {
       return;
@@ -992,7 +1296,13 @@ io.on("connection", (socket) => {
     emitMaintenance();
   });
 
-  socket.on("stop-bot", async ({ sessionId }: { sessionId?: string } = {}) => {
+  socket.on("stop-bot", async (payload: { sessionId?: string; botId?: string; clientRequestId?: string } = {}) => {
+    if (featureFlags.botExecutionMode === "agent" && payload.botId) {
+      void dispatchOwnedAgentCommand(socket, "STOP_BOT", payload.botId, payload.clientRequestId);
+      return;
+    }
+
+    const sessionId = payload.sessionId;
     const match = sessionId && sessions.has(sessionId) ? [sessionId, sessions.get(sessionId)!] as [string, BotSession] : findSessionForSocket(socket.id);
     if (!match) {
       return;

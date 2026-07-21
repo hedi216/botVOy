@@ -58,6 +58,13 @@
     modalRedetect: document.getElementById("agentModalRedetect"),
     modalCancel: document.getElementById("agentModalCancel"),
 
+    commandsPanel: document.getElementById("agentCommandsPanel"),
+    commandsTableBody: document.getElementById("agentCommandsTableBody"),
+
+    selectionModal: document.getElementById("agentSelectionModal"),
+    selectionList: document.getElementById("agentSelectionList"),
+    selectionCancel: document.getElementById("agentSelectionCancel"),
+
     navAgent: document.querySelector(".agent-nav")
   };
 
@@ -202,6 +209,10 @@
     }
     if (page === "agent") {
       await renderAgentLocalPage();
+    }
+    if (page === "bot") {
+      await refreshAgentCommandsFromServer();
+      renderAgentCommandsPanel();
     }
   };
 
@@ -509,6 +520,184 @@
   agentEls.bannerDismiss.addEventListener("click", () => {
     bannerDismissedForView = true;
     renderBanner();
+  });
+
+  // ---- Bots pilotes par l'agent (section 12/13/14) ----
+
+  // commandId -> derniere commande publique connue pour un botId donne.
+  const agentCommands = new Map();
+
+  // Traduit le couple (statut de commande, statut de bot remonte par
+  // l'agent) dans les messages utilisateur exiges par la section 12. La page
+  // ne doit jamais laisser entendre que Chrome est lance tant que l'agent ne
+  // l'a pas confirme via BOT_STATUS.
+  const commandStatusMessage = (command) => {
+    if (command.status === "PENDING" || command.status === "SENT") {
+      return "Envoi de la commande...";
+    }
+    if (command.status === "ACKNOWLEDGED") {
+      if (command.botStatus === "STARTING" || command.botStatus === "WAITING_FOR_USER") {
+        return "Demarrage en attente du moteur local";
+      }
+      if (command.botStatus === "MONITORING") {
+        return "Surveillance en cours (agent)";
+      }
+      if (command.botStatus === "RATE_LIMITED") {
+        return "Ralenti (rate limit) par l'agent";
+      }
+      if (command.botStatus === "SLOT_DETECTED") {
+        return "Creneau detecte par l'agent";
+      }
+      if (command.botStatus === "STOPPING" || command.botStatus === "STOPPED") {
+        return "Arret en cours (agent)";
+      }
+      return "Commande recue par l'agent";
+    }
+    if (command.status === "FAILED") {
+      if (command.errorCode === "AGENT_ACK_TIMEOUT") {
+        return "Delai de reponse depasse";
+      }
+      if (["AGENT_DISCONNECTED", "AGENT_DISCONNECTED_AFTER_ACK", "AGENT_REVOKED"].includes(command.errorCode)) {
+        return "Agent deconnecte";
+      }
+      return "Commande echouee";
+    }
+    if (command.status === "EXPIRED") {
+      return "Delai de reponse depasse";
+    }
+    if (command.status === "CANCELLED") {
+      return "Commande annulee";
+    }
+    if (command.status === "COMPLETED") {
+      return "Commande terminee par l'agent";
+    }
+    return command.status;
+  };
+
+  const isCommandTerminal = (command) =>
+    ["COMPLETED", "FAILED", "EXPIRED", "CANCELLED"].includes(command.status);
+
+  const renderAgentCommandsPanel = () => {
+    if (!agentEls.commandsPanel) {
+      return;
+    }
+
+    const commands = [...agentCommands.values()].sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+    agentEls.commandsPanel.hidden = commands.length === 0;
+    agentEls.commandsTableBody.replaceChildren();
+
+    for (const command of commands) {
+      const row = document.createElement("tr");
+      APP.addCell(row, command.botName || command.botId, "strong-cell");
+
+      const statusCell = document.createElement("td");
+      const cls = command.status === "COMPLETED" ? "green"
+        : command.status === "FAILED" || command.status === "EXPIRED" ? "red"
+          : "blue";
+      statusCell.append(APP.makeBadge(command.status, cls));
+      row.append(statusCell);
+
+      APP.addCell(row, commandStatusMessage(command));
+
+      const actions = document.createElement("td");
+      actions.className = "action-cell";
+      if (!isCommandTerminal(command)) {
+        if (command.botStatus === "WAITING_FOR_USER") {
+          const validate = document.createElement("button");
+          validate.className = "primary";
+          validate.type = "button";
+          validate.textContent = "Valider";
+          validate.addEventListener("click", () => {
+            APP.socket.emit("continue-bot", { botId: command.botId });
+          });
+          actions.append(validate);
+        }
+
+        const stop = document.createElement("button");
+        stop.className = "outline danger-text";
+        stop.type = "button";
+        stop.textContent = "Arreter";
+        stop.addEventListener("click", () => {
+          APP.socket.emit("stop-bot", { botId: command.botId, clientRequestId: `${command.botId}-stop-${Date.now()}` });
+        });
+        actions.append(stop);
+      }
+      row.append(actions);
+
+      agentEls.commandsTableBody.append(row);
+    }
+  };
+
+  const applyCommandUpdate = (command) => {
+    agentCommands.set(command.botId, command);
+    if (APP.state.page === "bot") {
+      renderAgentCommandsPanel();
+    }
+  };
+
+  APP.socket.on("agent-command-status", (payload) => applyCommandUpdate(payload));
+
+  // Recupere l'etat des commandes recentes apres un rechargement de page ou
+  // une reconnexion, plutot que de repartir d'un tableau vide (section 17).
+  const refreshAgentCommandsFromServer = async () => {
+    if (!clientConfig?.agentUiEnabled) {
+      return;
+    }
+    try {
+      const { commands } = await APP.requestJson("/api/agent-commands?limit=20");
+      for (const command of commands) {
+        if (!agentCommands.has(command.botId)) {
+          agentCommands.set(command.botId, command);
+        }
+      }
+    } catch {
+      // Best-effort: l'absence de rechargement ne doit pas bloquer la page.
+    }
+  };
+
+  // ---- Selection d'agent (section 6): plusieurs agents connectes ----
+
+  const closeSelectionModal = () => {
+    agentEls.selectionModal.hidden = true;
+  };
+
+  const showAgentSelectionModal = (agents) => {
+    agentEls.selectionList.replaceChildren();
+    for (const agent of agents) {
+      if (agent.status !== "CONNECTED") {
+        continue;
+      }
+      const item = document.createElement("li");
+      const name = document.createElement("span");
+      name.className = "agent-selection-name";
+      name.textContent = agent.name;
+      const pick = document.createElement("button");
+      pick.className = "primary";
+      pick.type = "button";
+      pick.textContent = "Choisir";
+      pick.addEventListener("click", () => {
+        closeSelectionModal();
+        const submission = APP.state.lastBotSubmission;
+        if (!submission) {
+          return;
+        }
+        // Reutilise le MEME clientRequestId que la tentative initiale: c'est
+        // une nouvelle etape de la meme demande utilisateur, pas un nouveau
+        // clic. Le serveur reste la source d'autorite sur l'idempotence.
+        APP.socket.emit("start-bot", { ...submission, agentId: agent.agentId });
+      });
+      item.append(name, pick);
+      agentEls.selectionList.append(item);
+    }
+    agentEls.selectionModal.hidden = false;
+  };
+
+  agentEls.selectionCancel.addEventListener("click", closeSelectionModal);
+
+  APP.socket.on("bot-status", (payload) => {
+    if (payload?.code === "AGENT_SELECTION_REQUIRED" && Array.isArray(payload.agents)) {
+      showAgentSelectionModal(payload.agents);
+    }
   });
 
   // ---- Modale de blocage du demarrage ----

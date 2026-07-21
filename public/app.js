@@ -1095,8 +1095,14 @@ els.botForm.addEventListener("submit", (event) => {
   const category = els.botFormCategory.value.trim();
   const login = els.botFormLogin.value.trim();
   const password = els.botFormPassword.value;
+  // Un seul identifiant par clic legitime: une repetition du meme
+  // clientRequestId (retry reseau, double-clic, nouvelle selection d'agent
+  // apres AGENT_SELECTION_REQUIRED) ne doit jamais creer une seconde commande
+  // cote serveur (idempotence, section 7 Phase 3).
+  const clientRequestId = window.crypto?.randomUUID ? window.crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-  socket.emit("start-bot", { botName, category, login, password });
+  state.lastBotSubmission = { botName, category, login, password, clientRequestId };
+  socket.emit("start-bot", { botName, category, login, password, clientRequestId });
   els.botForm.reset();
   els.botFormName.placeholder = `Bot ${state.agencyActiveCount + 2}`;
 

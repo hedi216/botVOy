@@ -1,6 +1,6 @@
 import { Server, Socket } from "socket.io";
-import { AgentGatewayConfig } from "./config.js";
-import { DbAgent } from "./db.js";
+import { AgentCommandConfig, AgentGatewayConfig } from "./config.js";
+import { DbAgent, DbAgentCommand } from "./db.js";
 import {
   computeLiveStatus,
   getAgentById,
@@ -10,7 +10,53 @@ import {
   verifyAgentToken,
   PublicAgent
 } from "./agentService.js";
+import {
+  BotStatusValue,
+  PublicAgentCommand,
+  clearAckTimer,
+  failNonTerminalOnDisconnect,
+  getCommandForAgent,
+  isValidBotStatus,
+  markAcknowledged,
+  markCompleted,
+  markFailedByAgent,
+  sweepAgentCommands,
+  toPublicAgentCommand,
+  updateAgentBotStatus
+} from "./agentCommandService.js";
 import { logger } from "./logger.js";
+
+const MAX_MESSAGE_LENGTH = 2_000;
+const MAX_ERROR_CODE_LENGTH = 64;
+
+const clampString = (value: unknown, maxLength: number): string => {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value.slice(0, maxLength);
+};
+
+// Defense en profondeur: meme si un agent legitime ne devrait jamais envoyer
+// de tel champ, un resultat/details ne doit jamais pouvoir vehiculer un
+// secret vers la base ou vers l'interface web (cf. section 5 et 16).
+const FORBIDDEN_KEY_SUBSTRINGS = ["token", "secret", "password", "code_hash", "codehash"];
+
+const sanitizePublicRecord = (value: unknown, depth = 0): unknown => {
+  if (depth > 4 || value === null || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 50).map((item) => sanitizePublicRecord(item, depth + 1));
+  }
+  const result: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    if (FORBIDDEN_KEY_SUBSTRINGS.some((forbidden) => key.toLowerCase().includes(forbidden))) {
+      continue;
+    }
+    result[key] = sanitizePublicRecord(nested, depth + 1);
+  }
+  return result;
+};
 
 type PairAuth = { mode: "pair"; pairingCode: string; computerName: string; version: string };
 type ReconnectAuth = { mode: "reconnect"; agentId: number; token: string; computerName?: string; version: string };
@@ -60,6 +106,15 @@ export const isAgentConnected = (agentId: number): boolean => connectedAgents.ha
 export const getConnectedAgentSocket = (agentId: number): Socket | undefined =>
   connectedAgents.get(agentId)?.socket;
 
+// Utilise par la revocation (server.ts): coupe le socket actif d'un agent.
+// Le handler "disconnect" existant (plus bas) se declenche normalement a la
+// suite et nettoie l'etat en memoire; les commandes non terminales doivent
+// deja avoir ete marquees AGENT_REVOKED par l'appelant avant ce coup de coupe,
+// pour porter ce code d'erreur precis plutot que AGENT_DISCONNECTED.
+export const disconnectAgentSocket = (agentId: number): void => {
+  connectedAgents.get(agentId)?.socket.disconnect(true);
+};
+
 export const getSnapshotForAgent = async (
   agentId: number,
   config: AgentGatewayConfig
@@ -69,12 +124,41 @@ export const getSnapshotForAgent = async (
 };
 
 export type AgentStatusListener = (agencyId: number, snapshot: AgentSnapshot) => void;
+export type AgentCommandChangeListener = (agencyId: number, publicCommand: PublicAgentCommand) => void;
+export type BotLogListener = (
+  agencyId: number,
+  botId: string,
+  botName: string,
+  level: "info" | "warn" | "error" | "success",
+  message: string
+) => void;
+
+export type AgentNamespaceCallbacks = {
+  onStatusChange: AgentStatusListener;
+  onCommandChange: AgentCommandChangeListener;
+  onBotLog: BotLogListener;
+};
+
+const publicCommandFor = (command: DbAgentCommand): PublicAgentCommand => toPublicAgentCommand(command);
+
+// Une erreur (DB, reseau...) dans l'un de ces gestionnaires asynchrones ne
+// doit jamais devenir une rejection de promesse non geree: Node arreterait
+// alors tout le process serveur pour un seul message malforme ou un blip DB
+// passager, ce qui affecterait TOUTES les agences, pas seulement celle en
+// cause. Chaque chaine async ci-dessous est donc systematiquement terminee
+// par ce filet de securite.
+const logAsyncError = (context: string) => (error: unknown): void => {
+  const message = error instanceof Error ? error.message : String(error);
+  logger.error(`agentGateway (${context}): ${message}`);
+};
 
 export const registerAgentNamespace = (
   io: Server,
   config: AgentGatewayConfig,
-  onStatusChange: AgentStatusListener
+  commandConfig: AgentCommandConfig,
+  callbacks: AgentNamespaceCallbacks
 ): void => {
+  const { onStatusChange, onCommandChange, onBotLog } = callbacks;
   const namespace = io.of("/agent");
 
   namespace.use(async (socket, next) => {
@@ -148,7 +232,7 @@ export const registerAgentNamespace = (
       if (agent) {
         onStatusChange(agencyId, snapshotFromAgent(agent, config));
       }
-    })();
+    })().catch(logAsyncError("connection"));
 
     socket.emit("AGENT_CONNECTED", {
       agentId,
@@ -170,7 +254,7 @@ export const registerAgentNamespace = (
         if (agent) {
           onStatusChange(agencyId, snapshotFromAgent(agent, config));
         }
-      })();
+      })().catch(logAsyncError("AGENT_HEARTBEAT"));
     });
 
     socket.on("AGENT_STATUS", () => {
@@ -179,7 +263,86 @@ export const registerAgentNamespace = (
         if (agent) {
           onStatusChange(agencyId, snapshotFromAgent(agent, config));
         }
-      })();
+      })().catch(logAsyncError("AGENT_STATUS"));
+    });
+
+    // ---- Section 9: accuses de reception. L'identite de l'agent vient
+    // exclusivement de socket.data.agentId (issu de l'authentification de la
+    // connexion), jamais d'un champ agentId qui serait fourni dans le payload:
+    // getCommandForAgent()/markXxx() exigent toujours agentId en parametre
+    // separe et le verifient en base (agent_id = $2 dans la clause WHERE). ----
+
+    socket.on("COMMAND_ACK", (payload?: { commandId?: unknown }) => {
+      const commandId = clampString(payload?.commandId, 100);
+      if (!commandId) {
+        return;
+      }
+
+      markAcknowledged(commandId, agentId).then(({ command }) => {
+        if (command) {
+          clearAckTimer(command.command_id);
+          onCommandChange(command.agency_id, publicCommandFor(command));
+        }
+      }).catch(logAsyncError("COMMAND_ACK"));
+    });
+
+    socket.on("COMMAND_COMPLETED", (payload?: { commandId?: unknown; result?: unknown }) => {
+      const commandId = clampString(payload?.commandId, 100);
+      if (!commandId) {
+        return;
+      }
+
+      const safeResult = sanitizePublicRecord(payload?.result ?? {});
+      markCompleted(commandId, agentId, safeResult).then(({ command }) => {
+        if (command) {
+          onCommandChange(command.agency_id, publicCommandFor(command));
+        }
+      }).catch(logAsyncError("COMMAND_COMPLETED"));
+    });
+
+    socket.on("COMMAND_FAILED", (payload?: { commandId?: unknown; errorCode?: unknown; message?: unknown }) => {
+      const commandId = clampString(payload?.commandId, 100);
+      if (!commandId) {
+        return;
+      }
+
+      const errorCode = clampString(payload?.errorCode, MAX_ERROR_CODE_LENGTH) || "ENGINE_ERROR";
+      const message = clampString(payload?.message, MAX_MESSAGE_LENGTH) || "Commande echouee cote agent.";
+      markFailedByAgent(commandId, agentId, errorCode, message).then(({ command }) => {
+        if (command) {
+          onCommandChange(command.agency_id, publicCommandFor(command));
+        }
+      }).catch(logAsyncError("COMMAND_FAILED"));
+    });
+
+    // ---- Section 11: statuts de bot. La commande sert de preuve
+    // d'appartenance: on ne met a jour un botId que s'il correspond bien au
+    // bot_id enregistre sur la commande possedee par CET agent. ----
+
+    socket.on("BOT_STATUS", (payload?: { commandId?: unknown; botId?: unknown; status?: unknown; details?: unknown }) => {
+      const commandId = clampString(payload?.commandId, 100);
+      const botId = clampString(payload?.botId, 100);
+      if (!commandId || !botId || !isValidBotStatus(payload?.status)) {
+        return;
+      }
+
+      getCommandForAgent(commandId, agentId).then((command) => {
+        if (!command || command.bot_id !== botId) {
+          return;
+        }
+
+        const bot = updateAgentBotStatus(botId, payload!.status as BotStatusValue);
+        if (!bot) {
+          return;
+        }
+
+        onCommandChange(command.agency_id, publicCommandFor(command));
+
+        const detailsText = payload?.details && typeof payload.details === "object"
+          ? ` ${JSON.stringify(sanitizePublicRecord(payload.details)).slice(0, 300)}`
+          : "";
+        onBotLog(command.agency_id, botId, bot.botName, "info", `[Agent] Statut du bot: ${bot.botStatus}${detailsText}`);
+      }).catch(logAsyncError("BOT_STATUS"));
     });
 
     socket.on("disconnect", () => {
@@ -190,7 +353,20 @@ export const registerAgentNamespace = (
         if (agent) {
           onStatusChange(agencyId, snapshotFromAgent(agent, config));
         }
-      })();
+
+        // Une commande START_BOT/STOP_BOT/VALIDATE_BOT en cours ne doit jamais
+        // rester bloquee indefiniment parce que son agent a disparu: on la
+        // fait echouer avec un code distinct selon qu'elle avait deja ete
+        // accusee reception ou non (cf. section 10). Si l'agent a ete
+        // explicitement revoque, failNonTerminalOnRevoke() a deja marque ces
+        // commandes plus tot (server.ts): les clauses WHERE status=... ici ne
+        // trouvent alors plus rien a modifier, sans ecraser AGENT_REVOKED.
+        const failedCommands = await failNonTerminalOnDisconnect(agentId);
+        for (const command of failedCommands) {
+          clearAckTimer(command.command_id);
+          onCommandChange(command.agency_id, publicCommandFor(command));
+        }
+      })().catch(logAsyncError("disconnect"));
     });
   });
 
@@ -210,6 +386,15 @@ export const registerAgentNamespace = (
           onStatusChange(agent.agency_id, snapshot);
         }
       }
-    })();
+    })().catch(logAsyncError("offline-sweep"));
   }, Math.max(5_000, Math.floor(config.offlineTimeoutMs / 2)));
+
+  // Filet de securite pour l'expiration/l'accuse de reception, y compris a
+  // travers un redemarrage serveur (cf. section 10): base sur les colonnes en
+  // base (sent_at, expires_at), independant des minuteurs en memoire.
+  setInterval(() => {
+    sweepAgentCommands(commandConfig, (command) => {
+      onCommandChange(command.agency_id, publicCommandFor(command));
+    }).catch(logAsyncError("command-sweep"));
+  }, commandConfig.sweepIntervalMs);
 };

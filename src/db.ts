@@ -112,19 +112,36 @@ export type AgentCommandType =
   | "REQUEST_STATUS"
   | "SHUTDOWN_BOT";
 
-export type AgentCommandStatus = "pending" | "acknowledged" | "completed" | "failed" | "expired";
+export type AgentCommandStatus =
+  | "pending"
+  | "sent"
+  | "acknowledged"
+  | "completed"
+  | "failed"
+  | "expired"
+  | "cancelled";
 
 export type DbAgentCommand = {
   id: number;
+  command_id: string;
+  agency_id: number;
   agent_id: number;
-  bot_id: string | null;
+  bot_id: string;
   command_type: AgentCommandType;
-  payload: unknown;
+  public_payload: unknown;
   status: AgentCommandStatus;
+  client_request_id: string | null;
+  created_by_user_id: number;
   created_at: string;
+  updated_at: string;
+  expires_at: string;
+  sent_at: string | null;
   acknowledged_at: string | null;
   completed_at: string | null;
+  failed_at: string | null;
+  error_code: string | null;
   error_message: string | null;
+  public_result: unknown;
 };
 
 export const ADMIN_LOGIN = "admin";
@@ -309,18 +326,30 @@ export const ensureSchema = async (): Promise<void> => {
 
     CREATE TABLE IF NOT EXISTS agent_commands (
       id SERIAL PRIMARY KEY,
+      command_id UUID,
+      agency_id INTEGER REFERENCES agencies(id) ON DELETE CASCADE,
       agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
       bot_id TEXT,
       command_type TEXT NOT NULL CHECK (command_type IN (
         'START_BOT', 'STOP_BOT', 'VALIDATE_BOT', 'REFRESH_BOT',
         'UPDATE_SETTINGS', 'REQUEST_STATUS', 'SHUTDOWN_BOT'
       )),
-      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'acknowledged', 'completed', 'failed', 'expired')),
+      public_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+        'pending', 'sent', 'acknowledged', 'completed', 'failed', 'expired', 'cancelled'
+      )),
+      client_request_id TEXT,
+      created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ,
+      sent_at TIMESTAMPTZ,
       acknowledged_at TIMESTAMPTZ,
       completed_at TIMESTAMPTZ,
-      error_message TEXT
+      failed_at TIMESTAMPTZ,
+      error_code TEXT,
+      error_message TEXT,
+      public_result JSONB NOT NULL DEFAULT '{}'::jsonb
     );
 
     CREATE INDEX IF NOT EXISTS agents_agency_idx ON agents (agency_id);
@@ -329,5 +358,52 @@ export const ensureSchema = async (): Promise<void> => {
       ON agent_pairing_codes (expires_at)
       WHERE used_at IS NULL AND revoked_at IS NULL;
     CREATE INDEX IF NOT EXISTS agent_commands_agent_idx ON agent_commands (agent_id, status);
+  `);
+
+  // Migration non destructive pour les bases Phase 1 ou` agent_commands existait
+  // deja` sous sa forme initiale (colonnes minimales, table jamais utilisee en
+  // pratique: aucune ligne n'a donc jamais ete ecrite, le renommage est sans risque).
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'agent_commands' AND column_name = 'payload'
+      ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'agent_commands' AND column_name = 'public_payload'
+      ) THEN
+        ALTER TABLE agent_commands RENAME COLUMN payload TO public_payload;
+      END IF;
+    END $$;
+
+    ALTER TABLE agent_commands
+      ADD COLUMN IF NOT EXISTS command_id UUID,
+      ADD COLUMN IF NOT EXISTS agency_id INTEGER REFERENCES agencies(id) ON DELETE CASCADE,
+      ADD COLUMN IF NOT EXISTS client_request_id TEXT,
+      ADD COLUMN IF NOT EXISTS created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS error_code TEXT,
+      ADD COLUMN IF NOT EXISTS public_result JSONB NOT NULL DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS public_payload JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+    ALTER TABLE agent_commands DROP CONSTRAINT IF EXISTS agent_commands_status_check;
+    ALTER TABLE agent_commands ADD CONSTRAINT agent_commands_status_check
+      CHECK (status IN ('pending', 'sent', 'acknowledged', 'completed', 'failed', 'expired', 'cancelled'));
+
+    CREATE UNIQUE INDEX IF NOT EXISTS agent_commands_command_id_idx
+      ON agent_commands (command_id) WHERE command_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS agent_commands_client_request_id_idx
+      ON agent_commands (client_request_id) WHERE client_request_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS agent_commands_agency_created_idx
+      ON agent_commands (agency_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS agent_commands_bot_created_idx
+      ON agent_commands (bot_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS agent_commands_expiry_sweep_idx
+      ON agent_commands (expires_at)
+      WHERE status IN ('pending', 'sent', 'acknowledged');
   `);
 };
