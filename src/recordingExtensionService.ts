@@ -10,7 +10,7 @@ import {
   updateProfileStatus
 } from "./browserProfileService.js";
 import { logger } from "./logger.js";
-import { MonitorEventLevel } from "./types.js";
+import { MonitorEventLevel } from "./shared/types.js";
 import { RecordingExtensionSettings } from "./userService.js";
 
 export type RecordingExtensionPrepareSnapshot = {

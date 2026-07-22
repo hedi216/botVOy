@@ -1,7 +1,7 @@
 import { logger } from "./logger.js";
 import { getUserNotificationEmail } from "./userService.js";
 import { sendAppAlert } from "./appAlertService.js";
-import { MonitorEventLevel } from "./types.js";
+import { MonitorEventLevel } from "./shared/types.js";
 
 type NotificationInput = {
   userId: number;

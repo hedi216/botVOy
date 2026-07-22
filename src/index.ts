@@ -1,8 +1,8 @@
 import { loadConfig } from "./config.js";
-import { launchBrowser } from "./browser.js";
+import { launchBrowser } from "./shared/browser.js";
 import { logger } from "./logger.js";
-import { monitorAppointments, waitForUserToStart } from "./monitor.js";
-import { takeTimestampedScreenshot } from "./screenshot.js";
+import { monitorAppointments, waitForUserToStart } from "./shared/monitor.js";
+import { takeTimestampedScreenshot } from "./shared/screenshot.js";
 
 const main = async (): Promise<void> => {
   const config = loadConfig();

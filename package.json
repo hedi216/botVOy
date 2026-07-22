@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "web:dev": "tsx src/server.ts",
+    "agent:dev": "tsx src/agent/agentMain.ts",
     "db:init": "tsx src/initDb.ts",
     "build": "tsc",
     "package:win": "powershell -ExecutionPolicy Bypass -File scripts/package-win.ps1",

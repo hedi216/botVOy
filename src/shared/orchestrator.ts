@@ -1,5 +1,11 @@
-import { MonitorEventLevel } from "./types.js";
-import { MonitoringSettings } from "./userService.js";
+import { AppConfig, MonitorEventLevel } from "./types.js";
+
+// Le moteur partage (utilise a la fois par le chemin legacy_vm et par l'agent,
+// cf. Phase 4) ne doit jamais dependre de userService.ts (couplage PostgreSQL
+// cote serveur uniquement): seul le champ reellement utilise ici est requis,
+// via un Pick structurel sur AppConfig. userService.MonitoringSettings (deja
+// un Pick d'AppConfig) reste assignable ici sans aucun changement d'appelant.
+type ScanTurnSettings = Pick<AppConfig, "maxParallelScansPerDomain">;
 
 type Logger = (level: MonitorEventLevel, message: string) => void;
 
@@ -19,7 +25,7 @@ type DomainState = {
 type TurnInput = {
   botName?: string;
   domain: string;
-  settings: MonitoringSettings;
+  settings: ScanTurnSettings;
   log: Logger;
 };
 

@@ -2,7 +2,7 @@ import { ADMIN_LOGIN, ADMIN_PASSWORD, DbAgency, DbExtensionLink, DbUser, ensureD
 import { loadConfig } from "./config.js";
 import { hashPassword, verifyPassword } from "./password.js";
 import { randomBytes } from "node:crypto";
-import { AppConfig } from "./types.js";
+import { AppConfig } from "./shared/types.js";
 
 export type CreateUserInput = {
   agencyId: number;

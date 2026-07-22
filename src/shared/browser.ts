@@ -1,6 +1,6 @@
 import { chromium, Browser, Page } from "playwright";
 import { AppConfig } from "./types.js";
-import { logger } from "./logger.js";
+import { logger } from "../logger.js";
 
 export type BrowserSession = {
   browser: Browser;

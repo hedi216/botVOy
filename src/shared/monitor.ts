@@ -4,7 +4,7 @@ import { Page } from "playwright";
 import { detectAppointmentAvailability, findBestCandidateElement, findReserveAppointmentButton } from "./detectors.js";
 import { detectHumanValidation } from "./humanValidation.js";
 import { highlightElement } from "./highlight.js";
-import { logger } from "./logger.js";
+import { logger } from "../logger.js";
 import {
   applyRateLimitCooldown,
   broadcastAppointmentSignal,

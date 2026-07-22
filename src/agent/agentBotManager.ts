@@ -1,0 +1,222 @@
+import { closeBrowserWithTimeout, killChromeProcess, launchChromeForBot } from "./agentBrowserManager.js";
+import { acquireProfileLock, ProfileLease } from "./agentProfileManager.js";
+import { AgentCommandError, toAgentCommandError } from "./agentErrors.js";
+import { AgentEventReporter } from "./agentEventReporter.js";
+import { AgentLogFn } from "./agentLocalLogger.js";
+import { AgentBotHandle, AgentRuntimeSettings } from "./types.js";
+
+export type StartBotParams = {
+  commandId: string;
+  botId: string;
+  botName?: string;
+};
+
+export type StopBotParams = {
+  commandId: string;
+  botId: string;
+};
+
+// Registre local des bots actifs (section 5/6): jamais persiste, jamais
+// serialise. Perdu au redemarrage de l'agent, comme les sessions legacy_vm
+// existantes cote serveur (meme principe deja accepte en Phase 3).
+export class AgentBotManager {
+  private readonly bots = new Map<string, AgentBotHandle>();
+  private readonly leases = new Map<string, ProfileLease>();
+  private readonly stopping = new Set<string>();
+  // Reserve un botId des la validation initiale, de facon synchrone, avant
+  // tout point d'attente (acquireProfileLock/launchChromeForBot sont ensuite
+  // asynchrones): sans cela, deux START_BOT quasi simultanes pour le meme
+  // botId (redelivraison socket, bug serveur) passeraient tous les deux le
+  // controle "this.bots.has(botId)" avant que le premier n'ait eu le temps
+  // d'inserer son handle, et lanceraient chacun un vrai Chrome sur le meme
+  // profil.
+  private readonly starting = new Set<string>();
+  private shuttingDown = false;
+
+  constructor(
+    private readonly settings: AgentRuntimeSettings,
+    private readonly log: AgentLogFn,
+    private readonly reporter: AgentEventReporter
+  ) {}
+
+  activeCount(): number {
+    return this.bots.size;
+  }
+
+  isActive(botId: string): boolean {
+    return this.bots.has(botId);
+  }
+
+  async startBot(params: StartBotParams): Promise<void> {
+    const { commandId, botId } = params;
+
+    if (this.shuttingDown) {
+      this.reporter.failed(commandId, "AGENT_CAPACITY_REACHED", "Agent en cours d'arret: aucune nouvelle commande acceptee.");
+      return;
+    }
+
+    if (this.bots.has(botId) || this.starting.has(botId)) {
+      this.reporter.failed(commandId, "BOT_ALREADY_RUNNING", "Ce bot est deja actif sur cet agent.");
+      return;
+    }
+
+    if (this.bots.size + this.starting.size >= this.settings.maxActiveBots) {
+      this.reporter.failed(commandId, "AGENT_CAPACITY_REACHED", `Limite locale atteinte (${this.settings.maxActiveBots} bots actifs).`);
+      return;
+    }
+
+    // Reservation synchrone immediate (cf. commentaire sur this.starting),
+    // puis accuse de reception (section 6).
+    this.starting.add(botId);
+    this.reporter.ack(commandId);
+    this.reporter.botStatus(botId, commandId, "STARTING");
+
+    let lease: ProfileLease | undefined;
+    try {
+      lease = acquireProfileLock(this.settings, botId);
+      this.leases.set(botId, lease);
+
+      const chrome = await launchChromeForBot(lease.profilePath, this.settings.targetUrl);
+
+      const handle: AgentBotHandle = {
+        botId,
+        startCommandId: commandId,
+        browserProcess: chrome.browserProcess,
+        browser: chrome.browser,
+        context: chrome.context,
+        page: chrome.page,
+        profilePath: lease.profilePath,
+        debugPort: chrome.debugPort,
+        currentStatus: "WAITING_FOR_USER",
+        startedAt: new Date().toISOString(),
+        lastActivityAt: new Date().toISOString(),
+        lastError: null
+      };
+      this.bots.set(botId, handle);
+      this.wireUnexpectedClosure(handle);
+
+      this.reporter.botStatus(botId, commandId, "WAITING_FOR_USER");
+      this.reporter.completed(commandId, {
+        botId,
+        status: "WAITING_FOR_USER",
+        started: true,
+        computerName: this.settings.computerName
+      });
+      this.log("success", `Bot ${botId} demarre (Chrome visible, profil verrouille).`);
+    } catch (error) {
+      lease?.release();
+      this.leases.delete(botId);
+      const commandError = toAgentCommandError(error, "BROWSER_LAUNCH_FAILED");
+      this.log("error", `Demarrage du bot ${botId} echoue (${commandError.code}): ${commandError.message}`);
+      this.reporter.botStatus(botId, commandId, "ERROR");
+      this.reporter.failed(commandId, commandError.code, this.publicMessageFor(commandError));
+    } finally {
+      this.starting.delete(botId);
+    }
+  }
+
+  async stopBot(params: StopBotParams): Promise<void> {
+    const { commandId, botId } = params;
+    const handle = this.bots.get(botId);
+
+    // COMMAND_ACK doit toujours preceder COMMAND_COMPLETED (machine a etats
+    // Phase 3: markCompleted() exige status='acknowledged' cote serveur).
+    // Sans cet accuse, le COMPLETED envoye plus bas serait silencieusement
+    // ignore (0 ligne mise a jour) et la commande finirait par expirer en
+    // AGENT_ACK_TIMEOUT malgre un arret reellement reussi cote agent.
+    this.reporter.ack(commandId);
+
+    if (!handle) {
+      // Idempotent par choix documente (section 8): un STOP_BOT pour un bot
+      // deja arrete (ou jamais connu de cette instance d'agent, ex. apres
+      // redemarrage) ne doit jamais faire echouer l'utilisateur qui clique
+      // "Arreter" une seconde fois. On complete directement, sans erreur.
+      this.log("warn", `STOP_BOT recu pour un botId inconnu de cet agent: ${botId} (traite comme deja arrete).`);
+      this.reporter.completed(commandId, { botId, status: "STOPPED", stopped: true, alreadyStopped: true });
+      return;
+    }
+
+    await this.stopHandle(handle, commandId);
+  }
+
+  private async stopHandle(handle: AgentBotHandle, commandId: string): Promise<void> {
+    const { botId } = handle;
+    this.stopping.add(botId);
+    this.reporter.botStatus(botId, commandId, "STOPPING");
+
+    try {
+      handle.browser.removeAllListeners("disconnected");
+      handle.browserProcess.removeAllListeners("exit");
+
+      await closeBrowserWithTimeout(handle.browser);
+      await killChromeProcess(handle.browserProcess);
+    } finally {
+      this.leases.get(botId)?.release();
+      this.leases.delete(botId);
+      this.bots.delete(botId);
+      this.stopping.delete(botId);
+    }
+
+    this.reporter.botStatus(botId, commandId, "STOPPED");
+    this.reporter.completed(commandId, { botId, status: "STOPPED", stopped: true });
+    this.log("success", `Bot ${botId} arrete, Chrome ferme, profil libere.`);
+  }
+
+  // Detecte une fermeture non sollicitee (Chrome ferme manuellement par
+  // l'utilisateur, crash) et distincte d'un STOP_BOT deliberement declenche:
+  // stopHandle() retire ces memes listeners avant de fermer volontairement,
+  // donc ce chemin n'est jamais atteint pour un arret demande par le serveur.
+  private wireUnexpectedClosure(handle: AgentBotHandle): void {
+    const onClosed = (): void => {
+      if (this.stopping.has(handle.botId) || !this.bots.has(handle.botId)) {
+        return;
+      }
+      this.log("warn", `Bot ${handle.botId}: navigateur ferme ou deconnecte de maniere inattendue.`);
+      this.leases.get(handle.botId)?.release();
+      this.leases.delete(handle.botId);
+      this.bots.delete(handle.botId);
+      this.reporter.botStatus(handle.botId, handle.startCommandId, "STOPPED", { reason: "BROWSER_CLOSED" });
+    };
+
+    handle.browser.on("disconnected", onClosed);
+    handle.browserProcess.once("exit", onClosed);
+  }
+
+  // Jamais de detail Playwright/Chrome brut transmis au serveur (section 7):
+  // seul le code public + un message deja generique est envoye.
+  private publicMessageFor(error: AgentCommandError): string {
+    const messages: Record<string, string> = {
+      BROWSER_LAUNCH_FAILED: "Le lancement de Chrome a echoue sur cet ordinateur.",
+      BROWSER_NOT_FOUND: "Google Chrome est introuvable sur cet ordinateur (CHROME_EXECUTABLE_PATH).",
+      BROWSER_CONNECTION_FAILED: "La connexion au navigateur ouvert a echoue.",
+      PROFILE_LOCKED: "Ce profil Chrome est deja utilise par une autre instance.",
+      PROFILE_CREATE_FAILED: "Impossible de preparer le profil Chrome local.",
+      BOT_ALREADY_RUNNING: "Ce bot est deja actif sur cet agent.",
+      AGENT_CAPACITY_REACHED: "Limite locale de bots actifs atteinte sur cet agent."
+    };
+    return messages[error.code] ?? "Erreur interne de l'agent.";
+  }
+
+  // Utilise par Ctrl+C (section 12): ferme tous les bots actifs sans
+  // necessiter de commande serveur (aucun commandId disponible dans ce
+  // contexte, donc pas de COMMAND_COMPLETED emis ici, seulement un BOT_STATUS
+  // best-effort pour que l'interface web se mette a jour immediatement).
+  async shutdownAll(): Promise<void> {
+    this.shuttingDown = true;
+    const handles = [...this.bots.values()];
+    await Promise.all(handles.map(async (handle) => {
+      handle.browser.removeAllListeners("disconnected");
+      handle.browserProcess.removeAllListeners("exit");
+      try {
+        this.reporter.botStatus(handle.botId, handle.startCommandId, "STOPPING");
+      } catch {
+        // best effort: la connexion serveur peut deja etre fermee.
+      }
+      await closeBrowserWithTimeout(handle.browser);
+      await killChromeProcess(handle.browserProcess);
+      this.leases.get(handle.botId)?.release();
+    }));
+    this.bots.clear();
+    this.leases.clear();
+  }
+}

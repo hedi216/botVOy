@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { Page } from "playwright";
-import { logger } from "./logger.js";
+import { logger } from "../logger.js";
 
 export const takeTimestampedScreenshot = async (
   page: Page,

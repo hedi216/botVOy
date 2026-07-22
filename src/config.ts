@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { AppConfig } from "./types.js";
+import { AppConfig } from "./shared/types.js";
 
 const numberEnv = (key: string, fallback: number): number => {
   const raw = process.env[key];

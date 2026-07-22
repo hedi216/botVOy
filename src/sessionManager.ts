@@ -5,13 +5,13 @@ import net from "node:net";
 import path from "node:path";
 import { Browser, Page } from "playwright";
 import { BrowserProfileLease, pinInstalledExtensions } from "./browserProfileService.js";
-import { launchBrowser } from "./browser.js";
+import { launchBrowser } from "./shared/browser.js";
 import { loadConfig } from "./config.js";
-import { clickBookNewAppointment, clickSeConnecter, clickSelectTravelGroup, fillLoginForm } from "./loginFlow.js";
+import { clickBookNewAppointment, clickSeConnecter, clickSelectTravelGroup, fillLoginForm } from "./shared/loginFlow.js";
 import { logger } from "./logger.js";
-import { monitorAppointments, waitForUserToStart } from "./monitor.js";
-import { takeTimestampedScreenshot } from "./screenshot.js";
-import { AppConfig, MonitorEventLevel } from "./types.js";
+import { monitorAppointments, waitForUserToStart } from "./shared/monitor.js";
+import { takeTimestampedScreenshot } from "./shared/screenshot.js";
+import { AppConfig, MonitorEventLevel } from "./shared/types.js";
 import { ExtensionLink, MonitoringSettings } from "./userService.js";
 
 export type SessionStatus = "created" | "starting" | "waiting" | "monitoring" | "paused" | "stopped" | "error";
