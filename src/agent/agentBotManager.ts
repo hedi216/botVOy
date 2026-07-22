@@ -1,4 +1,5 @@
 import { closeBrowserWithTimeout, killChromeProcess, launchChromeForBot } from "./agentBrowserManager.js";
+import { findAppointmentPage, maskUrlForLog } from "./agentPageDetector.js";
 import { acquireProfileLock, ProfileLease } from "./agentProfileManager.js";
 import { AgentCommandError, toAgentCommandError } from "./agentErrors.js";
 import { AgentEventReporter } from "./agentEventReporter.js";
@@ -12,6 +13,11 @@ export type StartBotParams = {
 };
 
 export type StopBotParams = {
+  commandId: string;
+  botId: string;
+};
+
+export type ValidateBotParams = {
   commandId: string;
   botId: string;
 };
@@ -31,6 +37,10 @@ export class AgentBotManager {
   // d'inserer son handle, et lanceraient chacun un vrai Chrome sur le meme
   // profil.
   private readonly starting = new Set<string>();
+  // Deduplique VALIDATE_BOT en cours (section 1: "une commande VALIDATE_BOT
+  // equivalente est deja en cours" -> VALIDATION_ALREADY_RUNNING), meme
+  // principe que this.starting/this.stopping.
+  private readonly validating = new Set<string>();
   private shuttingDown = false;
 
   constructor(
@@ -90,7 +100,8 @@ export class AgentBotManager {
         currentStatus: "WAITING_FOR_USER",
         startedAt: new Date().toISOString(),
         lastActivityAt: new Date().toISOString(),
-        lastError: null
+        lastError: null,
+        monitoringPrepared: false
       };
       this.bots.set(botId, handle);
       this.wireUnexpectedClosure(handle);
@@ -162,6 +173,77 @@ export class AgentBotManager {
     this.log("success", `Bot ${botId} arrete, Chrome ferme, profil libere.`);
   }
 
+  // VALIDATE_BOT (Lot 3): verifie que la page ouverte par l'utilisateur est
+  // bien reconnue, sans jamais automatiser la connexion/un captcha/Cloudflare
+  // (section 4). Une tentative echouee ne ferme JAMAIS Chrome et ne retire
+  // JAMAIS le bot du registre (section 2): seul BOT_STATUS revient a
+  // WAITING_FOR_USER, le navigateur et le verrou de profil restent intacts.
+  async validateBot(params: ValidateBotParams): Promise<void> {
+    const { commandId, botId } = params;
+    const handle = this.bots.get(botId);
+
+    if (!handle) {
+      this.reporter.failed(commandId, "BOT_NOT_RUNNING", "Ce bot n'est plus actif sur cet agent.");
+      return;
+    }
+
+    if (this.validating.has(botId)) {
+      this.reporter.failed(commandId, "VALIDATION_ALREADY_RUNNING", "Une verification de page est deja en cours pour ce bot.");
+      return;
+    }
+
+    // Verifications d'infrastructure AVANT tout accuse (section 2, etapes
+    // 3/4): un bot dont le navigateur a deja disparu ne doit jamais recevoir
+    // d'ACK pour une commande qu'il ne peut pas honorer. Le nettoyage du
+    // registre/verrou pour une fermeture reelle est deja assure par
+    // wireUnexpectedClosure (listeners poses au demarrage): ces verifications
+    // ne sont qu'un filet pour la fenetre etroite ou l'evenement n'a pas
+    // encore ete traite par la boucle d'evenements.
+    if (handle.browserProcess.killed || handle.browserProcess.exitCode !== null) {
+      this.reporter.failed(commandId, "BROWSER_CLOSED", "Le navigateur de ce bot a ete ferme.");
+      return;
+    }
+    if (!handle.browser.isConnected()) {
+      this.reporter.failed(commandId, "BROWSER_CONNECTION_LOST", "La connexion au navigateur de ce bot a ete perdue.");
+      return;
+    }
+
+    this.validating.add(botId);
+    this.reporter.ack(commandId);
+
+    try {
+      const pages = handle.context.pages();
+      const selection = await findAppointmentPage(pages, this.settings.targetMode);
+
+      if (!selection.ok) {
+        this.log("warn", `VALIDATE_BOT ${botId}: ${selection.reason}`);
+        this.reporter.botStatus(botId, commandId, "WAITING_FOR_USER");
+        this.reporter.failed(
+          commandId,
+          "PAGE_NOT_READY",
+          "La page de rendez-vous n'est pas prete. Verifiez la page ouverte dans Chrome, puis validez a nouveau."
+        );
+        return;
+      }
+
+      handle.page = selection.page;
+      handle.monitoringPrepared = true;
+      handle.currentStatus = "MONITORING";
+      handle.lastActivityAt = new Date().toISOString();
+
+      this.reporter.botStatus(botId, commandId, "MONITORING");
+      this.reporter.completed(commandId, { botId, status: "MONITORING", validated: true });
+      this.log("success", `Bot ${botId} valide: page reconnue (${maskUrlForLog(selection.page.url())}).`);
+    } catch (error) {
+      const commandError = toAgentCommandError(error, "PAGE_NOT_READY");
+      this.log("error", `VALIDATE_BOT ${botId} echoue (${commandError.code}): ${commandError.message}`);
+      this.reporter.botStatus(botId, commandId, "WAITING_FOR_USER");
+      this.reporter.failed(commandId, commandError.code, this.publicMessageFor(commandError));
+    } finally {
+      this.validating.delete(botId);
+    }
+  }
+
   // Detecte une fermeture non sollicitee (Chrome ferme manuellement par
   // l'utilisateur, crash) et distincte d'un STOP_BOT deliberement declenche:
   // stopHandle() retire ces memes listeners avant de fermer volontairement,
@@ -192,7 +274,13 @@ export class AgentBotManager {
       PROFILE_LOCKED: "Ce profil Chrome est deja utilise par une autre instance.",
       PROFILE_CREATE_FAILED: "Impossible de preparer le profil Chrome local.",
       BOT_ALREADY_RUNNING: "Ce bot est deja actif sur cet agent.",
-      AGENT_CAPACITY_REACHED: "Limite locale de bots actifs atteinte sur cet agent."
+      AGENT_CAPACITY_REACHED: "Limite locale de bots actifs atteinte sur cet agent.",
+      BOT_NOT_RUNNING: "Ce bot n'est plus actif sur cet agent.",
+      BROWSER_CLOSED: "Le navigateur de ce bot a ete ferme.",
+      BROWSER_CONNECTION_LOST: "La connexion au navigateur de ce bot a ete perdue.",
+      PAGE_NOT_READY: "La page de rendez-vous n'est pas prete.",
+      PAGE_CLOSED: "L'onglet du bot a ete ferme.",
+      VALIDATION_ALREADY_RUNNING: "Une verification de page est deja en cours pour ce bot."
     };
     return messages[error.code] ?? "Erreur interne de l'agent.";
   }

@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { Page } from "playwright";
-import { detectAppointmentAvailability, findBestCandidateElement, findReserveAppointmentButton } from "./detectors.js";
+import { detectAppointmentAvailability, findBestCandidateElement, findReserveAppointmentButton, isAppointmentPageReady } from "./detectors.js";
 import { detectHumanValidation } from "./humanValidation.js";
 import { highlightElement } from "./highlight.js";
 import { logger } from "../logger.js";
@@ -202,20 +202,6 @@ const detectOnCurrentMonth = async (
     runtime.log("success", `Slots disponibles DOM: ${availableSlotCount}`);
   }
   return detectAppointmentAvailability(page);
-};
-
-const isAppointmentPageReady = async (page: Page): Promise<boolean> => {
-  const currentMonth = page.locator(
-    '[data-testid="btn-current-month-available"], [data-testid="btn-current-month-unavailable"]'
-  ).first();
-  const nextMonth = page.locator(
-    '[data-testid="btn-next-month-available"], [data-testid="btn-next-month-unavailable"]'
-  ).first();
-  const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
-
-  return (await currentMonth.isVisible().catch(() => false))
-    || (await nextMonth.isVisible().catch(() => false))
-    || /réservez votre rendez-vous|reservez votre rendez-vous|sélectionnez un créneau|selectionnez un creneau/i.test(bodyText);
 };
 
 const detectUnexpectedPageReason = async (page: Page): Promise<string | null> => {

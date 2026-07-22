@@ -857,14 +857,14 @@ const selectAgentForCommand = async (agencyId: number, requestedAgentId?: number
   return { ok: false, code: "AGENT_NOT_CONNECTED" };
 };
 
-// Section 14: STOP_BOT/VALIDATE_BOT partagent le meme bus generique que
-// START_BOT plutot que d'inventer un evenement par type. Toujours envoyees a
-// l'agent proprietaire du bot (jamais une nouvelle selection), et refusees
+// Section 14: STOP_BOT partage le meme bus generique que START_BOT plutot
+// que d'inventer un evenement par type. Toujours envoye a l'agent
+// proprietaire du bot (jamais une nouvelle selection), et refuse
 // silencieusement si ce bot n'est pas/plus connu (deja arrete, jamais
-// demarre en mode agent...).
+// demarre en mode agent...): idempotence deja voulue et testee (Lot 2).
 const dispatchOwnedAgentCommand = async (
   socket: Socket,
-  type: "STOP_BOT" | "VALIDATE_BOT",
+  type: "STOP_BOT",
   botId: string,
   clientRequestId?: string
 ): Promise<void> => {
@@ -904,13 +904,90 @@ const dispatchOwnedAgentCommand = async (
       }
     );
 
-    emitOwnedLog(socket, owner, makeEvent(
-      "info",
-      `Commande ${type === "STOP_BOT" ? "d'arret" : "de validation"} envoyee a l'agent (id ${command.command_id.slice(0, 8)}).`
-    ));
+    emitOwnedLog(socket, owner, makeEvent("info", `Commande d'arret envoyee a l'agent (id ${command.command_id.slice(0, 8)}).`));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.error(`Echec du dispatch ${type}: ${message}`);
+    emitOwnedLog(socket, owner, makeEvent("error", "Erreur interne lors de l'envoi de la commande a l'agent."));
+  }
+};
+
+// Section 1 (Lot 3): contrat propre a VALIDATE_BOT, distinct de STOP_BOT
+// (idempotent, toujours tente quel que soit l'etat). VALIDATE_BOT n'a de
+// sens que si le bot est encore WAITING_FOR_USER: refuser AVANT de creer une
+// commande (bot inconnu, autre agence, mauvais etat, agent hors ligne)
+// plutot que de faire un aller-retour agent inutile pour un echec deja
+// connu du serveur. Ne revele jamais qu'un botId appartient a une autre
+// agence: meme code generique (BOT_NOT_RUNNING) que pour un bot inconnu.
+const VALIDATE_BOT_ERROR_MESSAGES: Record<string, string> = {
+  BOT_NOT_RUNNING: "Ce bot n'est plus actif.",
+  AGENT_NOT_CONNECTED: "L'agent proprietaire de ce bot n'est plus connecte.",
+  INVALID_BOT_STATE: "Ce bot n'est pas dans un etat permettant la validation."
+};
+
+const dispatchValidateBotCommand = async (
+  socket: Socket,
+  botId: string,
+  clientRequestId?: string
+): Promise<void> => {
+  const user = socketUsers.get(socket.id);
+  if (!user) {
+    return;
+  }
+
+  const bot = getAgentBot(botId);
+  if (!bot) {
+    socket.emit("bot-status", { botId, status: "error", code: "BOT_NOT_RUNNING" });
+    return;
+  }
+
+  const owner: SessionOwner = { userId: bot.ownerUserId, agencyId: bot.agencyId, botName: bot.botName, category: bot.category, login: "" };
+  if (!canSeeOwner(user, owner)) {
+    socket.emit("bot-status", { botId, status: "error", code: "BOT_NOT_RUNNING" });
+    return;
+  }
+
+  if (bot.botStatus !== "WAITING_FOR_USER") {
+    socket.emit("bot-status", { botId, status: "error", code: "INVALID_BOT_STATE" });
+    emitOwnedLog(socket, owner, makeEvent("error", VALIDATE_BOT_ERROR_MESSAGES.INVALID_BOT_STATE));
+    return;
+  }
+
+  if (!getConnectedAgentSocket(bot.agentId)) {
+    socket.emit("bot-status", { botId, status: "error", code: "AGENT_NOT_CONNECTED" });
+    emitOwnedLog(socket, owner, makeEvent("error", VALIDATE_BOT_ERROR_MESSAGES.AGENT_NOT_CONNECTED));
+    return;
+  }
+
+  const normalizedClientRequestId = typeof clientRequestId === "string" && clientRequestId.trim()
+    ? clientRequestId.trim().slice(0, 100)
+    : null;
+
+  try {
+    const { command } = await dispatchAgentCommand(
+      {
+        agencyId: bot.agencyId,
+        agentId: bot.agentId,
+        botId,
+        type: "VALIDATE_BOT",
+        publicPayload: {},
+        createdByUserId: user.id,
+        clientRequestId: normalizedClientRequestId
+      },
+      {
+        config: agentCommandConfig,
+        getAgentSocket: getConnectedAgentSocket,
+        onChange: (updatedCommand) => emitAgentCommandStatusToAuthorizedSockets(
+          updatedCommand.agency_id,
+          toPublicAgentCommand(updatedCommand)
+        )
+      }
+    );
+
+    emitOwnedLog(socket, owner, makeEvent("info", `Commande de validation envoyee a l'agent (id ${command.command_id.slice(0, 8)}).`));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error(`Echec du dispatch VALIDATE_BOT: ${message}`);
     emitOwnedLog(socket, owner, makeEvent("error", "Erreur interne lors de l'envoi de la commande a l'agent."));
   }
 };
@@ -1244,7 +1321,7 @@ io.on("connection", (socket) => {
 
   socket.on("continue-bot", (payload: { sessionId?: string; botId?: string; clientRequestId?: string } = {}) => {
     if (featureFlags.botExecutionMode === "agent" && payload.botId) {
-      void dispatchOwnedAgentCommand(socket, "VALIDATE_BOT", payload.botId, payload.clientRequestId);
+      void dispatchValidateBotCommand(socket, payload.botId, payload.clientRequestId);
       return;
     }
 

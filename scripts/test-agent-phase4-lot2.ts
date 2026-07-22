@@ -215,7 +215,19 @@ const runSuiteA = async (): Promise<void> => {
     const chromeBeforeStop = await listChromeProcs();
     const rootsBeforeStop = rootPids(chromeBeforeStop).length;
     await manager.stopBot({ commandId: "cmd-stop-a", botId: "bot-a" });
-    const chromeAfterStopA = await listChromeProcs();
+    // taskkill /F retourne des que l'arret est demande, mais Windows peut
+    // mettre quelques centaines de ms a faire disparaitre tous les
+    // sous-process d'un arbre Chrome complet (crashpad/gpu/renderers): on
+    // reverifie brievement avant de conclure (meme pattern que shutdownAll
+    // plus bas dans ce fichier).
+    let chromeAfterStopA = await listChromeProcs();
+    const stopADeadline = Date.now() + 5_000;
+    while (Date.now() < stopADeadline) {
+      chromeAfterStopA = await listChromeProcs();
+      const settled = newA.every((p) => !chromeAfterStopA.some((c) => c.pid === p.pid));
+      if (settled) break;
+      await sleep(300);
+    }
     const bPidStillAlive = newB.every((p) => chromeAfterStopA.some((c) => c.pid === p.pid));
     const aPidGone = newA.every((p) => !chromeAfterStopA.some((c) => c.pid === p.pid));
     assert(aPidGone, "STOP_BOT sur bot-a ferme bien le chrome.exe de bot-a (et tous ses sous-process)");

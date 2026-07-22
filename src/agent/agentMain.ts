@@ -17,10 +17,10 @@ const parseArgs = (): { pairingCode?: string } => {
   return {};
 };
 
-// VALIDATE_BOT (et tout type de commande non gere par ce lot) reste
-// honnetement refuse: le moteur de surveillance n'arrive qu'au Lot 3/4.
-// Jamais de faux succes simule (meme principe que scripts/test-agent-phase3.ts).
-const NOT_YET_IMPLEMENTED = new Set(["VALIDATE_BOT", "REFRESH_BOT", "UPDATE_SETTINGS", "REQUEST_STATUS", "SHUTDOWN_BOT"]);
+// Types de commande non geres avant le Lot 4/5: restent refuses honnetement
+// (accuse puis echec explicite), jamais un faux succes simule (meme principe
+// que scripts/test-agent-phase3.ts). VALIDATE_BOT est gere depuis le Lot 3.
+const NOT_YET_IMPLEMENTED = new Set(["REFRESH_BOT", "UPDATE_SETTINGS", "REQUEST_STATUS", "SHUTDOWN_BOT"]);
 
 const main = async (): Promise<void> => {
   const settings = loadAgentSettings();
@@ -93,7 +93,12 @@ const handleCommand = (
     return;
   }
 
-  // VALIDATE_BOT et les autres types non geres par ce lot restent refuses
+  if (command.type === "VALIDATE_BOT") {
+    void botManager.validateBot({ commandId: command.commandId, botId: command.botId });
+    return;
+  }
+
+  // Les autres types non geres par ce lot restent refuses
   // honnetement (accuse puis echec explicite), jamais laisses en silence
   // jusqu'au timeout serveur (constraint 9).
   reporter.ack(command.commandId);

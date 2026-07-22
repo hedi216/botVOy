@@ -356,3 +356,21 @@ export const findReserveAppointmentButton = async (
 
   return null;
 };
+
+// Utilisee par le refresh du moteur de surveillance (monitor.ts) ET par la
+// verification de page de VALIDATE_BOT cote agent (Phase 4, section 3): les
+// deux doivent juger "cette page est la page de rendez-vous" de la MEME
+// facon, jamais deux logiques divergentes.
+export const isAppointmentPageReady = async (page: Page): Promise<boolean> => {
+  const currentMonth = page.locator(
+    '[data-testid="btn-current-month-available"], [data-testid="btn-current-month-unavailable"]'
+  ).first();
+  const nextMonth = page.locator(
+    '[data-testid="btn-next-month-available"], [data-testid="btn-next-month-unavailable"]'
+  ).first();
+  const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
+
+  return (await currentMonth.isVisible().catch(() => false))
+    || (await nextMonth.isVisible().catch(() => false))
+    || /réservez votre rendez-vous|reservez votre rendez-vous|sélectionnez un créneau|selectionnez un creneau/i.test(bodyText);
+};

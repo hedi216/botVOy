@@ -530,23 +530,54 @@
   // Statuts runtime "actifs": le bot local existe encore et fonctionne.
   // Un botStatus dans cet ensemble prime TOUJOURS sur le statut de la
   // commande pour le message affiche (AFFICHAGE, cahier des charges): une
-  // commande START_BOT COMPLETED ne dit rien sur l'etat du bot lui-meme, et
-  // ne doit jamais afficher "Commande terminee par l'agent" tant que le bot
-  // est encore actif.
+  // commande START_BOT/VALIDATE_BOT COMPLETED ne dit rien a elle seule sur
+  // l'etat du bot, et ne doit jamais afficher "Commande terminee par
+  // l'agent" tant que le bot est encore actif.
   const ACTIVE_BOT_STATUS_MESSAGE = {
     STARTING: "Demarrage en attente du moteur local",
-    WAITING_FOR_USER: "En attente de l'utilisateur",
-    MONITORING: "Surveillance en cours (agent)",
+    WAITING_FOR_USER: "En attente de la connexion et de l'ouverture de la page de rendez-vous",
+    MONITORING: "Page validee - surveillance prete",
     RATE_LIMITED: "Ralenti (rate limit) par l'agent",
     SLOT_DETECTED: "Creneau detecte par l'agent",
     STOPPING: "Arret en cours (agent)"
   };
 
+  // Erreurs propres a VALIDATE_BOT (Lot 3) et cas herites (Lot 2): toujours
+  // verifiees en PREMIER, avant le raccourci "botStatus actif" ci-dessus.
+  // Sans cela, un COMMAND_FAILED(PAGE_NOT_READY) — dont le botStatus est
+  // deliberement remis a WAITING_FOR_USER par l'agent — se ferait masquer par
+  // le message generique "En attente de..." et l'echec deviendrait invisible.
+  const FAILURE_MESSAGE_BY_ERROR_CODE = {
+    AGENT_ACK_TIMEOUT: "Delai de reponse depasse",
+    AGENT_DISCONNECTED: "Agent deconnecte",
+    AGENT_DISCONNECTED_AFTER_ACK: "Agent deconnecte",
+    AGENT_REVOKED: "Agent deconnecte",
+    PAGE_NOT_READY: "La page de rendez-vous n'est pas prete. Verifiez la page ouverte dans Chrome, puis validez a nouveau.",
+    BOT_NOT_RUNNING: "Ce bot n'est plus actif.",
+    BROWSER_CLOSED: "Le navigateur du bot a ete ferme.",
+    BROWSER_CONNECTION_LOST: "La connexion au navigateur du bot a ete perdue.",
+    INVALID_BOT_STATE: "Ce bot n'est pas dans un etat permettant cette action.",
+    AGENT_NOT_CONNECTED: "L'agent n'est plus connecte.",
+    VALIDATION_ALREADY_RUNNING: "Une verification de page est deja en cours."
+  };
+
+  // Une commande VALIDATE_BOT non encore terminee (PENDING/SENT/ACKNOWLEDGED)
+  // affiche un message dedie et desactive le double-clic sur Valider, sans
+  // jamais masquer Arreter (section 7 du cahier des charges Lot 3).
+  const isValidateInFlight = (command) =>
+    command.type === "VALIDATE_BOT" && ["PENDING", "SENT", "ACKNOWLEDGED"].includes(command.status);
+
   // Traduit le couple (statut de commande, statut de bot remonte par
-  // l'agent) dans les messages utilisateur exiges par la section 12. La page
-  // ne doit jamais laisser entendre que Chrome est lance tant que l'agent ne
-  // l'a pas confirme via BOT_STATUS.
+  // l'agent) dans les messages utilisateur exiges par la section 12/7. La
+  // page ne doit jamais laisser entendre que Chrome est lance tant que
+  // l'agent ne l'a pas confirme via BOT_STATUS.
   const commandStatusMessage = (command) => {
+    if (command.status === "FAILED" && FAILURE_MESSAGE_BY_ERROR_CODE[command.errorCode]) {
+      return FAILURE_MESSAGE_BY_ERROR_CODE[command.errorCode];
+    }
+    if (isValidateInFlight(command)) {
+      return "Verification de la page...";
+    }
     if (ACTIVE_BOT_STATUS_MESSAGE[command.botStatus]) {
       return ACTIVE_BOT_STATUS_MESSAGE[command.botStatus];
     }
@@ -560,12 +591,6 @@
       return "Commande recue par l'agent";
     }
     if (command.status === "FAILED") {
-      if (command.errorCode === "AGENT_ACK_TIMEOUT") {
-        return "Delai de reponse depasse";
-      }
-      if (["AGENT_DISCONNECTED", "AGENT_DISCONNECTED_AFTER_ACK", "AGENT_REVOKED"].includes(command.errorCode)) {
-        return "Agent deconnecte";
-      }
       return "Commande echouee";
     }
     if (command.status === "EXPIRED") {
@@ -635,13 +660,17 @@
 
       const actions = document.createElement("td");
       actions.className = "action-cell";
-      if (command.botStatus === "WAITING_FOR_USER") {
+      if (command.botStatus === "WAITING_FOR_USER" && !isValidateInFlight(command)) {
         const validate = document.createElement("button");
         validate.className = "primary";
         validate.type = "button";
         validate.textContent = "Valider";
         validate.addEventListener("click", () => {
-          APP.socket.emit("continue-bot", { botId: command.botId });
+          // Desactive immediatement pour eviter un double-clic pendant que
+          // le prochain rendu (declenche par la reponse serveur) n'a pas
+          // encore eu lieu.
+          validate.disabled = true;
+          APP.socket.emit("continue-bot", { botId: command.botId, clientRequestId: `${command.botId}-validate-${Date.now()}` });
         });
         actions.append(validate);
       }

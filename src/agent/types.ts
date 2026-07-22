@@ -48,12 +48,13 @@ export type AgentCommandEnvelope = {
 export type AgentBotStatusValue =
   | "STARTING"
   | "WAITING_FOR_USER"
+  | "MONITORING"
   | "STOPPING"
   | "STOPPED"
   | "ERROR";
 
-// Codes publics whitelistes (section 7/8 du cahier des charges Phase 4):
-// jamais de stack trace, jamais de detail Playwright/Chrome brut.
+// Codes publics whitelistes (section 6/7/8 du cahier des charges Phase 4
+// Lot 2/3): jamais de stack trace, jamais de detail Playwright/Chrome brut.
 export const AGENT_COMMAND_ERROR_CODES = [
   "BROWSER_LAUNCH_FAILED",
   "BROWSER_NOT_FOUND",
@@ -63,7 +64,16 @@ export const AGENT_COMMAND_ERROR_CODES = [
   "BOT_ALREADY_RUNNING",
   "AGENT_CAPACITY_REACHED",
   "BOT_NOT_FOUND",
-  "ENGINE_NOT_IMPLEMENTED"
+  "ENGINE_NOT_IMPLEMENTED",
+  // Lot 3 (VALIDATE_BOT)
+  "BOT_NOT_RUNNING",
+  "BROWSER_CLOSED",
+  "BROWSER_CONNECTION_LOST",
+  "PAGE_NOT_READY",
+  "PAGE_CLOSED",
+  "INVALID_BOT_STATE",
+  "AGENT_NOT_CONNECTED",
+  "VALIDATION_ALREADY_RUNNING"
 ] as const;
 
 export type AgentCommandErrorCode = typeof AGENT_COMMAND_ERROR_CODES[number];
@@ -83,4 +93,8 @@ export type AgentBotHandle = {
   startedAt: string;
   lastActivityAt: string;
   lastError: string | null;
+  // Lot 3: vrai seulement une fois VALIDATE_BOT reussi. Le Lot 3 ne demarre
+  // pas de boucle de scan reelle (Lot 4): ce champ documente seulement que
+  // la page a ete validee et que le moteur local est pret a commencer.
+  monitoringPrepared: boolean;
 };
