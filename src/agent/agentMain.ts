@@ -1,8 +1,10 @@
 import { AgentBotManager } from "./agentBotManager.js";
 import { AgentClient } from "./agentClient.js";
 import { AgentEventReporter, createAgentEventReporter } from "./agentEventReporter.js";
+import { loadExtensionConfig, toPublicExtensionStatus, validateExtensions } from "./agentExtensionConfig.js";
 import { createAgentLogger } from "./agentLocalLogger.js";
 import { loadAgentSettings } from "./agentSettings.js";
+import { getConfigDir } from "./agentStorage.js";
 import { AgentCommandEnvelope } from "./types.js";
 
 const parseArgs = (): { pairingCode?: string } => {
@@ -46,10 +48,21 @@ const main = async (): Promise<void> => {
       handleCommand(botManager, reporter, command, log);
     },
     onConnectionChange: (connected) => {
-      log(connected ? "success" : "warn", connected ? "En attente de commandes." : "Connexion perdue, reconnexion en cours...");
+      log(connected ? "success" : "warn", connected ? "Connecte. Synchronisation en cours..." : "Connexion perdue: les bots locaux continuent, evenements mis en buffer.");
+    },
+    onSyncReady: () => {
+      log("success", "Synchronisation terminee. En attente de commandes.");
+    },
+    onPermanentFailure: (reason) => {
+      log("error", `Agent non reautorise a se connecter (${reason}). Reappairage requis (npm run agent:dev -- pair <CODE>). Les bots deja actifs localement continuent de tourner.`);
     }
   });
   client.setActiveBotCountProvider(() => botManager.activeCount());
+  client.setRuntimeStatusProvider(() => botManager.snapshotForRuntimeStatus());
+  client.setExtensionStatusProvider(() => {
+    const entries = loadExtensionConfig(getConfigDir(settings), log);
+    return toPublicExtensionStatus(validateExtensions(entries, log));
+  });
 
   reporter = createAgentEventReporter(client, log);
   botManager = new AgentBotManager(settings, log, reporter);

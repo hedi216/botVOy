@@ -1,7 +1,7 @@
 import "dotenv/config";
 import os from "node:os";
 import path from "node:path";
-import { AgentRuntimeSettings, AgentTargetMode } from "./types.js";
+import { AgentLogLevelSetting, AgentRuntimeSettings, AgentTargetMode } from "./types.js";
 
 // Version locale au runtime agent: independante du numero de version du
 // package serveur (rdv-agent/package.json, qui designe le serveur lui-meme,
@@ -20,6 +20,29 @@ const numberEnv = (key: string, fallback: number): number => {
     throw new Error(`Variable d'environnement invalide: ${key}`);
   }
   return value;
+};
+
+const ratioEnv = (key: string, fallback: number): number => {
+  const raw = process.env[key];
+  if (!raw || !raw.trim()) {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`Variable d'environnement invalide (attendu entre 0 et 1): ${key}`);
+  }
+  return value;
+};
+
+const resolveLogLevel = (): AgentLogLevelSetting => {
+  const raw = process.env.AGENT_LOG_LEVEL?.trim().toLowerCase();
+  if (!raw) {
+    return "info";
+  }
+  if (raw === "debug" || raw === "info" || raw === "warn" || raw === "error") {
+    return raw;
+  }
+  throw new Error(`AGENT_LOG_LEVEL invalide: "${raw}". Valeurs acceptees: debug, info, warn, error.`);
 };
 
 const resolveTargetMode = (): AgentTargetMode => {
@@ -78,6 +101,13 @@ export const loadAgentSettings = (): AgentRuntimeSettings => {
     fixtureUrl,
     targetUrl,
     maxActiveBots: numberEnv("AGENT_MAX_ACTIVE_BOTS", 15),
-    dataRoot: resolveDataRoot()
+    dataRoot: resolveDataRoot(),
+    reconnectMinDelayMs: numberEnv("AGENT_RECONNECT_MIN_DELAY_MS", 1_000),
+    reconnectMaxDelayMs: numberEnv("AGENT_RECONNECT_MAX_DELAY_MS", 30_000),
+    reconnectJitterRatio: ratioEnv("AGENT_RECONNECT_JITTER_RATIO", 0.2),
+    offlineEventBufferMax: numberEnv("AGENT_OFFLINE_EVENT_BUFFER_MAX", 500),
+    logMaxFileSizeMb: numberEnv("AGENT_LOG_MAX_FILE_SIZE_MB", 5),
+    logMaxFiles: numberEnv("AGENT_LOG_MAX_FILES", 5),
+    logLevel: resolveLogLevel()
   };
 };

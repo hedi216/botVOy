@@ -26,12 +26,28 @@ export type PublicAgent = {
   createdAt: string;
   updatedAt: string;
   revokedAt: string | null;
+  // Lot 5 (section 9): distinct de status==="CONNECTED" - vrai seulement
+  // apres reconciliation (AGENT_RUNTIME_STATUS traite). Permet a
+  // l'interface d'afficher brievement "synchronisation en cours".
+  readyForCommands: boolean;
+  // Lot 5 (section 14): inventaire public rapporte par AGENT_EXTENSION_STATUS
+  // - jamais de chemin local (garanti par agentExtensionConfig.ts cote agent).
+  extensions: PublicAgentExtension[];
+};
+
+export type PublicAgentExtension = {
+  id: string;
+  configured: boolean;
+  valid: boolean;
+  version: string | null;
 };
 
 export const toPublicAgent = (
   agent: DbAgent,
   liveStatus: AgentLiveStatus,
-  activeBotCount = 0
+  activeBotCount = 0,
+  readyForCommands = false,
+  extensions: PublicAgentExtension[] = []
 ): PublicAgent => ({
   agentId: agent.id,
   agencyId: agent.agency_id,
@@ -44,7 +60,9 @@ export const toPublicAgent = (
   activeBotCount: Math.max(0, Math.trunc(activeBotCount)),
   createdAt: agent.created_at,
   updatedAt: agent.updated_at,
-  revokedAt: agent.revoked_at
+  revokedAt: agent.revoked_at,
+  readyForCommands: liveStatus === "CONNECTED" && readyForCommands,
+  extensions
 });
 
 // Alphabet sans caracteres ambigus (pas de 0/O, 1/I/L) pour que le code reste

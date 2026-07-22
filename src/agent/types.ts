@@ -21,7 +21,21 @@ export type AgentRuntimeSettings = {
   targetUrl: string;
   maxActiveBots: number;
   dataRoot: string;
+  // Lot 5 (section 2): reconnexion manuelle a backoff exponentiel + jitter,
+  // pilotee entierement par l'agent (reconnection socket.io native
+  // desactivee) pour distinguer erreur transitoire/definitive.
+  reconnectMinDelayMs: number;
+  reconnectMaxDelayMs: number;
+  reconnectJitterRatio: number;
+  // Lot 5 (section 4): borne stricte du buffer d'evenements hors ligne.
+  offlineEventBufferMax: number;
+  // Lot 5 (section 10): logs locaux.
+  logMaxFileSizeMb: number;
+  logMaxFiles: number;
+  logLevel: AgentLogLevelSetting;
 };
+
+export type AgentLogLevelSetting = "debug" | "info" | "warn" | "error";
 
 // Meme forme que celle deja ecrite par scripts/test-agent-phase1.ts (mode
 // "pair"): un appairage effectue par l'un ou l'autre reste utilisable par
@@ -80,7 +94,10 @@ export const AGENT_COMMAND_ERROR_CODES = [
   "AGENT_NOT_CONNECTED",
   "VALIDATION_ALREADY_RUNNING",
   // Lot 4 (surveillance reelle)
-  "REFRESH_FAILED"
+  "REFRESH_FAILED",
+  // Lot 5 (extensions locales, section 13)
+  "EXTENSION_NOT_FOUND",
+  "EXTENSION_INVALID"
 ] as const;
 
 export type AgentCommandErrorCode = typeof AGENT_COMMAND_ERROR_CODES[number];
@@ -109,4 +126,53 @@ export type AgentBotHandle = {
   // Lot 4: present uniquement pendant MONITORING (entre VALIDATE_BOT reussi
   // et STOP_BOT/fermeture).
   monitoringRuntime: MonitoringRuntimeHandle | null;
+};
+
+// -------- Lot 5: resilience (reconnexion, buffer, resync, extensions) --------
+
+// Snapshot public envoye au serveur via AGENT_RUNTIME_STATUS (section 6):
+// jamais profilePath/debugPort/PID/cookies/URL complete/objets Playwright.
+export type RuntimeStatusBotSnapshot = {
+  botId: string;
+  status: AgentBotStatusValue;
+  startedAt: string;
+  lastActivityAt: string;
+  monitoringActive: boolean;
+  browserOpen: boolean;
+};
+
+// -------- Lot 5: extensions Chrome locales (section 12/13) --------
+
+export type AgentExtensionEntry = {
+  id: string;
+  enabled: boolean;
+  required: boolean;
+  localPath: string;
+};
+
+export type AgentExtensionConfigFile = {
+  extensions: AgentExtensionEntry[];
+};
+
+export type AgentExtensionValidationStatus = "ok" | "invalid" | "not_found" | "disabled";
+
+export type AgentExtensionValidationResult = {
+  id: string;
+  enabled: boolean;
+  required: boolean;
+  status: AgentExtensionValidationStatus;
+  // Jamais transmis au serveur (section 14): usage strictement local (choix
+  // des arguments --load-extension, logs locaux assainis).
+  localPath: string;
+  version: string | null;
+  reason: string | null;
+};
+
+// Inventaire public envoye via AGENT_EXTENSION_STATUS (section 14): jamais
+// localPath, jamais reason (pourrait reveler une structure de dossier).
+export type AgentExtensionPublicStatus = {
+  id: string;
+  configured: boolean;
+  valid: boolean;
+  version: string | null;
 };

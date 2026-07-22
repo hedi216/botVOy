@@ -51,11 +51,19 @@ export type LaunchedChrome = {
 
 export const launchChromeForBot = async (
   profilePath: string,
-  initialUrl: string
+  initialUrl: string,
+  // Lot 5 (section 13): dossiers deja valides (agentExtensionConfig.ts) a
+  // charger via --load-extension. Jamais un chemin brut non valide: la
+  // validation (existence, manifest.json) a deja eu lieu avant cet appel.
+  extensionDirs: string[] = []
 ): Promise<LaunchedChrome> => {
   const port = await getFreePort();
   const chromePath = process.env.CHROME_EXECUTABLE_PATH
     || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+
+  const extensionArgs = extensionDirs.length > 0
+    ? [`--load-extension=${extensionDirs.join(",")}`, "--disable-extensions-except=" + extensionDirs.join(",")]
+    : [];
 
   let browserProcess: ChildProcess;
   try {
@@ -66,6 +74,7 @@ export const launchChromeForBot = async (
       "--no-default-browser-check",
       "--disable-default-apps",
       "--disable-search-engine-choice-screen",
+      ...extensionArgs,
       "--new-window",
       initialUrl
     ], {

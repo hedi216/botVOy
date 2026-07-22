@@ -296,6 +296,9 @@ const connectFakeAgent = (
         reject(new Error("Aucun jeton recu."));
         return;
       }
+      // Lot 5: sans AGENT_RUNTIME_STATUS, l'agent reste READY_FOR_COMMANDS=
+      // false et le serveur refuse de dispatcher START_BOT (AGENT_SYNCING).
+      socket.emit("AGENT_RUNTIME_STATUS", { sentAt: new Date().toISOString(), bots: [] });
       resolve({ agentId, token, socket });
     });
 

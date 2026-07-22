@@ -8,18 +8,25 @@ import {
   touchAgentSeen,
   toPublicAgent,
   verifyAgentToken,
-  PublicAgent
+  PublicAgent,
+  PublicAgentExtension
 } from "./agentService.js";
 import {
+  AgentBotRecord,
   BotStatusValue,
   PublicAgentCommand,
   clearAckTimer,
+  dispatchAgentCommand,
   failNonTerminalOnDisconnect,
+  getAgentBot,
+  getBotOwnershipHistory,
   getCommandForAgent,
+  getLatestCommandForBot,
   isValidBotStatus,
   markAcknowledged,
   markCompleted,
   markFailedByAgent,
+  registerAgentBot,
   sweepAgentCommands,
   toPublicAgentCommand,
   updateAgentBotStatus
@@ -70,6 +77,13 @@ export type AgentSnapshot = PublicAgent;
 type ConnectedAgent = {
   socket: Socket;
   activeBotCount: number;
+  // Lot 5 (section 9): vrai seulement une fois AGENT_RUNTIME_STATUS traite
+  // pour cette connexion. Aucune nouvelle commande ne doit etre dispatchee
+  // avant (READY_FOR_COMMANDS), meme si le socket est deja techniquement
+  // connecte.
+  ready: boolean;
+  // Lot 5 (section 14): dernier inventaire recu via AGENT_EXTENSION_STATUS.
+  extensions: PublicAgentExtension[];
 };
 
 const connectedAgents = new Map<number, ConnectedAgent>();
@@ -98,13 +112,22 @@ const snapshotFromAgent = (agent: DbAgent, config: AgentGatewayConfig): AgentSna
   toPublicAgent(
     agent,
     computeLiveStatus(agent, connectedAgents.has(agent.id), config),
-    connectedAgents.get(agent.id)?.activeBotCount ?? 0
+    connectedAgents.get(agent.id)?.activeBotCount ?? 0,
+    connectedAgents.get(agent.id)?.ready ?? false,
+    connectedAgents.get(agent.id)?.extensions ?? []
   );
 
 export const isAgentConnected = (agentId: number): boolean => connectedAgents.has(agentId);
 
 export const getConnectedAgentSocket = (agentId: number): Socket | undefined =>
   connectedAgents.get(agentId)?.socket;
+
+// Lot 5 (section 9): distinct de isAgentConnected - un agent peut etre
+// techniquement connecte (socket ouvert) mais pas encore synchronise
+// (AGENT_RUNTIME_STATUS pas encore traite). Les appelants (server.ts)
+// doivent verifier ceci avant de dispatcher une NOUVELLE commande.
+export const isAgentReadyForCommands = (agentId: number): boolean =>
+  connectedAgents.get(agentId)?.ready ?? false;
 
 // Utilise par la revocation (server.ts): coupe le socket actif d'un agent.
 // Le handler "disconnect" existant (plus bas) se declenche normalement a la
@@ -170,7 +193,12 @@ const logAsyncError = (context: string) => (error: unknown): void => {
 // prend chaque requete DB individuellement.
 const commandEventQueues = new Map<string, Promise<void>>();
 
-const enqueueCommandEvent = (commandId: string, task: () => Promise<void>): void => {
+// Retourne desormais la promesse de fin de traitement (Lot 5): permet a
+// BOT_STATUS d'accuser reception aupres du CLIENT uniquement une fois le
+// traitement (DB + diffusion) reellement termine, pour que le buffer hors
+// ligne de l'agent ne retire un evenement qu'apres confirmation reelle
+// (section 5, etape 5).
+const enqueueCommandEvent = (commandId: string, task: () => Promise<void>): Promise<void> => {
   const previous = commandEventQueues.get(commandId) ?? Promise.resolve();
   const next = previous.then(task, task).catch(logAsyncError("command-event-queue")).finally(() => {
     if (commandEventQueues.get(commandId) === next) {
@@ -178,6 +206,25 @@ const enqueueCommandEvent = (commandId: string, task: () => Promise<void>): void
     }
   });
   commandEventQueues.set(commandId, next);
+  return next;
+};
+
+// Lot 5 (section 5): dedup par eventId, bornee (les eventId sont ephemeres,
+// perdus au redemarrage serveur comme le reste de l'etat en memoire de ce
+// module - coherent avec le choix deja fait pour agentBots).
+const MAX_PROCESSED_EVENT_IDS = 2_000;
+const processedBotStatusEventIds = new Set<string>();
+const processedEventIdOrder: string[] = [];
+
+const rememberProcessedEventId = (eventId: string): void => {
+  processedBotStatusEventIds.add(eventId);
+  processedEventIdOrder.push(eventId);
+  if (processedEventIdOrder.length > MAX_PROCESSED_EVENT_IDS) {
+    const oldest = processedEventIdOrder.shift();
+    if (oldest) {
+      processedBotStatusEventIds.delete(oldest);
+    }
+  }
 };
 
 export const registerAgentNamespace = (
@@ -245,12 +292,45 @@ export const registerAgentNamespace = (
     next(new Error("INVALID_AUTH_MODE"));
   });
 
+  // Section 7: reponse commune aux deux cas ou un bot deja STOPPED cote
+  // serveur (registre en memoire encore present, ou historique DB) est
+  // rapporte actif par un agent - jamais reactive silencieusement, toujours
+  // reconvergence via un nouveau STOP_BOT (au cas ou le precedent n'aurait
+  // jamais atteint l'agent, ex. deconnexion juste avant reception).
+  // clientRequestId groupe par heure: reessaie automatiquement d'heure en
+  // heure si la premiere tentative echoue, sans spammer l'agent entre-temps.
+  const forceStopForReconciliation = async (
+    agencyId: number,
+    agentId: number,
+    botId: string,
+    ownerUserId: number
+  ): Promise<void> => {
+    logger.warn(`Bot ${botId} rapporte actif par l'agent mais deja STOPPED cote serveur: renvoi de STOP_BOT pour reconciliation.`);
+    const hourBucket = Math.floor(Date.now() / 3_600_000);
+    await dispatchAgentCommand(
+      {
+        agencyId,
+        agentId,
+        botId,
+        type: "STOP_BOT",
+        publicPayload: {},
+        createdByUserId: ownerUserId,
+        clientRequestId: `resync-stop-${botId}-${hourBucket}`
+      },
+      {
+        config: commandConfig,
+        getAgentSocket: getConnectedAgentSocket,
+        onChange: (updatedCommand) => onCommandChange(updatedCommand.agency_id, publicCommandFor(updatedCommand))
+      }
+    ).catch(logAsyncError("resync-stop"));
+  };
+
   namespace.on("connection", (socket) => {
     const agentId = socket.data.agentId as number;
     const agencyId = socket.data.agencyId as number;
     const issuedToken = socket.data.issuedToken as string | undefined;
 
-    connectedAgents.set(agentId, { socket, activeBotCount: 0 });
+    connectedAgents.set(agentId, { socket, activeBotCount: 0, ready: false, extensions: [] });
     logger.info(`Agent connecte: agentId=${agentId}, agencyId=${agencyId}`);
 
     void (async () => {
@@ -350,10 +430,24 @@ export const registerAgentNamespace = (
     // d'appartenance: on ne met a jour un botId que s'il correspond bien au
     // bot_id enregistre sur la commande possedee par CET agent. ----
 
-    socket.on("BOT_STATUS", (payload?: { commandId?: unknown; botId?: unknown; status?: unknown; details?: unknown }) => {
+    socket.on("BOT_STATUS", (
+      payload?: { commandId?: unknown; botId?: unknown; status?: unknown; details?: unknown; eventId?: unknown },
+      ackCallback?: (response: { ok: boolean }) => void
+    ) => {
       const commandId = clampString(payload?.commandId, 100);
       const botId = clampString(payload?.botId, 100);
+      const eventId = clampString(payload?.eventId, 100);
       if (!commandId || !botId || !isValidBotStatus(payload?.status)) {
+        ackCallback?.({ ok: false });
+        return;
+      }
+
+      // Lot 5 (section 5): un evenement deja traite (rejeu depuis le buffer
+      // hors ligne apres une reconnexion, ex. accuse de reception perdu en
+      // cours de route) est confirme sans etre re-applique - jamais deux
+      // logs/diffusions pour le meme eventId.
+      if (eventId && processedBotStatusEventIds.has(eventId)) {
+        ackCallback?.({ ok: true });
         return;
       }
 
@@ -374,7 +468,159 @@ export const registerAgentNamespace = (
           ? ` ${JSON.stringify(sanitizePublicRecord(payload.details)).slice(0, 300)}`
           : "";
         onBotLog(command.agency_id, botId, bot.botName, "info", `[Agent] Statut du bot: ${bot.botStatus}${detailsText}`);
-      });
+
+        if (eventId) {
+          rememberProcessedEventId(eventId);
+        }
+      }).then(
+        () => ackCallback?.({ ok: true }),
+        () => ackCallback?.({ ok: false })
+      );
+    });
+
+    // ---- Lot 5 (section 6/7/8/9): resynchronisation. Envoye par l'agent
+    // immediatement apres chaque (re)connexion authentifiee, avec le
+    // snapshot de ses bots locaux actifs. Reconstruit agentBots quand ce
+    // process serveur l'a perdu (redemarrage), sans jamais faire confiance
+    // au payload pour l'appartenance (agencyId/ownerUserId/botName/category
+    // viennent toujours de l'historique DB, jamais de l'agent). Marque
+    // ensuite l'agent READY_FOR_COMMANDS. ----
+    socket.on("AGENT_RUNTIME_STATUS", (payload?: { sentAt?: unknown; bots?: unknown }) => {
+      void (async () => {
+        const rawBots = Array.isArray(payload?.bots) ? payload.bots : [];
+        const touchedBotIds = new Set<string>();
+
+        for (const rawBot of rawBots) {
+          if (!rawBot || typeof rawBot !== "object") {
+            continue;
+          }
+          const botId = clampString((rawBot as Record<string, unknown>).botId, 100);
+          const status = (rawBot as Record<string, unknown>).status;
+          if (!botId || !isValidBotStatus(status)) {
+            continue;
+          }
+
+          const existing = getAgentBot(botId);
+
+          if (existing) {
+            if (existing.agentId !== agentId) {
+              // Section 8: deux agents annoncent le meme bot. Conserver le
+              // proprietaire legitime deja enregistre, ignorer ce rapport,
+              // signaler le conflit (jamais un choix silencieux du dernier
+              // evenement recu).
+              logger.warn(`RUNTIME_OWNERSHIP_CONFLICT: bot ${botId} deja possede par agentId=${existing.agentId}, egalement rapporte par agentId=${agentId}.`);
+              onBotLog(agencyId, botId, existing.botName, "warn", "Conflit de propriete detecte pour ce bot (RUNTIME_OWNERSHIP_CONFLICT): rapport ignore.");
+              continue;
+            }
+
+            if (existing.botStatus === "STOPPED") {
+              // Section 7: le registre en memoire n'est JAMAIS purge apres un
+              // STOP_BOT reussi (l'entree reste, active=false) - sans cette
+              // verification explicite, la branche "meme agent -> autorite"
+              // ci-dessous accepterait aveuglement un rapport ulterieur
+              // pretendant ce bot de nouveau MONITORING, le reactivant a
+              // tort. Un bot deja STOPPED ne doit jamais l'etre "un peu
+              // moins": on redemande sa fermeture reelle pour converger.
+              await forceStopForReconciliation(existing.agencyId, agentId, botId, existing.ownerUserId);
+              continue;
+            }
+
+            // Section 8: l'agent est l'autorite pour son etat runtime
+            // courant (navigateur reellement ouvert, boucle active).
+            updateAgentBotStatus(botId, status as BotStatusValue);
+            touchedBotIds.add(botId);
+            continue;
+          }
+
+          // Bot inconnu du registre en memoire de CE process serveur
+          // (redemarrage serveur, ou premiere fois qu'il voit ce bot):
+          // reconstruction a partir de l'historique DB uniquement.
+          const history = await getBotOwnershipHistory(botId, agentId);
+          if (!history) {
+            // Jamais vu par ce serveur pour cet agent: rien a reconstruire,
+            // signale proprement plutot qu'ignore silencieusement.
+            logger.warn(`AGENT_RUNTIME_STATUS: bot ${botId} inconnu (aucun START_BOT trouve pour agentId=${agentId}). Ignore.`);
+            continue;
+          }
+
+          if (history.everStopped) {
+            // Section 7: ne jamais reactiver un bot deja explicitement
+            // arrete cote serveur. Un botId n'est jamais reutilise: "deja
+            // arrete un jour" signifie "arrete pour toujours".
+            await forceStopForReconciliation(history.agencyId, agentId, botId, history.ownerUserId);
+            continue;
+          }
+
+          const record: AgentBotRecord = {
+            botId,
+            agentId,
+            agencyId: history.agencyId,
+            ownerUserId: history.ownerUserId,
+            botName: history.botName,
+            category: history.category,
+            latestCommandId: "",
+            botStatus: null,
+            botStatusUpdatedAt: null,
+            active: true,
+            updatedAt: new Date().toISOString()
+          };
+          registerAgentBot(record);
+          updateAgentBotStatus(botId, status as BotStatusValue);
+          touchedBotIds.add(botId);
+          onBotLog(history.agencyId, botId, history.botName, "info", `Bot resynchronise apres reconnexion/redemarrage serveur (statut: ${status}).`);
+        }
+
+        // Diffuse l'objet public a jour de chaque bot touche, pour que
+        // l'interface web reconstruise ses boutons sans attendre un futur
+        // evenement (section 7: "un bot reellement MONITORING doit
+        // reapparaitre comme MONITORING dans l'interface").
+        for (const botId of touchedBotIds) {
+          const latest = await getLatestCommandForBot(botId);
+          if (latest) {
+            onCommandChange(latest.agency_id, publicCommandFor(latest));
+          }
+        }
+
+        // Section 9: READY_FOR_COMMANDS seulement maintenant que la
+        // reconciliation est terminee.
+        const entry = connectedAgents.get(agentId);
+        if (entry) {
+          entry.ready = true;
+        }
+        const agent = await getAgentById(agentId);
+        if (agent) {
+          onStatusChange(agencyId, snapshotFromAgent(agent, config));
+        }
+      })().catch(logAsyncError("AGENT_RUNTIME_STATUS"));
+    });
+
+    // Lot 5 (section 14): inventaire public des extensions locales - jamais
+    // de chemin ni de raison detaillee (deja garanti cote agent), seulement
+    // id/configured/valid/version. Stocke en memoire (perdu a la
+    // deconnexion, comme le reste du registre connectedAgents).
+    socket.on("AGENT_EXTENSION_STATUS", (payload?: { extensions?: unknown }) => {
+      const entry = connectedAgents.get(agentId);
+      if (!entry) {
+        return;
+      }
+      const rawExtensions = Array.isArray(payload?.extensions) ? payload.extensions : [];
+      entry.extensions = rawExtensions
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+        .slice(0, 50)
+        .map((item) => ({
+          id: clampString(item.id, 100),
+          configured: item.configured === true,
+          valid: item.valid === true,
+          version: typeof item.version === "string" ? item.version.slice(0, 50) : null
+        }))
+        .filter((item) => item.id.length > 0);
+
+      void (async () => {
+        const agent = await getAgentById(agentId);
+        if (agent) {
+          onStatusChange(agencyId, snapshotFromAgent(agent, config));
+        }
+      })().catch(logAsyncError("AGENT_EXTENSION_STATUS"));
     });
 
     socket.on("disconnect", () => {

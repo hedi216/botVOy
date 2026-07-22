@@ -3,17 +3,21 @@ import path from "node:path";
 import { AgentRuntimeSettings } from "./types.js";
 import { getLogsDir } from "./agentStorage.js";
 
-export type AgentLogLevel = "info" | "warn" | "error" | "success";
+// "success" est une nuance positive d'info (deja utilisee partout dans
+// l'agent), pas un niveau de severite a part entiere: elle partage le rang
+// de filtrage d'"info" (cf. LOG_LEVEL_RANK). "debug" est ajoute pour la
+// configuration (AGENT_LOG_LEVEL=debug), meme si rien ne l'emet encore.
+export type AgentLogLevel = "debug" | "info" | "warn" | "error" | "success";
 export type AgentLogFn = (level: AgentLogLevel, message: string) => void;
-
-const MAX_LOG_FILE_BYTES = 5 * 1024 * 1024;
-const MAX_ROTATED_FILES = 5;
 
 // Meme liste de sous-chaines interdites que le serveur (agentGateway.ts), mais
 // tenue independamment ici: l'agent tourne sur le PC de l'agence, hors du
 // process serveur, et ne doit dependre d'aucun module cote serveur pour
-// garantir cette regle (defense en profondeur, cf. section 12).
-const FORBIDDEN_SUBSTRINGS = ["token", "secret", "password", "cookie", "code_hash", "codehash"];
+// garantir cette regle (defense en profondeur, cf. section 11/12).
+const FORBIDDEN_SUBSTRINGS = [
+  "token", "secret", "password", "cookie", "code_hash", "codehash",
+  "authorization", "set-cookie", "profilepath", "debugport", "apikey", "api_key"
+];
 
 export const redactForLog = (value: unknown, depth = 0): unknown => {
   if (depth > 4 || value === null || typeof value !== "object") {
@@ -33,16 +37,57 @@ export const redactForLog = (value: unknown, depth = 0): unknown => {
   return result;
 };
 
-const rotateIfNeeded = (filePath: string): void => {
-  if (!existsSync(filePath) || statSync(filePath).size < MAX_LOG_FILE_BYTES) {
+// Section 11: fonction UNIQUE de redaction appliquee a toute ligne de log
+// texte (locale ou destinee au serveur) avant ecriture/emission - en plus de
+// redactForLog (structures), pour les cas ou un secret finirait dans une
+// simple chaine de caracteres (ex. message d'erreur Playwright qui
+// recopierait une URL avec parametres, ou un mot cle sensible glisse dans un
+// texte libre). Jamais de contenu HTML complet ni d'URL avec query string.
+const SENSITIVE_TEXT_PATTERNS: Array<[RegExp, string]> = [
+  [/\b[A-Za-z0-9_-]*token[A-Za-z0-9_-]*\s*[:=]\s*\S+/gi, "token=[redacted]"],
+  [/\b[A-Za-z0-9_-]*password[A-Za-z0-9_-]*\s*[:=]\s*\S+/gi, "password=[redacted]"],
+  // .+ (pas \S+): "Authorization: Bearer <token>" a une valeur sur plusieurs
+  // mots, \S+ ne masquerait que "Bearer" et laisserait le token en clair.
+  [/\bAuthorization\s*:\s*.+/gi, "Authorization: [redacted]"],
+  [/\bSet-Cookie\s*:\s*\S+/gi, "Set-Cookie: [redacted]"],
+  [/\bcookie\s*[:=]\s*\S+/gi, "cookie=[redacted]"],
+  // Exige une paire ouvrante/fermante correspondante (ex: <body>...</body>):
+  // un simple texte a chevrons ("pair <CODE_APPARIEMENT>", present dans nos
+  // propres messages d'usage) n'a jamais de fermeture correspondante et ne
+  // doit donc jamais etre pris pour du HTML a supprimer.
+  [/<([a-z][a-z0-9]*)\b[^<>]*>[\s\S]*?<\/\1>/gi, "[html omis]"],
+  // URL avec query string: conserve origine + chemin, masque les parametres.
+  [/(https?:\/\/[^\s?]+)\?[^\s]*/gi, "$1?[redacted]"]
+];
+
+export const redactLogLine = (line: string): string =>
+  SENSITIVE_TEXT_PATTERNS.reduce((current, [pattern, replacement]) => current.replace(pattern, replacement), line);
+
+const LOG_LEVEL_RANK: Record<AgentLogLevel, number> = {
+  debug: 0,
+  info: 1,
+  success: 1,
+  warn: 2,
+  error: 3
+};
+
+const CONFIG_LEVEL_RANK: Record<AgentRuntimeSettings["logLevel"], number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3
+};
+
+const rotateIfNeeded = (filePath: string, maxBytes: number, maxFiles: number): void => {
+  if (!existsSync(filePath) || statSync(filePath).size < maxBytes) {
     return;
   }
 
-  const oldest = `${filePath}.${MAX_ROTATED_FILES}`;
+  const oldest = `${filePath}.${maxFiles}`;
   if (existsSync(oldest)) {
     unlinkSync(oldest);
   }
-  for (let index = MAX_ROTATED_FILES - 1; index >= 1; index -= 1) {
+  for (let index = maxFiles - 1; index >= 1; index -= 1) {
     const from = `${filePath}.${index}`;
     if (existsSync(from)) {
       renameSync(from, `${filePath}.${index + 1}`);
@@ -51,11 +96,24 @@ const rotateIfNeeded = (filePath: string): void => {
   renameSync(filePath, `${filePath}.1`);
 };
 
+// Section 10: jamais de crash de l'agent a cause du logger - toute erreur
+// disque (disque plein, dossier inaccessible, permission refusee) reste
+// locale a cette fonction, jamais propagee. Section 11: chaque ligne passe
+// par redactLogLine avant d'etre ecrite (defense en profondeur en plus des
+// appelants qui evitent deja d'inclure des secrets dans leurs messages).
 export const createAgentLogger = (settings: AgentRuntimeSettings): AgentLogFn => {
   const filePath = path.join(getLogsDir(settings), "agent.log");
+  const maxBytes = Math.max(1, settings.logMaxFileSizeMb) * 1024 * 1024;
+  const maxFiles = Math.max(1, settings.logMaxFiles);
+  const minRank = CONFIG_LEVEL_RANK[settings.logLevel];
 
   return (level, message) => {
-    const line = `[${new Date().toISOString()}] [${level.toUpperCase()}] ${message}`;
+    if (LOG_LEVEL_RANK[level] < minRank) {
+      return;
+    }
+
+    const safeMessage = redactLogLine(message);
+    const line = `[${new Date().toISOString()}] [${level.toUpperCase()}] ${safeMessage}`;
 
     if (level === "error") {
       console.error(line);
@@ -64,8 +122,8 @@ export const createAgentLogger = (settings: AgentRuntimeSettings): AgentLogFn =>
     }
 
     try {
-      rotateIfNeeded(filePath);
-      appendFileSync(filePath, `${line}\n`);
+      rotateIfNeeded(filePath, maxBytes, maxFiles);
+      appendFileSync(filePath, `${line}\n`, "utf8");
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       console.error(`[agentLocalLogger] Ecriture du log local impossible: ${detail}`);

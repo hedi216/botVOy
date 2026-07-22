@@ -151,6 +151,9 @@ const pairFakeAgent = async (baseUrl: string, managerCookie: string, computerNam
     socket.on("AGENT_CONNECTED", (payload: { agentId: number; token: string | null }) => {
       clearTimeout(t);
       if (!payload.token) { reject(new Error("Aucun jeton.")); return; }
+      // Lot 5: sans AGENT_RUNTIME_STATUS, l'agent reste READY_FOR_COMMANDS=
+      // false et le serveur refuse de dispatcher START_BOT (AGENT_SYNCING).
+      socket.emit("AGENT_RUNTIME_STATUS", { sentAt: new Date().toISOString(), bots: [] });
       resolve({ agentId: payload.agentId, token: payload.token, socket });
     });
     socket.connect();
@@ -207,7 +210,11 @@ const runStressScenario = async (baseUrl: string, managerCookie: string, iterati
     });
     const t = setTimeout(() => reject(new Error("timeout agent")), 8_000);
     s.on("connect_error", (e: Error) => { clearTimeout(t); reject(e); });
-    s.on("AGENT_CONNECTED", () => { clearTimeout(t); resolve(s); });
+    s.on("AGENT_CONNECTED", () => {
+      clearTimeout(t);
+      s.emit("AGENT_RUNTIME_STATUS", { sentAt: new Date().toISOString(), bots: [] });
+      resolve(s);
+    });
     s.connect();
   });
 

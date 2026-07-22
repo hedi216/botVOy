@@ -184,6 +184,60 @@ export const getCommandForAgency = async (agencyId: number, commandId: string): 
   return result.rows[0] ?? null;
 };
 
+// Lot 5 (section 7): utilisee uniquement pour re-diffuser l'objet public a
+// jour d'un bot apres reconciliation AGENT_RUNTIME_STATUS - jamais pour une
+// verification d'autorisation (celle-ci reste toujours basee sur
+// agent_id/agency_id verifies separement).
+export const getLatestCommandForBot = async (botId: string): Promise<DbAgentCommand | null> => {
+  const result = await pool.query<DbAgentCommand>(
+    "SELECT * FROM agent_commands WHERE bot_id = $1 ORDER BY created_at DESC LIMIT 1",
+    [botId]
+  );
+  return result.rows[0] ?? null;
+};
+
+export type BotOwnershipHistory = {
+  agencyId: number;
+  ownerUserId: number;
+  botName: string;
+  category: string;
+  // Vrai si un STOP_BOT a deja ete complete pour ce botId: un botId n'est
+  // jamais reutilise (generateBotId() genere un identifiant frais a chaque
+  // START_BOT), donc "deja arrete un jour" signifie "arrete pour toujours".
+  everStopped: boolean;
+};
+
+// Seule source durable pour reconstruire un bot apres un redemarrage serveur
+// (agentBots en memoire perdu) ou une premiere resynchronisation d'agent
+// (section 7): n'utilise QUE des colonnes deja persistees (agency_id/
+// agent_id/created_by_user_id) et le public_payload deja public du
+// START_BOT (botName/category) - jamais un champ fourni par l'agent
+// lui-meme pour ces informations d'appartenance.
+export const getBotOwnershipHistory = async (botId: string, agentId: number): Promise<BotOwnershipHistory | null> => {
+  const result = await pool.query<DbAgentCommand>(
+    "SELECT * FROM agent_commands WHERE bot_id = $1 AND agent_id = $2 ORDER BY created_at ASC",
+    [botId, agentId]
+  );
+  const rows = result.rows;
+  const startRow = rows.find((row) => row.command_type === "START_BOT");
+  if (!startRow) {
+    return null;
+  }
+
+  const payload = (startRow.public_payload && typeof startRow.public_payload === "object")
+    ? startRow.public_payload as Record<string, unknown>
+    : {};
+  const everStopped = rows.some((row) => row.command_type === "STOP_BOT" && row.status === "completed");
+
+  return {
+    agencyId: startRow.agency_id,
+    ownerUserId: startRow.created_by_user_id,
+    botName: typeof payload.botName === "string" ? payload.botName : "Bot",
+    category: typeof payload.category === "string" ? payload.category : "",
+    everStopped
+  };
+};
+
 export type ListAgentCommandsFilters = {
   agentId?: number;
   botId?: string;

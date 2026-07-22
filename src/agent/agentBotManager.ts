@@ -1,4 +1,6 @@
 import { closeBrowserWithTimeout, killChromeProcess, launchChromeForBot } from "./agentBrowserManager.js";
+import { loadExtensionConfig, validateExtensions } from "./agentExtensionConfig.js";
+import { getConfigDir } from "./agentStorage.js";
 import { findAppointmentPage, maskUrlForLog } from "./agentPageDetector.js";
 import { acquireProfileLock, ProfileLease } from "./agentProfileManager.js";
 import { AgentCommandError, toAgentCommandError } from "./agentErrors.js";
@@ -6,7 +8,7 @@ import { AgentEventReporter } from "./agentEventReporter.js";
 import { AgentLogFn } from "./agentLocalLogger.js";
 import { validateMonitoringSettings } from "./agentMonitoringSettings.js";
 import { startMonitoring } from "./agentMonitoringRuntime.js";
-import { AgentBotHandle, AgentRuntimeSettings } from "./types.js";
+import { AgentBotHandle, AgentRuntimeSettings, RuntimeStatusBotSnapshot } from "./types.js";
 
 // Delai maximum laisse a la boucle de surveillance pour repondre a
 // l'annulation avant de fermer Chrome de force (section 11 du cahier des
@@ -68,6 +70,20 @@ export class AgentBotManager {
     return this.bots.has(botId);
   }
 
+  // Lot 5 (section 6): snapshot public envoye via AGENT_RUNTIME_STATUS a
+  // chaque connexion/reconnexion. Jamais profilePath/debugPort/PID/objets
+  // Playwright: uniquement des champs deja publics ailleurs (BOT_STATUS).
+  snapshotForRuntimeStatus(): RuntimeStatusBotSnapshot[] {
+    return [...this.bots.values()].map((handle) => ({
+      botId: handle.botId,
+      status: handle.currentStatus,
+      startedAt: handle.startedAt,
+      lastActivityAt: handle.lastActivityAt,
+      monitoringActive: handle.monitoringRuntime !== null,
+      browserOpen: !handle.browserProcess.killed && handle.browserProcess.exitCode === null
+    }));
+  }
+
   async startBot(params: StartBotParams): Promise<void> {
     const { commandId, botId } = params;
     const settingsSnapshot = validateMonitoringSettings(params.rawMonitoringSettings, this.log);
@@ -95,10 +111,23 @@ export class AgentBotManager {
 
     let lease: ProfileLease | undefined;
     try {
+      // Section 13: extensions locales validees AVANT tout lancement de
+      // Chrome - une extension "required" absente/invalide doit refuser
+      // START_BOT sans jamais ouvrir Chrome, une extension optionnelle
+      // manquante ne fait que logger un avertissement local assaini.
+      const extensionEntries = loadExtensionConfig(getConfigDir(this.settings), this.log);
+      const extensionResults = validateExtensions(extensionEntries, this.log);
+      const missingRequired = extensionResults.find((result) => result.required && result.status !== "ok");
+      if (missingRequired) {
+        const code = missingRequired.status === "not_found" ? "EXTENSION_NOT_FOUND" : "EXTENSION_INVALID";
+        throw new AgentCommandError(code, `Extension obligatoire "${missingRequired.id}" ${missingRequired.status === "not_found" ? "introuvable" : "invalide"} (${missingRequired.reason ?? "raison inconnue"}).`);
+      }
+      const extensionDirs = extensionResults.filter((result) => result.status === "ok").map((result) => result.localPath);
+
       lease = acquireProfileLock(this.settings, botId);
       this.leases.set(botId, lease);
 
-      const chrome = await launchChromeForBot(lease.profilePath, this.settings.targetUrl);
+      const chrome = await launchChromeForBot(lease.profilePath, this.settings.targetUrl, extensionDirs);
 
       const handle: AgentBotHandle = {
         botId,
@@ -324,7 +353,9 @@ export class AgentBotManager {
       PAGE_NOT_READY: "La page de rendez-vous n'est pas prete.",
       PAGE_CLOSED: "L'onglet du bot a ete ferme.",
       VALIDATION_ALREADY_RUNNING: "Une verification de page est deja en cours pour ce bot.",
-      REFRESH_FAILED: "Le rafraichissement de la page a echoue de maniere repetee."
+      REFRESH_FAILED: "Le rafraichissement de la page a echoue de maniere repetee.",
+      EXTENSION_NOT_FOUND: "Une extension Chrome obligatoire est introuvable sur cet ordinateur.",
+      EXTENSION_INVALID: "Une extension Chrome obligatoire est invalide sur cet ordinateur."
     };
     return messages[error.code] ?? "Erreur interne de l'agent.";
   }

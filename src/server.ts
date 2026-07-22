@@ -52,6 +52,7 @@ import {
   disconnectAgentSocket,
   getConnectedAgentSocket,
   getSnapshotForAgent,
+  isAgentReadyForCommands,
   registerAgentNamespace
 } from "./agentGateway.js";
 import {
@@ -812,12 +813,16 @@ const emitBotLogFromAgent = (
 
 type AgentSelectionResult =
   | { ok: true; agentId: number }
-  | { ok: false; code: "AGENT_NOT_CONNECTED" | "AGENT_VERSION_INCOMPATIBLE" | "AGENT_SELECTION_REQUIRED"; agents?: AgentSnapshot[] };
+  | { ok: false; code: "AGENT_NOT_CONNECTED" | "AGENT_VERSION_INCOMPATIBLE" | "AGENT_SELECTION_REQUIRED" | "AGENT_SYNCING"; agents?: AgentSnapshot[] };
 
 const AGENT_SELECTION_ERROR_MESSAGES: Record<string, string> = {
   AGENT_NOT_CONNECTED: "Aucun agent local autorise n'est actuellement connecte.",
   AGENT_VERSION_INCOMPATIBLE: "La version de RendezBot Agent doit etre mise a jour avant de lancer un bot.",
-  AGENT_SELECTION_REQUIRED: "Plusieurs ordinateurs sont connectes: selectionnez celui qui doit executer ce bot."
+  AGENT_SELECTION_REQUIRED: "Plusieurs ordinateurs sont connectes: selectionnez celui qui doit executer ce bot.",
+  // Lot 5 (section 9): agent techniquement connecte mais reconciliation
+  // (AGENT_RUNTIME_STATUS) pas encore terminee - jamais de commande envoyee
+  // avant READY_FOR_COMMANDS.
+  AGENT_SYNCING: "Agent connecte - synchronisation en cours. Reessayez dans un instant."
 };
 
 // Section 6: choisit l'agent qui recevra la commande. Ne revele jamais qu'un
@@ -840,15 +845,23 @@ const selectAgentForCommand = async (agencyId: number, requestedAgentId?: number
     if (requested.status !== "CONNECTED") {
       return { ok: false, code: "AGENT_NOT_CONNECTED" };
     }
+    if (!requested.readyForCommands) {
+      return { ok: false, code: "AGENT_SYNCING" };
+    }
     return { ok: true, agentId: requested.agentId };
   }
 
   const connected = snapshots.filter((snapshot) => snapshot.status === "CONNECTED");
-  if (connected.length === 1) {
-    return { ok: true, agentId: connected[0].agentId };
+  const ready = connected.filter((snapshot) => snapshot.readyForCommands);
+  if (ready.length === 1) {
+    return { ok: true, agentId: ready[0].agentId };
   }
-  if (connected.length > 1) {
+  if (ready.length > 1) {
     return { ok: false, code: "AGENT_SELECTION_REQUIRED", agents: snapshots };
+  }
+  if (connected.length > 0) {
+    // Au moins un agent connecte, mais aucun encore READY_FOR_COMMANDS.
+    return { ok: false, code: "AGENT_SYNCING" };
   }
 
   if (snapshots.some((snapshot) => snapshot.status === "VERSION_INCOMPATIBLE")) {
@@ -923,7 +936,8 @@ const dispatchOwnedAgentCommand = async (
 const VALIDATE_BOT_ERROR_MESSAGES: Record<string, string> = {
   BOT_NOT_RUNNING: "Ce bot n'est plus actif.",
   AGENT_NOT_CONNECTED: "L'agent proprietaire de ce bot n'est plus connecte.",
-  INVALID_BOT_STATE: "Ce bot n'est pas dans un etat permettant la validation."
+  INVALID_BOT_STATE: "Ce bot n'est pas dans un etat permettant la validation.",
+  AGENT_SYNCING: "Agent connecte - synchronisation en cours. Reessayez dans un instant."
 };
 
 const dispatchValidateBotCommand = async (
@@ -957,6 +971,12 @@ const dispatchValidateBotCommand = async (
   if (!getConnectedAgentSocket(bot.agentId)) {
     socket.emit("bot-status", { botId, status: "error", code: "AGENT_NOT_CONNECTED" });
     emitOwnedLog(socket, owner, makeEvent("error", VALIDATE_BOT_ERROR_MESSAGES.AGENT_NOT_CONNECTED));
+    return;
+  }
+
+  if (!isAgentReadyForCommands(bot.agentId)) {
+    socket.emit("bot-status", { botId, status: "error", code: "AGENT_SYNCING" });
+    emitOwnedLog(socket, owner, makeEvent("error", VALIDATE_BOT_ERROR_MESSAGES.AGENT_SYNCING));
     return;
   }
 

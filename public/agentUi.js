@@ -404,7 +404,7 @@
     if (error && agents.length === 0) {
       const row = document.createElement("tr");
       const cell = document.createElement("td");
-      cell.colSpan = 8;
+      cell.colSpan = 9;
       cell.textContent = `Impossible de charger les agents: ${error}`;
       row.append(cell);
       agentEls.agentTableBody.append(row);
@@ -414,7 +414,7 @@
     if (agents.length === 0) {
       const row = document.createElement("tr");
       const cell = document.createElement("td");
-      cell.colSpan = 8;
+      cell.colSpan = 9;
       cell.textContent = "Aucun ordinateur associe a cette agence.";
       row.append(cell);
       agentEls.agentTableBody.append(row);
@@ -428,12 +428,31 @@
       APP.addCell(row, agent.version || "-");
 
       const statusCell = document.createElement("td");
-      statusCell.append(APP.makeBadge(BADGE_LABEL[agent.status] || agent.status, BADGE_CLASS[agent.status] || "grey"));
+      // Lot 5 (section 9): nuance "synchronisation en cours" sans introduire
+      // un nouveau statut CONNECTED/OFFLINE - un agent CONNECTED mais pas
+      // encore readyForCommands vient de se (re)connecter et termine sa
+      // reconciliation (generalement quelques centaines de ms).
+      const showSyncing = agent.status === "CONNECTED" && agent.readyForCommands === false;
+      statusCell.append(showSyncing
+        ? APP.makeBadge("Synchronisation...", "amber")
+        : APP.makeBadge(BADGE_LABEL[agent.status] || agent.status, BADGE_CLASS[agent.status] || "grey"));
       row.append(statusCell);
 
       APP.addCell(row, APP.formatDate(agent.lastSeenAt));
       APP.addCell(row, APP.formatDate(agent.pairedAt));
       APP.addCell(row, String(agent.activeBotCount));
+
+      const extensionsCell = document.createElement("td");
+      const extensions = Array.isArray(agent.extensions) ? agent.extensions : [];
+      if (extensions.length === 0) {
+        extensionsCell.textContent = "-";
+      } else {
+        const validCount = extensions.filter((extension) => extension.valid).length;
+        const badgeClass = validCount === extensions.length ? "green" : "amber";
+        extensionsCell.append(APP.makeBadge(`${validCount}/${extensions.length} OK`, badgeClass));
+        extensionsCell.title = extensions.map((extension) => `${extension.id}: ${extension.valid ? "valide" : extension.configured ? "invalide" : "non configuree"}`).join(", ");
+      }
+      row.append(extensionsCell);
 
       const actions = document.createElement("td");
       actions.className = "action-cell";

@@ -117,6 +117,9 @@ const run = async (): Promise<void> => {
   socket.on("AGENT_CONNECTED", (payload: { heartbeatIntervalMs: number }) => {
     log("AGENT_CONNECTED", `heartbeatIntervalMs=${payload.heartbeatIntervalMs}`);
     setInterval(() => socket.emit("AGENT_HEARTBEAT", { version: credentials.version, activeBotCount: 0 }), payload.heartbeatIntervalMs);
+    // Lot 5: sans AGENT_RUNTIME_STATUS, l'agent reste READY_FOR_COMMANDS=false
+    // et le serveur refuse de dispatcher toute nouvelle commande (AGENT_SYNCING).
+    socket.emit("AGENT_RUNTIME_STATUS", { sentAt: new Date().toISOString(), bots: [] });
   });
 
   socket.on("AGENT_COMMAND", (command: AgentCommandPayload) => {
