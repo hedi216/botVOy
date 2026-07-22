@@ -1095,6 +1095,8 @@ io.on("connection", (socket) => {
           category,
           latestCommandId: "",
           botStatus: null,
+          botStatusUpdatedAt: null,
+          active: true,
           updatedAt: new Date().toISOString()
         });
 

@@ -24,6 +24,15 @@ export type PublicAgentCommand = {
   type: AgentCommandType;
   status: string;
   botStatus: string | null;
+  // Horodatage du DERNIER BOT_STATUS reellement applique, distinct de
+  // command.updatedAt (qui ne concerne que le cycle de vie de LA commande).
+  // Necessaire cote frontend pour comparer independamment la fraicheur du
+  // statut runtime et ne jamais le faire regresser (cf. agentUi.js mergeCommand).
+  botStatusUpdatedAt: string | null;
+  // false une fois que le bot a atteint STOPPED/ERROR (ou n'a jamais existe):
+  // permet au frontend de distinguer "aucune information runtime" de
+  // "runtime explicitement termine", meme longtemps apres COMPLETED.
+  botActive: boolean;
   errorCode: string | null;
   message: string | null;
   createdAt: string;
@@ -59,6 +68,8 @@ export const toPublicAgentCommand = (row: DbAgentCommand): PublicAgentCommand =>
     type: row.command_type,
     status: toPublicStatus(row.status),
     botStatus: bot?.botStatus ?? null,
+    botStatusUpdatedAt: bot?.botStatusUpdatedAt ?? null,
+    botActive: bot?.active ?? false,
     errorCode: row.error_code,
     message: row.error_message,
     createdAt: row.created_at,
@@ -102,6 +113,12 @@ export const isValidBotStatus = (value: unknown): value is BotStatusValue =>
 // (server.ts, Map en memoire), perdu au redemarrage sans regression par
 // rapport a l'existant. --------
 
+// Source d'autorite explicite pour le dernier etat runtime connu d'un bot
+// (botStatus/botStatusUpdatedAt/owningAgentId via agentId/active). Reste en
+// memoire pour la Phase 4 (perdu au redemarrage serveur, meme principe deja
+// accepte pour les sessions legacy_vm), mais toute lecture publique
+// (toPublicAgentCommand, donc GET /api/agent-commands ET chaque diffusion
+// temps reel) le consulte fraichement a chaque appel: aucune copie figee.
 export type AgentBotRecord = {
   botId: string;
   agentId: number;
@@ -111,6 +128,8 @@ export type AgentBotRecord = {
   category: string;
   latestCommandId: string;
   botStatus: BotStatusValue | null;
+  botStatusUpdatedAt: string | null;
+  active: boolean;
   updatedAt: string;
 };
 
@@ -132,8 +151,11 @@ export const updateAgentBotStatus = (botId: string, status: BotStatusValue): Age
   if (!bot) {
     return undefined;
   }
+  const now = new Date().toISOString();
   bot.botStatus = status;
-  bot.updatedAt = new Date().toISOString();
+  bot.botStatusUpdatedAt = now;
+  bot.updatedAt = now;
+  bot.active = status !== "STOPPED" && status !== "ERROR";
   return bot;
 };
 

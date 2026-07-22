@@ -527,28 +527,34 @@
   // commandId -> derniere commande publique connue pour un botId donne.
   const agentCommands = new Map();
 
+  // Statuts runtime "actifs": le bot local existe encore et fonctionne.
+  // Un botStatus dans cet ensemble prime TOUJOURS sur le statut de la
+  // commande pour le message affiche (AFFICHAGE, cahier des charges): une
+  // commande START_BOT COMPLETED ne dit rien sur l'etat du bot lui-meme, et
+  // ne doit jamais afficher "Commande terminee par l'agent" tant que le bot
+  // est encore actif.
+  const ACTIVE_BOT_STATUS_MESSAGE = {
+    STARTING: "Demarrage en attente du moteur local",
+    WAITING_FOR_USER: "En attente de l'utilisateur",
+    MONITORING: "Surveillance en cours (agent)",
+    RATE_LIMITED: "Ralenti (rate limit) par l'agent",
+    SLOT_DETECTED: "Creneau detecte par l'agent",
+    STOPPING: "Arret en cours (agent)"
+  };
+
   // Traduit le couple (statut de commande, statut de bot remonte par
   // l'agent) dans les messages utilisateur exiges par la section 12. La page
   // ne doit jamais laisser entendre que Chrome est lance tant que l'agent ne
   // l'a pas confirme via BOT_STATUS.
   const commandStatusMessage = (command) => {
+    if (ACTIVE_BOT_STATUS_MESSAGE[command.botStatus]) {
+      return ACTIVE_BOT_STATUS_MESSAGE[command.botStatus];
+    }
     if (command.status === "PENDING" || command.status === "SENT") {
       return "Envoi de la commande...";
     }
     if (command.status === "ACKNOWLEDGED") {
-      if (command.botStatus === "STARTING" || command.botStatus === "WAITING_FOR_USER") {
-        return "Demarrage en attente du moteur local";
-      }
-      if (command.botStatus === "MONITORING") {
-        return "Surveillance en cours (agent)";
-      }
-      if (command.botStatus === "RATE_LIMITED") {
-        return "Ralenti (rate limit) par l'agent";
-      }
-      if (command.botStatus === "SLOT_DETECTED") {
-        return "Creneau detecte par l'agent";
-      }
-      if (command.botStatus === "STOPPING" || command.botStatus === "STOPPED") {
+      if (command.botStatus === "STOPPED") {
         return "Arret en cours (agent)";
       }
       return "Commande recue par l'agent";
@@ -656,8 +662,41 @@
     }
   };
 
+  // Fusionne un objet commande deja connu avec un nouvel objet recu (socket
+  // temps reel OU reponse REST), plutot que de remplacer aveuglement.
+  //
+  // Deux familles de champs, comparees INDEPENDAMMENT l'une de l'autre:
+  // - champs "commande" (status/errorCode/message/updatedAt...): adoptes
+  //   seulement si l'entrant est reellement plus recent (command.updatedAt).
+  //   Protege un refresh REST contre l'ecrasement d'une mise a jour socket
+  //   plus fraiche arrivee entre-temps.
+  // - champs "runtime" (botStatus/botStatusUpdatedAt): compares sur LEUR
+  //   PROPRE horodatage (botStatusUpdatedAt), jamais sur celui de la
+  //   commande. C'est la garantie centrale demandee: un COMMAND_COMPLETED
+  //   sans botStatus recent (ou racine du bug corrige: arrivant avant qu'un
+  //   BOT_STATUS plus recent n'ait ete traite serveur) ne doit JAMAIS
+  //   effacer un WAITING_FOR_USER deja connu et pas plus vieux.
+  const mergeCommand = (existing, incoming) => {
+    if (!existing) {
+      return incoming;
+    }
+
+    const useIncomingCommandFields = existing.updatedAt <= incoming.updatedAt;
+    const base = useIncomingCommandFields ? incoming : existing;
+
+    const incomingRuntimeIsFresher = incoming.botStatus != null
+      && (!existing.botStatusUpdatedAt || !incoming.botStatusUpdatedAt || existing.botStatusUpdatedAt <= incoming.botStatusUpdatedAt);
+
+    return {
+      ...base,
+      botStatus: incomingRuntimeIsFresher ? incoming.botStatus : existing.botStatus,
+      botStatusUpdatedAt: incomingRuntimeIsFresher ? incoming.botStatusUpdatedAt : existing.botStatusUpdatedAt,
+      botActive: incomingRuntimeIsFresher ? incoming.botActive : existing.botActive
+    };
+  };
+
   const applyCommandUpdate = (command) => {
-    agentCommands.set(command.botId, command);
+    agentCommands.set(command.botId, mergeCommand(agentCommands.get(command.botId), command));
     if (APP.state.page === "bot") {
       renderAgentCommandsPanel();
     }
@@ -670,14 +709,8 @@
   // perime (section 17). Le serveur (registre en memoire agentBots, cf.
   // agentCommandService.ts) reste la source de verite: cette requete ne fait
   // que reconstruire l'etat deja tenu a jour cote serveur, ce n'est jamais un
-  // etat invente cote navigateur.
-  //
-  // Compare par updatedAt plutot que "seulement si absent": lors d'une
-  // reconnexion, la Map locale n'est pas vide et peut contenir des entrees
-  // perimees (BOT_STATUS recus pendant que le socket etait deconnecte et donc
-  // jamais livres). Ne remplace une entree que si la version serveur est
-  // reellement plus recente, pour ne jamais ecraser une mise a jour
-  // temps-reel plus fraiche arrivee pendant que cette requete etait en vol.
+  // etat invente cote navigateur. Meme fusion que applyCommandUpdate: un
+  // refresh REST ne doit jamais faire regresser un botStatus deja connu.
   const refreshAgentCommandsFromServer = async () => {
     if (!clientConfig?.agentUiEnabled) {
       return;
@@ -685,10 +718,7 @@
     try {
       const { commands } = await APP.requestJson("/api/agent-commands?limit=20");
       for (const command of commands) {
-        const existing = agentCommands.get(command.botId);
-        if (!existing || existing.updatedAt < command.updatedAt) {
-          agentCommands.set(command.botId, command);
-        }
+        agentCommands.set(command.botId, mergeCommand(agentCommands.get(command.botId), command));
       }
     } catch {
       // Best-effort: l'absence de rechargement ne doit pas bloquer la page.

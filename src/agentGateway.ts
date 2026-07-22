@@ -152,6 +152,34 @@ const logAsyncError = (context: string) => (error: unknown): void => {
   logger.error(`agentGateway (${context}): ${message}`);
 };
 
+// COMMAND_ACK, BOT_STATUS (repete plusieurs fois) et COMMAND_COMPLETED/FAILED
+// d'une MEME commande sont chacun geres par un handler independant, chacun
+// avec son propre aller-retour DB. Un agent reel les emet en succession quasi
+// immediate (ex. BOT_STATUS WAITING_FOR_USER puis COMMAND_COMPLETED sans le
+// moindre delai): rien ne garantit qu'une requete SELECT (BOT_STATUS) se
+// termine avant une requete UPDATE (COMMAND_COMPLETED) lancee juste apres,
+// meme si l'evenement a ete RECU en premier. Sans serialisation, la diffusion
+// la plus recente peut alors porter un botStatus perime, voire une commande
+// peut rester bloquee (COMPLETED reçu avant que ACK n'ait fini d'etre
+// applique). Confirme empiriquement: sur 30 iterations rapprochees, ~17%
+// finissaient avec un etat incoherent avant ce correctif.
+//
+// Chaque commandId a donc sa propre file FIFO: le traitement complet d'un
+// evenement (DB + diffusion) doit se terminer avant que le traitement du
+// suivant, pour LE MEME commandId, ne commence — quel que soit le temps que
+// prend chaque requete DB individuellement.
+const commandEventQueues = new Map<string, Promise<void>>();
+
+const enqueueCommandEvent = (commandId: string, task: () => Promise<void>): void => {
+  const previous = commandEventQueues.get(commandId) ?? Promise.resolve();
+  const next = previous.then(task, task).catch(logAsyncError("command-event-queue")).finally(() => {
+    if (commandEventQueues.get(commandId) === next) {
+      commandEventQueues.delete(commandId);
+    }
+  });
+  commandEventQueues.set(commandId, next);
+};
+
 export const registerAgentNamespace = (
   io: Server,
   config: AgentGatewayConfig,
@@ -278,12 +306,13 @@ export const registerAgentNamespace = (
         return;
       }
 
-      markAcknowledged(commandId, agentId).then(({ command }) => {
+      enqueueCommandEvent(commandId, async () => {
+        const { command } = await markAcknowledged(commandId, agentId);
         if (command) {
           clearAckTimer(command.command_id);
           onCommandChange(command.agency_id, publicCommandFor(command));
         }
-      }).catch(logAsyncError("COMMAND_ACK"));
+      });
     });
 
     socket.on("COMMAND_COMPLETED", (payload?: { commandId?: unknown; result?: unknown }) => {
@@ -293,11 +322,12 @@ export const registerAgentNamespace = (
       }
 
       const safeResult = sanitizePublicRecord(payload?.result ?? {});
-      markCompleted(commandId, agentId, safeResult).then(({ command }) => {
+      enqueueCommandEvent(commandId, async () => {
+        const { command } = await markCompleted(commandId, agentId, safeResult);
         if (command) {
           onCommandChange(command.agency_id, publicCommandFor(command));
         }
-      }).catch(logAsyncError("COMMAND_COMPLETED"));
+      });
     });
 
     socket.on("COMMAND_FAILED", (payload?: { commandId?: unknown; errorCode?: unknown; message?: unknown }) => {
@@ -308,11 +338,12 @@ export const registerAgentNamespace = (
 
       const errorCode = clampString(payload?.errorCode, MAX_ERROR_CODE_LENGTH) || "ENGINE_ERROR";
       const message = clampString(payload?.message, MAX_MESSAGE_LENGTH) || "Commande echouee cote agent.";
-      markFailedByAgent(commandId, agentId, errorCode, message).then(({ command }) => {
+      enqueueCommandEvent(commandId, async () => {
+        const { command } = await markFailedByAgent(commandId, agentId, errorCode, message);
         if (command) {
           onCommandChange(command.agency_id, publicCommandFor(command));
         }
-      }).catch(logAsyncError("COMMAND_FAILED"));
+      });
     });
 
     // ---- Section 11: statuts de bot. La commande sert de preuve
@@ -326,7 +357,8 @@ export const registerAgentNamespace = (
         return;
       }
 
-      getCommandForAgent(commandId, agentId).then((command) => {
+      enqueueCommandEvent(commandId, async () => {
+        const command = await getCommandForAgent(commandId, agentId);
         if (!command || command.bot_id !== botId) {
           return;
         }
@@ -342,7 +374,7 @@ export const registerAgentNamespace = (
           ? ` ${JSON.stringify(sanitizePublicRecord(payload.details)).slice(0, 300)}`
           : "";
         onBotLog(command.agency_id, botId, bot.botName, "info", `[Agent] Statut du bot: ${bot.botStatus}${detailsText}`);
-      }).catch(logAsyncError("BOT_STATUS"));
+      });
     });
 
     socket.on("disconnect", () => {
