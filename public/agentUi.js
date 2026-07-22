@@ -574,8 +574,31 @@
     return command.status;
   };
 
-  const isCommandTerminal = (command) =>
-    ["COMPLETED", "FAILED", "EXPIRED", "CANCELLED"].includes(command.status);
+  // Le statut de la commande START_BOT/STOP_BOT (PENDING/SENT/ACKNOWLEDGED/
+  // COMPLETED/FAILED/...) et le statut metier du bot local remonte par
+  // l'agent (botStatus: STARTING/WAITING_FOR_USER/MONITORING/.../STOPPED)
+  // sont DEUX choses distinctes: START_BOT passe a COMPLETED des que Chrome
+  // est ouvert, alors que le bot reste actif (WAITING_FOR_USER) bien apres.
+  // Les actions (Valider/Arreter) ne doivent donc jamais se baser sur le
+  // statut de commande, uniquement sur ce statut runtime.
+  //
+  // STARTING est volontairement exclu: au Lot 2, AgentBotManager n'enregistre
+  // le bot dans son registre qu'une fois Chrome effectivement ouvert (juste
+  // avant WAITING_FOR_USER) — un STOP_BOT recu pendant la toute breve fenetre
+  // STARTING ne trouverait donc pas encore le bot. Aucune action n'est donc
+  // proposee pendant cette fenetre precise (cf. exigence Lot 2 point 3).
+  const STOPPABLE_RUNTIME_STATUSES = new Set(["WAITING_FOR_USER", "MONITORING", "RATE_LIMITED", "SLOT_DETECTED"]);
+
+  const RUNTIME_BADGE = {
+    STARTING: { label: "Demarrage", cls: "amber" },
+    WAITING_FOR_USER: { label: "Attente utilisateur", cls: "blue" },
+    MONITORING: { label: "Surveillance", cls: "green" },
+    RATE_LIMITED: { label: "Ralenti", cls: "amber" },
+    SLOT_DETECTED: { label: "Creneau detecte", cls: "green" },
+    STOPPING: { label: "Arret en cours", cls: "amber" },
+    STOPPED: { label: "Arrete", cls: "grey" },
+    ERROR: { label: "Erreur", cls: "red" }
+  };
 
   const renderAgentCommandsPanel = () => {
     if (!agentEls.commandsPanel) {
@@ -590,29 +613,34 @@
       const row = document.createElement("tr");
       APP.addCell(row, command.botName || command.botId, "strong-cell");
 
-      const statusCell = document.createElement("td");
+      const commandStatusCell = document.createElement("td");
       const cls = command.status === "COMPLETED" ? "green"
         : command.status === "FAILED" || command.status === "EXPIRED" ? "red"
           : "blue";
-      statusCell.append(APP.makeBadge(command.status, cls));
-      row.append(statusCell);
+      commandStatusCell.append(APP.makeBadge(command.status, cls));
+      row.append(commandStatusCell);
+
+      const runtimeCell = document.createElement("td");
+      const runtimeInfo = RUNTIME_BADGE[command.botStatus] || { label: "—", cls: "grey" };
+      runtimeCell.append(APP.makeBadge(runtimeInfo.label, runtimeInfo.cls));
+      row.append(runtimeCell);
 
       APP.addCell(row, commandStatusMessage(command));
 
       const actions = document.createElement("td");
       actions.className = "action-cell";
-      if (!isCommandTerminal(command)) {
-        if (command.botStatus === "WAITING_FOR_USER") {
-          const validate = document.createElement("button");
-          validate.className = "primary";
-          validate.type = "button";
-          validate.textContent = "Valider";
-          validate.addEventListener("click", () => {
-            APP.socket.emit("continue-bot", { botId: command.botId });
-          });
-          actions.append(validate);
-        }
+      if (command.botStatus === "WAITING_FOR_USER") {
+        const validate = document.createElement("button");
+        validate.className = "primary";
+        validate.type = "button";
+        validate.textContent = "Valider";
+        validate.addEventListener("click", () => {
+          APP.socket.emit("continue-bot", { botId: command.botId });
+        });
+        actions.append(validate);
+      }
 
+      if (STOPPABLE_RUNTIME_STATUSES.has(command.botStatus)) {
         const stop = document.createElement("button");
         stop.className = "outline danger-text";
         stop.type = "button";
@@ -637,8 +665,19 @@
 
   APP.socket.on("agent-command-status", (payload) => applyCommandUpdate(payload));
 
-  // Recupere l'etat des commandes recentes apres un rechargement de page ou
-  // une reconnexion, plutot que de repartir d'un tableau vide (section 17).
+  // Recupere l'etat des commandes/bots recents apres un rechargement de page
+  // ou une reconnexion Socket.IO, plutot que de repartir d'un etat vide ou
+  // perime (section 17). Le serveur (registre en memoire agentBots, cf.
+  // agentCommandService.ts) reste la source de verite: cette requete ne fait
+  // que reconstruire l'etat deja tenu a jour cote serveur, ce n'est jamais un
+  // etat invente cote navigateur.
+  //
+  // Compare par updatedAt plutot que "seulement si absent": lors d'une
+  // reconnexion, la Map locale n'est pas vide et peut contenir des entrees
+  // perimees (BOT_STATUS recus pendant que le socket etait deconnecte et donc
+  // jamais livres). Ne remplace une entree que si la version serveur est
+  // reellement plus recente, pour ne jamais ecraser une mise a jour
+  // temps-reel plus fraiche arrivee pendant que cette requete etait en vol.
   const refreshAgentCommandsFromServer = async () => {
     if (!clientConfig?.agentUiEnabled) {
       return;
@@ -646,7 +685,8 @@
     try {
       const { commands } = await APP.requestJson("/api/agent-commands?limit=20");
       for (const command of commands) {
-        if (!agentCommands.has(command.botId)) {
+        const existing = agentCommands.get(command.botId);
+        if (!existing || existing.updatedAt < command.updatedAt) {
           agentCommands.set(command.botId, command);
         }
       }
@@ -654,6 +694,15 @@
       // Best-effort: l'absence de rechargement ne doit pas bloquer la page.
     }
   };
+
+  // Une reconnexion Socket.IO (redemarrage serveur, coupure reseau) peut
+  // survenir pendant que l'utilisateur est deja sur la page Bot: sans cela,
+  // le tableau resterait fige sur son dernier etat connu avant la coupure.
+  APP.socket.on("connect", () => {
+    if (APP.state.page === "bot") {
+      void refreshAgentCommandsFromServer().then(renderAgentCommandsPanel);
+    }
+  });
 
   // ---- Selection d'agent (section 6): plusieurs agents connectes ----
 
