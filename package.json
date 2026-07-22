@@ -12,7 +12,9 @@
     "package:win": "powershell -ExecutionPolicy Bypass -File scripts/package-win.ps1",
     "start": "node dist/index.js",
     "web:start": "node dist/server.js",
-    "playwright:install": "playwright install chromium"
+    "playwright:install": "playwright install chromium",
+    "test:agent:bot-status:simulated": "tsx scripts/test-agent-bot-status-simulated.ts",
+    "test:agent:bot-status:real": "tsx scripts/test-agent-bot-status-real.ts"
   },
   "keywords": [
     "playwright",

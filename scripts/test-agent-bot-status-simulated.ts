@@ -1,36 +1,20 @@
-// Correctif de la persistance de botStatus apres COMMAND_COMPLETED.
+// Tests SIMULES du cycle de vie botStatus (course COMMAND_ACK/BOT_STATUS/
+// COMMAND_COMPLETED, persistance apres COMPLETED, gating Valider/Arreter,
+// isolation inter-agence). Ce script NE LANCE JAMAIS src/agent/agentMain.ts
+// ET NE LANCE JAMAIS Chrome: tout agent est un socket.io-client fantome
+// (auth "pair" reelle, mais reponses simulees), et le seul navigateur
+// demarre ici est le Chromium headless de Playwright utilise comme harnais
+// de test pour piloter l'INTERFACE WEB elle-meme (jamais le "Chrome du bot").
+// Peut donc etre execute sans risque sur la VM.
 //
-// CAUSE EXACTE: COMMAND_ACK, BOT_STATUS (repete) et COMMAND_COMPLETED/FAILED
-// d'une MEME commande etaient traites par des gestionnaires socket.io
-// independants, chacun avec son propre aller-retour PostgreSQL (getCommandForAgent
-// / markAcknowledged / markCompleted). Un agent reel emet BOT_STATUS
-// WAITING_FOR_USER puis COMMAND_COMPLETED sans le moindre delai (deux
-// socket.emit synchrones consecutifs dans AgentBotManager.startBot()). Rien
-// ne garantissait que la requete SELECT de BOT_STATUS se termine avant la
-// requete UPDATE de COMMAND_COMPLETED lancee juste apres: si COMPLETED
-// gagnait la course, sa diffusion (et la ligne servie par la suite) portait
-// un botStatus perime (ex. "STARTING") voire la commande restait bloquee a
-// ACKNOWLEDGED si COMMAND_COMPLETED arrivait avant que COMMAND_ACK n'ait fini
-// d'etre applique. Confirme empiriquement: ~17% des commandes (5/30) dans un
-// scenario de stress avant correctif.
+// Pour le scenario avec le vrai runtime agent + vrai Chrome visible (a
+// executer uniquement sur un PC Windows personnel/interactif), voir
+// scripts/test-agent-bot-status-real.ts.
 //
-// CORRECTIF:
-// - src/agentGateway.ts: une file FIFO par commandId (enqueueCommandEvent)
-//   serialise desormais COMMAND_ACK/BOT_STATUS/COMMAND_COMPLETED/COMMAND_FAILED:
-//   le traitement complet (DB + diffusion) d'un evenement se termine
-//   TOUJOURS avant que le suivant, pour le meme commandId, ne commence.
-// - src/agentCommandService.ts: AgentBotRecord/PublicAgentCommand exposent
-//   desormais botStatusUpdatedAt et botActive, une source d'autorite
-//   explicite et separee du cycle de vie de la commande.
-// - public/agentUi.js: fusion (jamais un remplacement aveugle) entre l'etat
-//   deja connu et tout nouvel objet recu (socket ou REST), en comparant
-//   botStatusUpdatedAt independamment de command.updatedAt.
-//
-// Usage: npx tsx scripts/test-agent-botstatus-persistence.ts
+// Usage: npx tsx scripts/test-agent-bot-status-simulated.ts
+//    ou: npm run test:agent:bot-status:simulated
 
 import { ChildProcess, spawn } from "node:child_process";
-import { existsSync, rmSync } from "node:fs";
-import path from "node:path";
 import { Browser, Page, chromium } from "playwright";
 import { Socket, io as ioClient } from "socket.io-client";
 import { pool } from "../src/db.js";
@@ -59,11 +43,12 @@ const waitUntil = async (predicate: () => Promise<boolean> | boolean, timeoutMs 
 // --- Cycle de vie serveur ---
 
 type ServerHandle = { child: ChildProcess; baseUrl: string };
+const runningServers: ServerHandle[] = [];
 
 const waitForServerReady = async (baseUrl: string): Promise<void> => {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
-    try { const res = await fetch(`${baseUrl}/api/me`); if (res.status === 401 || res.status === 200) return; } catch { /* */ }
+    try { const res = await fetch(`${baseUrl}/api/me`); if (res.status === 401 || res.status === 200) return; } catch { /* pas encore pret */ }
     await sleep(500);
   }
   throw new Error("Le serveur de test n'a jamais repondu.");
@@ -80,7 +65,9 @@ const startServer = async (port: number, env: Record<string, string>): Promise<S
   child.stderr?.on("data", (c: Buffer) => log("SERVER-ERR", c.toString().trim()));
   const baseUrl = `http://localhost:${port}`;
   await waitForServerReady(baseUrl);
-  return { child, baseUrl };
+  const handle = { child, baseUrl };
+  runningServers.push(handle);
+  return handle;
 };
 
 const killTree = (pid: number | undefined): Promise<void> => new Promise((resolve) => {
@@ -129,11 +116,11 @@ const createdAgencyNames: string[] = [];
 const createdUserLogins: string[] = [];
 
 const createAgencyAndManager = async (baseUrl: string, adminCookie: string, labelSuffix: string) => {
-  const agencyName = `Test BotStatus ${labelSuffix} ${RUN_SUFFIX}`;
+  const agencyName = `Test BotStatus Sim ${labelSuffix} ${RUN_SUFFIX}`;
   createdAgencyNames.push(agencyName);
   const agencyResult = await requestJson(baseUrl, "POST", "/api/agencies", adminCookie, { name: agencyName, maxActiveClients: 15 });
   const agencyId = agencyResult.body.agency.id;
-  const managerLogin = `test-botstatus-${labelSuffix.toLowerCase()}-${RUN_SUFFIX}`;
+  const managerLogin = `test-botstatus-sim-${labelSuffix.toLowerCase()}-${RUN_SUFFIX}`;
   createdUserLogins.push(managerLogin);
   const userResult = await requestJson(baseUrl, "POST", "/api/users", adminCookie, {
     agencyId, login: managerLogin, name: `Manager ${labelSuffix}`, email: `${managerLogin}@example.test`, role: 1
@@ -146,15 +133,72 @@ const cleanupTestData = async (): Promise<void> => {
   if (createdAgencyNames.length > 0) await pool.query("DELETE FROM agencies WHERE name = ANY($1::text[])", [createdAgencyNames]);
 };
 
-// ===================== Partie A: preuve de la race (stress) =====================
-// Reproduit exactement la timing reelle d'AgentBotManager.startBot(): ACK,
-// BOT_STATUS STARTING, BOT_STATUS WAITING_FOR_USER et COMMAND_COMPLETED
-// emis en succession la plus rapide possible (zero delai), sur de
-// nombreuses commandes concurrentes, pour maximiser la probabilite de
-// declencher la course. AVANT le correctif, environ 15-20% des commandes se
-// terminaient dans un etat incoherent; APRES, 0/N de facon repetee.
+// --- Agent fantome (socket.io-client brut: authentification /agent reelle,
+// mais reponses COMMAND_ACK/BOT_STATUS/COMMAND_COMPLETED simulees a la main.
+// AUCUN process src/agent/agentMain.ts, AUCUN Chrome.) ---
 
-const runStressPartA = async (baseUrl: string, managerCookie: string, iterations: number): Promise<void> => {
+type FakeAgentHandle = { agentId: number; token: string; socket: Socket };
+
+const pairFakeAgent = async (baseUrl: string, managerCookie: string, computerName: string): Promise<FakeAgentHandle> => {
+  const pairing = await requestJson(baseUrl, "POST", "/api/agents/pairing-codes", managerCookie, {});
+  return new Promise((resolve, reject) => {
+    const socket = ioClient(`${baseUrl}/agent`, {
+      autoConnect: false, reconnection: false, forceNew: true,
+      auth: { mode: "pair", pairingCode: pairing.body.pairing.code, computerName, version: "1.0.0" }
+    });
+    const t = setTimeout(() => { socket.disconnect(); reject(new Error("Timeout agent fantome.")); }, 8_000);
+    socket.on("connect_error", (e: Error) => { clearTimeout(t); reject(e); });
+    socket.on("AGENT_CONNECTED", (payload: { agentId: number; token: string | null }) => {
+      clearTimeout(t);
+      if (!payload.token) { reject(new Error("Aucun jeton.")); return; }
+      resolve({ agentId: payload.agentId, token: payload.token, socket });
+    });
+    socket.connect();
+  });
+};
+
+const waitUntilValue = async <T>(getter: () => T | undefined, timeoutMs = 8_000): Promise<T | undefined> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = getter();
+    if (value) return value;
+    await sleep(100);
+  }
+  return getter();
+};
+
+// --- Helpers DOM (page web pilotee par le Chromium headless du harnais de test) ---
+
+const rowFor = (page: Page, botNameText: string) => page.locator("#agentCommandsTableBody tr", { hasText: botNameText });
+const stopButtonFor = (page: Page, botNameText: string) => rowFor(page, botNameText).locator("button", { hasText: "Arreter" });
+const validateButtonFor = (page: Page, botNameText: string) => rowFor(page, botNameText).locator("button", { hasText: "Valider" });
+
+const loginViaUi = async (page: Page, baseUrl: string, loginName: string, password: string): Promise<void> => {
+  await page.goto(baseUrl);
+  await page.fill("#loginInput", loginName);
+  await page.fill("#passwordInput", password);
+  await page.click('#loginForm button[type="submit"]');
+  await page.waitForSelector("#appLayout:not([hidden])", { timeout: 10_000 });
+};
+
+const startBotViaUi = async (page: Page, botName: string): Promise<void> => {
+  await page.fill("#botFormName", botName);
+  await page.selectOption("#botFormCategory", { index: 1 });
+  await page.fill("#botFormLogin", "x");
+  await page.fill("#botFormPassword", "y");
+  await page.click("#startBot");
+};
+
+// ===================== Scenario 1: preuve de la race (stress, sans Playwright) =====================
+// Reproduit la timing exacte d'AgentBotManager.startBot() reel: ACK, BOT_STATUS
+// STARTING, BOT_STATUS WAITING_FOR_USER et COMMAND_COMPLETED emis en
+// succession la plus rapide possible (zero delai), sur N commandes
+// concurrentes. Avant le correctif de serialisation par commandId
+// (src/agentGateway.ts), ~17% des commandes finissaient dans un etat
+// incoherent; ce scenario doit rester a 0/N.
+
+const runStressScenario = async (baseUrl: string, managerCookie: string, iterations: number): Promise<void> => {
+  log("SCENARIO-1", `=== Course COMMAND_ACK/BOT_STATUS/COMMAND_COMPLETED (${iterations} iterations) ===`);
   const pairing = await requestJson(baseUrl, "POST", "/api/agents/pairing-codes", managerCookie, {});
   const agentSocket: Socket = await new Promise((resolve, reject) => {
     const s = ioClient(`${baseUrl}/agent`, {
@@ -207,61 +251,10 @@ const runStressPartA = async (baseUrl: string, managerCookie: string, iterations
   uiSocket.disconnect();
 };
 
-// --- Helpers DOM (Partie B/C) ---
+// ===================== Scenario 2: sequence exacte, Playwright + agent fantome =====================
 
-const rowFor = (page: Page, botNameText: string) => page.locator("#agentCommandsTableBody tr", { hasText: botNameText });
-const stopButtonFor = (page: Page, botNameText: string) => rowFor(page, botNameText).locator("button", { hasText: "Arreter" });
-const validateButtonFor = (page: Page, botNameText: string) => rowFor(page, botNameText).locator("button", { hasText: "Valider" });
-
-const loginViaUi = async (page: Page, baseUrl: string, loginName: string, password: string): Promise<void> => {
-  await page.goto(baseUrl);
-  await page.fill("#loginInput", loginName);
-  await page.fill("#passwordInput", password);
-  await page.click('#loginForm button[type="submit"]');
-  await page.waitForSelector("#appLayout:not([hidden])", { timeout: 10_000 });
-};
-
-const startBotViaUi = async (page: Page, botName: string): Promise<void> => {
-  await page.fill("#botFormName", botName);
-  await page.selectOption("#botFormCategory", { index: 1 });
-  await page.fill("#botFormLogin", "x");
-  await page.fill("#botFormPassword", "y");
-  await page.click("#startBot");
-};
-
-type FakeAgentHandle = { agentId: number; token: string; socket: Socket };
-
-const pairFakeAgent = async (baseUrl: string, managerCookie: string, computerName: string): Promise<FakeAgentHandle> => {
-  const pairing = await requestJson(baseUrl, "POST", "/api/agents/pairing-codes", managerCookie, {});
-  return new Promise((resolve, reject) => {
-    const socket = ioClient(`${baseUrl}/agent`, {
-      autoConnect: false, reconnection: false, forceNew: true,
-      auth: { mode: "pair", pairingCode: pairing.body.pairing.code, computerName, version: "1.0.0" }
-    });
-    const t = setTimeout(() => { socket.disconnect(); reject(new Error("Timeout agent fantome.")); }, 8_000);
-    socket.on("connect_error", (e: Error) => { clearTimeout(t); reject(e); });
-    socket.on("AGENT_CONNECTED", (payload: { agentId: number; token: string | null }) => {
-      clearTimeout(t);
-      if (!payload.token) { reject(new Error("Aucun jeton.")); return; }
-      resolve({ agentId: payload.agentId, token: payload.token, socket });
-    });
-    socket.connect();
-  });
-};
-
-const waitUntilValue = async <T>(getter: () => T | undefined, timeoutMs = 8_000): Promise<T | undefined> => {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const value = getter();
-    if (value) return value;
-    await sleep(100);
-  }
-  return getter();
-};
-
-// ===================== Partie B: sequence exacte, agent fantome, Playwright =====================
-
-const runSequencePartB = async (browser: Browser, baseUrl: string, fixture: { managerLogin: string; managerPassword: string }): Promise<void> => {
+const runSequenceScenario = async (browser: Browser, baseUrl: string, fixture: { managerLogin: string; managerPassword: string }): Promise<void> => {
+  log("SCENARIO-2", "=== Sequence PENDING->SENT->ACKNOWLEDGED->STARTING->WAITING_FOR_USER->COMPLETED->GET->reload->STOP ===");
   const managerCookie = await loginWithRetry(baseUrl, fixture.managerLogin, fixture.managerPassword);
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -280,30 +273,25 @@ const runSequencePartB = async (browser: Browser, baseUrl: string, fixture: { ma
   await page.click('[data-page-target="bot"]');
   await page.waitForSelector("#page-bot.active");
 
-  // 1) creation START_BOT
   await startBotViaUi(page, "Bot Sequence");
   const startCommand = await waitUntilValue(() => commandsSeen.find((c) => c.type === "START_BOT"));
   if (!startCommand) throw new Error("START_BOT jamais recu.");
-  assert(true, "1) START_BOT cree et recu par l'agent");
+  assert(true, "1) START_BOT cree et recu par l'agent fantome");
 
-  // 2) SENT / 3) ACKNOWLEDGED
   await waitUntil(async () => (await rowFor(page, "Bot Sequence").innerText()).includes("SENT"), 5_000);
   assert(true, "2) La commande transite par SENT");
   agent.socket.emit("COMMAND_ACK", { commandId: startCommand.commandId, receivedAt: new Date().toISOString() });
   await waitUntil(async () => (await rowFor(page, "Bot Sequence").innerText()).includes("ACKNOWLEDGED"), 5_000);
   assert(true, "3) La commande transite par ACKNOWLEDGED");
 
-  // 4) BOT_STATUS STARTING
   agent.socket.emit("BOT_STATUS", { commandId: startCommand.commandId, botId: startCommand.botId, status: "STARTING", timestamp: new Date().toISOString() });
   await waitUntil(async () => (await rowFor(page, "Bot Sequence").innerText()).includes("Demarrage"), 5_000);
   assert(true, "4) BOT_STATUS STARTING relaye et affiche");
 
-  // 5) BOT_STATUS WAITING_FOR_USER
   agent.socket.emit("BOT_STATUS", { commandId: startCommand.commandId, botId: startCommand.botId, status: "WAITING_FOR_USER", timestamp: new Date().toISOString() });
   await waitUntil(async () => (await stopButtonFor(page, "Bot Sequence").count()) === 1, 5_000);
-  assert(true, "5) BOT_STATUS WAITING_FOR_USER relaye, bouton Arreter deja visible avant meme COMPLETED");
+  assert(true, "5) BOT_STATUS WAITING_FOR_USER relaye, bouton Arreter deja visible avant COMPLETED");
 
-  // 6) COMMAND_COMPLETED
   agent.socket.emit("COMMAND_COMPLETED", {
     commandId: startCommand.commandId, completedAt: new Date().toISOString(),
     result: { botId: startCommand.botId, status: "WAITING_FOR_USER", started: true, computerName: "SEQ-PC" }
@@ -312,55 +300,31 @@ const runSequencePartB = async (browser: Browser, baseUrl: string, fixture: { ma
 
   const rowText = await rowFor(page, "Bot Sequence").innerText();
   assert(rowText.includes("COMPLETED"), "6) status === COMPLETED apres COMMAND_COMPLETED");
-  assert(
-    (await stopButtonFor(page, "Bot Sequence").count()) === 1,
-    "6) botStatus reste WAITING_FOR_USER apres COMMAND_COMPLETED: bouton Arreter toujours visible (BUG CORRIGE)"
-  );
-  assert(
-    (await validateButtonFor(page, "Bot Sequence").count()) === 1,
-    "6) bouton Valider toujours visible apres COMMAND_COMPLETED"
-  );
-  assert(
-    !rowText.includes("Commande terminee par l'agent"),
-    "6) Le message \"Commande terminee par l'agent\" n'est jamais affiche tant qu'un botStatus actif existe"
-  );
+  assert((await stopButtonFor(page, "Bot Sequence").count()) === 1, "6) botStatus reste WAITING_FOR_USER: bouton Arreter toujours visible");
+  assert((await validateButtonFor(page, "Bot Sequence").count()) === 1, "6) bouton Valider toujours visible apres COMMAND_COMPLETED");
+  assert(!rowText.includes("Commande terminee par l'agent"), "6) Jamais \"Commande terminee par l'agent\" tant qu'un botStatus actif existe");
 
-  // 7) GET /api/agent-commands
   const detail = await requestJson(baseUrl, "GET", "/api/agent-commands?limit=5", managerCookie);
   const restCommand = detail.body.commands.find((c: any) => c.botId === startCommand.botId);
   assert(restCommand?.status === "COMPLETED", "7) GET /api/agent-commands: status === COMPLETED");
-  assert(restCommand?.botStatus === "WAITING_FOR_USER", "7) GET /api/agent-commands: botStatus toujours WAITING_FOR_USER (jamais efface)");
+  assert(restCommand?.botStatus === "WAITING_FOR_USER", "7) GET /api/agent-commands: botStatus toujours WAITING_FOR_USER");
   assert(typeof restCommand?.botStatusUpdatedAt === "string", "7) GET /api/agent-commands: botStatusUpdatedAt present");
 
-  // Refresh REST sans rechargement complet (navigation dashboard -> bot):
-  // verifie qu'un refresh REST declenche APRES l'etat socket ne fait pas
-  // disparaitre les boutons.
   await page.click('[data-page-target="dashboard"]');
   await page.waitForSelector("#page-dashboard.active");
   await page.click('[data-page-target="bot"]');
   await page.waitForSelector("#page-bot.active");
   await waitUntil(async () => (await rowFor(page, "Bot Sequence").count()) > 0, 5_000);
-  assert(
-    (await stopButtonFor(page, "Bot Sequence").count()) === 1,
-    "Un refresh REST (navigation bot -> dashboard -> bot) ne fait pas disparaitre le bouton Arreter"
-  );
+  assert((await stopButtonFor(page, "Bot Sequence").count()) === 1, "Un refresh REST (navigation bot->dashboard->bot) ne fait pas disparaitre le bouton Arreter");
 
-  // 8) rechargement complet de la page
   await page.reload();
   await page.waitForSelector("#appLayout:not([hidden])");
   await page.click('[data-page-target="bot"]');
   await page.waitForSelector("#page-bot.active");
   await waitUntil(async () => (await rowFor(page, "Bot Sequence").count()) > 0, 5_000);
-  assert(
-    (await stopButtonFor(page, "Bot Sequence").count()) === 1,
-    "8) Apres rechargement complet de la page, le bouton Arreter est toujours present"
-  );
-  assert(
-    (await validateButtonFor(page, "Bot Sequence").count()) === 1,
-    "8) Apres rechargement complet de la page, le bouton Valider est toujours present"
-  );
+  assert((await stopButtonFor(page, "Bot Sequence").count()) === 1, "8) Apres rechargement complet, le bouton Arreter est toujours present");
+  assert((await validateButtonFor(page, "Bot Sequence").count()) === 1, "8) Apres rechargement complet, le bouton Valider est toujours present");
 
-  // STOP_BOT -> STOPPING masque -> STOPPED masque definitivement
   await stopButtonFor(page, "Bot Sequence").click();
   const stopCommand = await waitUntilValue(() => commandsSeen.find((c) => c.type === "STOP_BOT"));
   if (!stopCommand) throw new Error("STOP_BOT jamais recu.");
@@ -381,71 +345,63 @@ const runSequencePartB = async (browser: Browser, baseUrl: string, fixture: { ma
   await context.close();
 };
 
-// ===================== Partie C: vrai agent, vrai Chrome =====================
+// ===================== Scenario 3: isolation inter-agence =====================
 
-const runRealAgentPartC = async (browser: Browser, port: number): Promise<void> => {
-  const server = await startServer(port, { AGENT_UI_ENABLED: "true", BOT_EXECUTION_MODE: "agent" });
-  try {
-    const adminCookie = await loginWithRetry(server.baseUrl, ADMIN_LOGIN, ADMIN_PASSWORD);
-    const fixture = await createAgencyAndManager(server.baseUrl, adminCookie, "Real");
-    const managerCookie = await loginWithRetry(server.baseUrl, fixture.managerLogin, fixture.managerPassword);
-    const pairing = await requestJson(server.baseUrl, "POST", "/api/agents/pairing-codes", managerCookie, {});
-    const code = pairing.body.pairing.code;
+const runCrossAgencyScenario = async (
+  browser: Browser,
+  baseUrl: string,
+  fixtureA: { managerLogin: string; managerPassword: string },
+  fixtureB: { managerLogin: string; managerPassword: string }
+): Promise<void> => {
+  log("SCENARIO-3", "=== Isolation inter-agence ===");
+  const managerCookieA = await loginWithRetry(baseUrl, fixtureA.managerLogin, fixtureA.managerPassword);
+  const contextA = await browser.newContext();
+  const pageA = await contextA.newPage();
+  await loginViaUi(pageA, baseUrl, fixtureA.managerLogin, fixtureA.managerPassword);
+  await pageA.click('#agentSetupSkip').catch(() => undefined);
+  await pageA.waitForSelector("#page-dashboard.active", { timeout: 10_000 });
 
-    const credPath = path.join(process.cwd(), `.test-botstatus-real-creds-${RUN_SUFFIX}.json`);
-    const dataRoot = path.join(process.cwd(), `.test-botstatus-real-data-${RUN_SUFFIX}`);
+  const agentA = await pairFakeAgent(baseUrl, managerCookieA, "CROSS-A-PC");
+  const commandsSeenA: Array<Record<string, unknown>> = [];
+  agentA.socket.on("AGENT_COMMAND", (command: Record<string, unknown>) => commandsSeenA.push(command));
 
-    const realAgent: ChildProcess = spawn(process.platform === "win32" ? "npx.cmd" : "npx", ["tsx", "src/agent/agentMain.ts", "pair", code], {
-      env: {
-        ...process.env,
-        AGENT_SERVER_URL: server.baseUrl,
-        AGENT_CREDENTIALS_PATH: credPath,
-        AGENT_DATA_DIR: dataRoot,
-        AGENT_COMPUTER_NAME: "REAL-BOTSTATUS-PC",
-        AGENT_TARGET_MODE: "fixture",
-        AGENT_FIXTURE_URL: "about:blank"
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-      shell: process.platform === "win32"
-    });
-    realAgent.stdout?.on("data", (c: Buffer) => log("REAL-AGENT", c.toString().trim()));
-    realAgent.stderr?.on("data", (c: Buffer) => log("REAL-AGENT-ERR", c.toString().trim()));
-    await sleep(2_000);
+  await pageA.click('[data-page-target="bot"]');
+  await pageA.waitForSelector("#page-bot.active");
+  await startBotViaUi(pageA, "Bot CrossAgency");
+  const startCommand = await waitUntilValue(() => commandsSeenA.find((c) => c.type === "START_BOT"));
+  if (!startCommand) throw new Error("START_BOT jamais recu (cross-agency).");
 
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    await loginViaUi(page, server.baseUrl, fixture.managerLogin, fixture.managerPassword);
-    await page.click('#agentSetupSkip').catch(() => undefined);
-    await page.waitForSelector("#page-dashboard.active", { timeout: 10_000 });
-    await page.click('[data-page-target="bot"]');
-    await page.waitForSelector("#page-bot.active");
+  agentA.socket.emit("COMMAND_ACK", { commandId: startCommand.commandId, receivedAt: new Date().toISOString() });
+  agentA.socket.emit("BOT_STATUS", { commandId: startCommand.commandId, botId: startCommand.botId, status: "WAITING_FOR_USER", timestamp: new Date().toISOString() });
+  agentA.socket.emit("COMMAND_COMPLETED", { commandId: startCommand.commandId, completedAt: new Date().toISOString(), result: { botId: startCommand.botId, status: "WAITING_FOR_USER", started: true } });
+  await waitUntil(async () => (await stopButtonFor(pageA, "Bot CrossAgency").count()) === 1, 5_000);
 
-    await startBotViaUi(page, "Bot Reel Sequence");
-    await waitUntil(async () => (await rowFor(page, "Bot Reel Sequence").innerText()).includes("COMPLETED"), 15_000);
+  const managerCookieB = await loginWithRetry(baseUrl, fixtureB.managerLogin, fixtureB.managerPassword);
+  const contextB = await browser.newContext();
+  const pageB = await contextB.newPage();
+  await loginViaUi(pageB, baseUrl, fixtureB.managerLogin, fixtureB.managerPassword);
+  await pageB.click('#agentSetupSkip').catch(() => undefined);
+  await pageB.waitForSelector("#page-dashboard.active", { timeout: 10_000 });
+  await pageB.click('[data-page-target="bot"]');
+  await pageB.waitForSelector("#page-bot.active");
+  assert((await rowFor(pageB, "Bot CrossAgency").count()) === 0, "Le manager d'une autre agence ne voit meme pas le bot dans son tableau de commandes");
 
-    const rowText = await rowFor(page, "Bot Reel Sequence").innerText();
-    assert(rowText.includes("COMPLETED"), "Vrai agent: START_BOT reel atteint COMPLETED (Chrome reellement ouvert)");
-    assert(
-      (await stopButtonFor(page, "Bot Reel Sequence").count()) === 1,
-      "Vrai agent, vrai ordre d'evenements (zero delai WAITING_FOR_USER->COMPLETED): bouton Arreter bien visible"
-    );
+  const socketB = ioClient(baseUrl, { autoConnect: false, reconnection: false, extraHeaders: { Cookie: managerCookieB } });
+  await new Promise<void>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timeout socket B")), 5_000);
+    socketB.on("connect", () => { clearTimeout(t); resolve(); });
+    socketB.connect();
+  });
+  let crossAgencyEventReceived = false;
+  socketB.on("agent-command-status", () => { crossAgencyEventReceived = true; });
+  socketB.emit("stop-bot", { botId: startCommand.botId as string, clientRequestId: `cross-agency-${RUN_SUFFIX}` });
+  await sleep(1_000);
+  assert(!crossAgencyEventReceived, "Une tentative stop-bot depuis une autre agence sur ce botId n'a aucun effet observable");
 
-    const commandId = (await requestJson(server.baseUrl, "GET", "/api/agent-commands?limit=5", managerCookie))
-      .body.commands.find((c: any) => c.botName === "Bot Reel Sequence")?.commandId;
-    const restDetail = await requestJson(server.baseUrl, "GET", `/api/agent-commands/${commandId}`, managerCookie);
-    assert(restDetail.body.command.botStatus === "WAITING_FOR_USER", "Vrai agent: GET /api/agent-commands/:id confirme botStatus=WAITING_FOR_USER apres COMPLETED");
-
-    await stopButtonFor(page, "Bot Reel Sequence").click();
-    await waitUntil(async () => (await stopButtonFor(page, "Bot Reel Sequence").count()) === 0, 15_000);
-    assert((await stopButtonFor(page, "Bot Reel Sequence").count()) === 0, "Vrai agent: apres clic reel sur Arreter, le bouton disparait (bot STOPPED)");
-
-    await context.close();
-    await killTree(realAgent.pid);
-    if (existsSync(credPath)) rmSync(credPath);
-    if (existsSync(dataRoot)) rmSync(dataRoot, { recursive: true, force: true });
-  } finally {
-    await killTree(server.child.pid);
-  }
+  socketB.disconnect();
+  agentA.socket.disconnect();
+  await contextA.close();
+  await contextB.close();
 };
 
 const main = async (): Promise<void> => {
@@ -454,27 +410,25 @@ const main = async (): Promise<void> => {
   try {
     browser = await chromium.launch({ headless: true });
 
-    const server = await startServer(3271, {
+    const server = await startServer(3281, {
       AGENT_UI_ENABLED: "true", BOT_EXECUTION_MODE: "agent",
       AGENT_COMMAND_ACK_TIMEOUT_MS: "8000", AGENT_COMMAND_TTL_MS: "20000"
     });
     const adminCookie = await loginWithRetry(server.baseUrl, ADMIN_LOGIN, ADMIN_PASSWORD);
+
     const fixtureStress = await createAgencyAndManager(server.baseUrl, adminCookie, "Stress");
     const stressCookie = await loginWithRetry(server.baseUrl, fixtureStress.managerLogin, fixtureStress.managerPassword);
+    await runStressScenario(server.baseUrl, stressCookie, 30);
 
-    log("PART-A", "=== Preuve de la race (30 iterations rapides, timing reel) ===");
-    await runStressPartA(server.baseUrl, stressCookie, 30);
-
-    log("PART-B", "=== Sequence exacte PENDING->SENT->ACKNOWLEDGED->STARTING->WAITING_FOR_USER->COMPLETED->GET->reload ===");
     const fixtureSeq = await createAgencyAndManager(server.baseUrl, adminCookie, "Seq");
-    await runSequencePartB(browser, server.baseUrl, fixtureSeq);
+    await runSequenceScenario(browser, server.baseUrl, fixtureSeq);
 
-    await killTree(server.child.pid);
-
-    log("PART-C", "=== Vrai agent, vrai Chrome ===");
-    await runRealAgentPartC(browser, 3272);
+    const fixtureCrossA = await createAgencyAndManager(server.baseUrl, adminCookie, "CrossA");
+    const fixtureCrossB = await createAgencyAndManager(server.baseUrl, adminCookie, "CrossB");
+    await runCrossAgencyScenario(browser, server.baseUrl, fixtureCrossA, fixtureCrossB);
   } finally {
     if (browser) await browser.close().catch(() => undefined);
+    for (const server of runningServers) await killTree(server.child.pid);
     await cleanupTestData();
     await pool.end();
   }
