@@ -533,13 +533,18 @@
   // commande START_BOT/VALIDATE_BOT COMPLETED ne dit rien a elle seule sur
   // l'etat du bot, et ne doit jamais afficher "Commande terminee par
   // l'agent" tant que le bot est encore actif.
+  // Lot 4: MONITORING signifie desormais une boucle de surveillance
+  // REELLEMENT active (plus seulement "page validee, prete" comme au Lot 3).
   const ACTIVE_BOT_STATUS_MESSAGE = {
     STARTING: "Demarrage en attente du moteur local",
     WAITING_FOR_USER: "En attente de la connexion et de l'ouverture de la page de rendez-vous",
-    MONITORING: "Page validee - surveillance prete",
-    RATE_LIMITED: "Ralenti (rate limit) par l'agent",
-    SLOT_DETECTED: "Creneau detecte par l'agent",
-    STOPPING: "Arret en cours (agent)"
+    MONITORING: "Surveillance active",
+    RATE_LIMITED: "Pause apres limitation du site",
+    SLOT_DETECTED: "Creneau detecte - intervention requise",
+    STOPPING: "Arret en cours (agent)",
+    // Lot 4: ERROR runtime (ex. REFRESH_FAILED) n'implique pas que Chrome
+    // soit ferme: le bot reste arretable tant qu'il l'est encore (section 14).
+    ERROR: "Erreur du bot. Verifiez le navigateur, puis arretez si necessaire."
   };
 
   // Erreurs propres a VALIDATE_BOT (Lot 3) et cas herites (Lot 2): toujours
@@ -618,7 +623,7 @@
   // avant WAITING_FOR_USER) — un STOP_BOT recu pendant la toute breve fenetre
   // STARTING ne trouverait donc pas encore le bot. Aucune action n'est donc
   // proposee pendant cette fenetre precise (cf. exigence Lot 2 point 3).
-  const STOPPABLE_RUNTIME_STATUSES = new Set(["WAITING_FOR_USER", "MONITORING", "RATE_LIMITED", "SLOT_DETECTED"]);
+  const STOPPABLE_RUNTIME_STATUSES = new Set(["WAITING_FOR_USER", "MONITORING", "RATE_LIMITED", "SLOT_DETECTED", "ERROR"]);
 
   const RUNTIME_BADGE = {
     STARTING: { label: "Demarrage", cls: "amber" },

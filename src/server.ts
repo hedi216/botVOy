@@ -30,6 +30,7 @@ import {
   createExtensionLink,
   deleteExtensionLink,
   getAgency,
+  getAgencyMonitoringSettings,
   getAgencySettings,
   initUserModule,
   listAgencies,
@@ -1181,6 +1182,13 @@ io.on("connection", (socket) => {
           ? payload.clientRequestId.trim().slice(0, 100)
           : null;
 
+        // Lot 4 (section 4 du cahier des charges): snapshot public et deja
+        // valide des parametres de surveillance de l'agence, transmis une
+        // fois pour toutes au demarrage. L'agent le revalide/borne de son
+        // cote (defense en profondeur, cf. agentMonitoringSettings.ts):
+        // jamais fait confiance tel quel meme si deja normalise ici.
+        const monitoringSettings = await getAgencyMonitoringSettings(agencyId);
+
         const { command, alreadyExisted } = await dispatchAgentCommand(
           {
             agencyId,
@@ -1189,7 +1197,7 @@ io.on("connection", (socket) => {
             type: "START_BOT",
             // Solution A (section 5 Phase 3): aucun identifiant TLScontact tant
             // que le moteur reel n'existe pas cote agent (Phase 4).
-            publicPayload: { botName, category },
+            publicPayload: { botName, category, monitoringSettings },
             createdByUserId: user.id,
             clientRequestId
           },

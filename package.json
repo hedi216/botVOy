@@ -16,7 +16,9 @@
     "test:agent:bot-status:simulated": "tsx scripts/test-agent-bot-status-simulated.ts",
     "test:agent:bot-status:real": "tsx scripts/test-agent-bot-status-real.ts",
     "test:agent:validate:simulated": "tsx scripts/test-agent-validate-simulated.ts",
-    "test:agent:validate:real": "tsx scripts/test-agent-validate-real.ts"
+    "test:agent:validate:real": "tsx scripts/test-agent-validate-real.ts",
+    "test:agent:monitoring:simulated": "tsx scripts/test-agent-monitoring-simulated.ts",
+    "test:agent:monitoring:real": "tsx scripts/test-agent-monitoring-real.ts"
   },
   "keywords": [
     "playwright",

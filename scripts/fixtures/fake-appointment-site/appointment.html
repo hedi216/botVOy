@@ -1,20 +1,132 @@
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-  <meta charset="utf-8">
-  <title>Fixture - Page de rendez-vous</title>
+<meta charset="utf-8">
+<title>Fixture - Page de rendez-vous</title>
 </head>
 <body>
-  <!--
-    Page de test locale UNIQUEMENT (Phase 4, section 4/18): ne represente
-    aucun site reel, ne contacte jamais TLScontact. Le marqueur
-    data-testid="fixture-appointment-page" est reconnu exclusivement par le
-    detecteur fixture de l'agent (src/agent/agentPageDetector.ts), separe du
-    detecteur production qui reutilise src/shared/detectors.ts.
-  -->
-  <div data-testid="fixture-appointment-page">
-    <h1>Page de rendez-vous (fixture locale de test)</h1>
-    <p>Cette page simule uniquement la reconnaissance de page par l'agent pour VALIDATE_BOT.</p>
-  </div>
+<!--
+  Page de test locale UNIQUEMENT (Phase 4, Lot 3 section 4 / Lot 4 section
+  15/18): ne represente aucun site reel, ne contacte jamais TLScontact,
+  aucune requete reseau. data-testid="fixture-appointment-page" est reconnu
+  exclusivement par le detecteur fixture de l'agent
+  (src/agent/agentPageDetector.ts) pour VALIDATE_BOT. Une fois la
+  surveillance demarree (Lot 4), le moteur partage (src/shared/monitor.ts,
+  detectors.ts) examine cette page avec exactement les MEMES selecteurs et
+  motifs de texte que la production: cette fixture doit donc reproduire ces
+  marqueurs fidelement pour chaque scenario, jamais une logique parallele.
+
+  Scenarios pilotes par query string (?scenario=..., jamais actives
+  implicitement: requiert toujours AGENT_TARGET_MODE=fixture +
+  AGENT_FIXTURE_URL explicite):
+    - no-slots (defaut): mois courant/suivant sans disponibilite, message
+      officiel "plus de creneaux disponibles".
+    - slot-available: creneau disponible + reservation qui aboutit (contenu
+      reconnu par hasReservationConfirmation), pour tester la detection ET
+      l'alerte SLOT_DETECTED avec deduplication.
+    - month-change: mois courant indisponible, mois suivant disponible
+      (teste le changement de mois et les delais associes).
+    - rate-limited: texte "Error 1015" (motif rate-limit reconnu), qui se
+      dissipe automatiquement apres clearAfterMs (defaut 30000) pour valider
+      la reprise MONITORING sans dependre d'un vrai site.
+    - refresh-required: etat "non pret" au premier chargement, devient pret
+      seulement apres un reload() reel (sessionStorage), pour valider le
+      refresh periodique.
+
+  Parametres additionnels: clearAfterMs (rate-limited), monthDelayMs
+  (month-change, delai avant que le mois suivant affiche son contenu).
+-->
+<div data-testid="fixture-appointment-page">
+  <div id="fixture-root"></div>
+</div>
+<script>
+(function () {
+  "use strict";
+  var params = new URLSearchParams(location.search);
+  var scenario = params.get("scenario") || "no-slots";
+  var root = document.getElementById("fixture-root");
+
+  var NO_SLOTS_TEXT = "Nous n'avons actuellement plus de creneaux de rendez-vous disponibles.";
+  var RESERVE_TEXT = "Reservez votre rendez-vous";
+  var CONFIRMATION_TEXT = "Recapitulatif de la commande. Rendez-vous reserve pour le creneau selectionne.";
+
+  var renderNoSlots = function () {
+    root.innerHTML =
+      '<button data-testid="btn-current-month-unavailable" disabled>Mois courant</button>' +
+      '<button data-testid="btn-next-month-unavailable" disabled>Mois suivant</button>' +
+      '<p>' + NO_SLOTS_TEXT + '</p>';
+  };
+
+  var renderSlotAvailable = function () {
+    root.innerHTML =
+      '<button data-testid="btn-current-month-available">Mois courant</button>' +
+      '<button data-testid="btn-available-slot">14:30</button>' +
+      '<button id="fixture-reserve-btn">' + RESERVE_TEXT + '</button>' +
+      '<div id="fixture-confirmation"></div>';
+
+    document.getElementById("fixture-reserve-btn").addEventListener("click", function () {
+      document.getElementById("fixture-confirmation").textContent = CONFIRMATION_TEXT;
+    });
+  };
+
+  var renderMonthChange = function () {
+    var delayMs = Number(params.get("monthDelayMs") || "0");
+    root.innerHTML =
+      '<button data-testid="btn-current-month-unavailable" disabled>Mois courant</button>' +
+      '<button data-testid="btn-next-month-available">Mois suivant</button>' +
+      '<div id="fixture-next-month"><p>Chargement du mois suivant...</p></div>';
+
+    document.querySelector('[data-testid="btn-next-month-available"]').addEventListener("click", function () {
+      var apply = function () {
+        document.getElementById("fixture-next-month").innerHTML =
+          '<button data-testid="btn-available-slot">09:00</button>' +
+          '<p>Selectionnez un creneau</p>';
+      };
+      if (delayMs > 0) {
+        setTimeout(apply, delayMs);
+      } else {
+        apply();
+      }
+    });
+  };
+
+  var renderRateLimited = function () {
+    var clearAfterMs = Number(params.get("clearAfterMs") || "30000");
+    root.innerHTML = '<p>Error 1015 - Acces temporairement limite (test).</p>';
+    setTimeout(function () {
+      renderNoSlots();
+    }, clearAfterMs);
+  };
+
+  var renderRefreshRequired = function () {
+    var reloadedKey = "rdv-fixture-refresh-required-reloaded";
+    if (sessionStorage.getItem(reloadedKey) === "1") {
+      renderNoSlots();
+      return;
+    }
+    sessionStorage.setItem(reloadedKey, "1");
+    root.innerHTML = "<p>Chargement en cours (etat volontairement non pret avant refresh)...</p>";
+  };
+
+  switch (scenario) {
+    case "slot-available":
+      renderSlotAvailable();
+      break;
+    case "month-change":
+      renderMonthChange();
+      break;
+    case "rate-limited":
+      renderRateLimited();
+      break;
+    case "refresh-required":
+      renderRefreshRequired();
+      break;
+    case "no-slots":
+    default:
+      renderNoSlots();
+      break;
+  }
+})();
+</script>
 </body>
 </html>

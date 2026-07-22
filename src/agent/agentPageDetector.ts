@@ -42,21 +42,17 @@ export type PageSelectionResult =
   | { ok: true; page: Page }
   | { ok: false; reason: string };
 
-// Ne suppose jamais que la premiere page est la bonne (section 3): examine
-// TOUTES les pages ouvertes du contexte, ignore les pages fermees, prefere
-// une page reconnue par le detecteur approprie au mode, et ne retient
-// about:blank que s'il n'existe strictement aucune autre page ouverte (et
-// meme alors, seulement si elle passe elle-meme le detecteur - jamais par
-// defaut).
-export const findAppointmentPage = async (
-  pages: Page[],
-  targetMode: AgentTargetMode
-): Promise<PageSelectionResult> => {
+const usableCandidates = (pages: Page[]): Page[] => {
   const usable = pages.filter(isUsablePage);
   const nonBlank = usable.filter((page) => page.url() !== "about:blank");
-  const candidates = nonBlank.length > 0 ? nonBlank : usable;
+  return nonBlank.length > 0 ? nonBlank : usable;
+};
 
-  const checker = targetMode === "fixture" ? isFixtureAppointmentPage : isAppointmentPageReady;
+const selectWithChecker = async (
+  pages: Page[],
+  checker: (page: Page) => Promise<boolean>
+): Promise<PageSelectionResult> => {
+  const candidates = usableCandidates(pages);
 
   for (const page of candidates) {
     if (await checker(page)) {
@@ -71,3 +67,32 @@ export const findAppointmentPage = async (
       : `Aucune page de rendez-vous reconnue parmi ${candidates.length} onglet(s) ouvert(s).`
   };
 };
+
+// Ne suppose jamais que la premiere page est la bonne (section 3): examine
+// TOUTES les pages ouvertes du contexte, ignore les pages fermees, prefere
+// une page reconnue par le detecteur approprie au mode, et ne retient
+// about:blank que s'il n'existe strictement aucune autre page ouverte (et
+// meme alors, seulement si elle passe elle-meme le detecteur - jamais par
+// defaut).
+//
+// Utilisee UNIQUEMENT pour VALIDATE_BOT (selection initiale, section 3 Lot
+// 3): en mode fixture, verifie seulement la presence du marqueur de test
+// (deliberement permissif, une page fixture peut legitimement ne pas encore
+// afficher un contenu "pret" - ex. scenario rate-limited/refresh-required -
+// et VALIDATE_BOT doit quand meme reconnaitre que c'est la bonne page pour
+// que la boucle de surveillance puisse ensuite gerer ces cas elle-meme).
+export const findAppointmentPage = async (
+  pages: Page[],
+  targetMode: AgentTargetMode
+): Promise<PageSelectionResult> => selectWithChecker(pages, targetMode === "fixture" ? isFixtureAppointmentPage : isAppointmentPageReady);
+
+// Utilisee UNIQUEMENT par la boucle de surveillance pour la RECUPERATION en
+// cours de route (Lot 4: recoverPage/recoverWorkflow), jamais pour
+// VALIDATE_BOT. Contrairement a findAppointmentPage, verifie TOUJOURS le
+// contenu reellement pret (isAppointmentPageReady), y compris en mode
+// fixture: le marqueur fixture seul (toujours present, quel que soit le
+// scenario) ne doit jamais faire croire a une reprise reelle pendant qu'un
+// probleme (rate limit, page non prete) est encore affiche - piege constate
+// empiriquement (boucle a vitesse CPU tant que le marqueur reste present).
+export const findReadyAppointmentPage = async (pages: Page[]): Promise<PageSelectionResult> =>
+  selectWithChecker(pages, isAppointmentPageReady);

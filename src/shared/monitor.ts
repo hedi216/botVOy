@@ -16,7 +16,7 @@ import {
   waitRandomDelay
 } from "./orchestrator.js";
 import { takeTimestampedScreenshot } from "./screenshot.js";
-import { AppConfig, CandidateElementResult, MonitorEventLevel, MonitorRuntime } from "./types.js";
+import { AppConfig, CandidateElementResult, MonitorEventLevel, MonitorRuntime, SlotDetectedInfo } from "./types.js";
 
 type ResolvedMonitorRuntime = {
   botName?: string;
@@ -26,6 +26,11 @@ type ResolvedMonitorRuntime = {
   recoverPage: (preferredUrl?: string) => Promise<Page | null>;
   recoverWorkflow: (reason?: string) => Promise<Page | null>;
   waitWhileNotPaused: () => Promise<void>;
+  signal?: AbortSignal;
+  onRateLimited?: (cooldownMinutes: number) => void;
+  onSlotDetected?: (info: SlotDetectedInfo) => void;
+  onRefreshFailed?: () => void;
+  onRefreshSucceeded?: () => void;
 };
 
 const defaultRuntime: ResolvedMonitorRuntime = {
@@ -52,7 +57,12 @@ const resolveRuntime = (runtime?: MonitorRuntime): ResolvedMonitorRuntime => ({
   waitForUser: runtime?.waitForUser ?? defaultRuntime.waitForUser,
   recoverPage: runtime?.recoverPage ?? defaultRuntime.recoverPage,
   recoverWorkflow: runtime?.recoverWorkflow ?? defaultRuntime.recoverWorkflow,
-  waitWhileNotPaused: runtime?.waitWhileNotPaused ?? defaultRuntime.waitWhileNotPaused
+  waitWhileNotPaused: runtime?.waitWhileNotPaused ?? defaultRuntime.waitWhileNotPaused,
+  signal: runtime?.signal,
+  onRateLimited: runtime?.onRateLimited,
+  onSlotDetected: runtime?.onSlotDetected,
+  onRefreshFailed: runtime?.onRefreshFailed,
+  onRefreshSucceeded: runtime?.onRefreshSucceeded
 });
 
 export const waitForUserToStart = async (runtime?: MonitorRuntime): Promise<void> => {
@@ -72,11 +82,20 @@ const HUMAN_RECHECK_INTERVAL_MS = 15_000;
 // reprend sans jamais afficher de prompt ni solliciter l'humain.
 const waitForConditionToClear = async (
   page: Page,
-  isStillBlocked: () => Promise<boolean>
+  isStillBlocked: () => Promise<boolean>,
+  signal?: AbortSignal
 ): Promise<boolean> => {
   const deadline = Date.now() + HUMAN_BLOCK_GRACE_MS;
 
   while (Date.now() < deadline) {
+    // Lot 4: un STOP_BOT ne doit jamais rester coince jusqu'a 4 minutes dans
+    // cette attente silencieuse. On sort immediatement (traite comme
+    // "resolu") pour laisser l'appelant constater l'annulation a la
+    // prochaine verification en tete de boucle.
+    if (signal?.aborted) {
+      return true;
+    }
+
     if (page.isClosed()) {
       return true;
     }
@@ -100,8 +119,15 @@ export const pauseForHuman = async (
   const resolved = resolveRuntime(runtime);
   resolved.log("warn", `Intervention humaine potentiellement requise: ${reason}`);
 
+  if (resolved.signal?.aborted) {
+    return;
+  }
+
   if (page && isStillBlocked) {
-    const cleared = await waitForConditionToClear(page, isStillBlocked);
+    const cleared = await waitForConditionToClear(page, isStillBlocked, resolved.signal);
+    if (resolved.signal?.aborted) {
+      return;
+    }
     if (cleared) {
       resolved.log("success", "Situation resolue automatiquement, reprise de la surveillance sans intervention.");
       return;
@@ -456,7 +482,10 @@ const waitMonthClickDelay = async (
     config.monthClickMinDelayMs,
     config.monthClickMaxDelayMs,
     runtime.log,
-    "Attente entre changements de mois"
+    "Attente entre changements de mois",
+    undefined,
+    undefined,
+    runtime.signal
   );
 };
 
@@ -578,6 +607,10 @@ export const monitorAppointments = async (
   let attempts = 0;
 
   while (config.maxRefreshAttempts === 0 || attempts < config.maxRefreshAttempts) {
+    if (resolved.signal?.aborted) {
+      resolved.log("info", "Surveillance interrompue (arret demande).");
+      return;
+    }
     await resolved.waitWhileNotPaused();
     attempts += 1;
     lastKnownUrl = activePage.isClosed() ? lastKnownUrl : activePage.url();
@@ -599,6 +632,7 @@ export const monitorAppointments = async (
     if (unexpectedReason) {
       if (isRateLimitReason(unexpectedReason)) {
         applyRateLimitCooldown(pageDomain(activePage), config.rateLimitCooldownMinutes, resolved.log);
+        resolved.onRateLimited?.(config.rateLimitCooldownMinutes);
       }
       const recoveredPage = await resolved.recoverWorkflow(unexpectedReason);
       if (recoveredPage) {
@@ -623,8 +657,13 @@ export const monitorAppointments = async (
       botName: resolved.botName,
       domain: groupKey,
       settings: config,
-      log: resolved.log
+      log: resolved.log,
+      signal: resolved.signal
     });
+    if (resolved.signal?.aborted) {
+      resolved.log("info", "Surveillance interrompue (arret demande).");
+      return;
+    }
 
     let availability: Awaited<ReturnType<typeof detectAppointmentAvailability>>;
     try {
@@ -660,7 +699,8 @@ export const monitorAppointments = async (
           resolved.log,
           "Attente avant nouveau cycle",
           groupKey,
-          resolved.botName
+          resolved.botName,
+          resolved.signal
         );
         continue;
       }
@@ -668,6 +708,10 @@ export const monitorAppointments = async (
       resolved.log("success", "CRENEAU_POTENTIEL_DETECTE");
       resolved.log("info", `Date/heure: ${availability.dateTimeHint ?? candidate.text ?? "non determinee"}`);
       resolved.log("info", `Texte trouve: ${availability.textFound ?? candidate.text ?? "non determine"}`);
+      resolved.onSlotDetected?.({
+        textFound: availability.textFound ?? candidate.text,
+        dateTimeHint: availability.dateTimeHint ?? candidate.text
+      });
       broadcastAppointmentSignal(groupKey, resolved.botName, resolved.log);
       await takeTimestampedScreenshot(activePage, "appointment-detected");
       await highlightElement(activePage, candidate.locator);
@@ -732,6 +776,7 @@ export const monitorAppointments = async (
 
         lastKnownUrl = activePage.url();
         await refreshAndWaitForReady(activePage, resolved);
+        resolved.onRefreshSucceeded?.();
       } catch (error) {
         if (isTargetClosedError(error)) {
           const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
@@ -746,6 +791,11 @@ export const monitorAppointments = async (
         const reason = `Refresh impossible ou page instable: ${error instanceof Error ? error.message : String(error)}`;
         if (isRateLimitReason(reason)) {
           applyRateLimitCooldown(pageDomain(activePage), config.rateLimitCooldownMinutes, resolved.log);
+          resolved.onRateLimited?.(config.rateLimitCooldownMinutes);
+        }
+        resolved.onRefreshFailed?.();
+        if (resolved.signal?.aborted) {
+          return;
         }
         await safeScreenshot(activePage, "reload-error");
         await alertAndPause(reason, resolved);
@@ -760,7 +810,8 @@ export const monitorAppointments = async (
       resolved.log,
       "Attente avant nouveau cycle",
       groupKey,
-      resolved.botName
+      resolved.botName,
+      resolved.signal
     );
   }
 

@@ -84,7 +84,12 @@ const handleCommand = (
   log: ReturnType<typeof createAgentLogger>
 ): void => {
   if (command.type === "START_BOT") {
-    void botManager.startBot({ commandId: command.commandId, botId: command.botId });
+    const payload = command.payload as { monitoringSettings?: unknown } | undefined;
+    void botManager.startBot({
+      commandId: command.commandId,
+      botId: command.botId,
+      rawMonitoringSettings: payload?.monitoringSettings
+    });
     return;
   }
 

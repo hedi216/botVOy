@@ -4,12 +4,23 @@ import { acquireProfileLock, ProfileLease } from "./agentProfileManager.js";
 import { AgentCommandError, toAgentCommandError } from "./agentErrors.js";
 import { AgentEventReporter } from "./agentEventReporter.js";
 import { AgentLogFn } from "./agentLocalLogger.js";
+import { validateMonitoringSettings } from "./agentMonitoringSettings.js";
+import { startMonitoring } from "./agentMonitoringRuntime.js";
 import { AgentBotHandle, AgentRuntimeSettings } from "./types.js";
+
+// Delai maximum laisse a la boucle de surveillance pour repondre a
+// l'annulation avant de fermer Chrome de force (section 11 du cahier des
+// charges Lot 4): l'arret du navigateur ne doit jamais dependre de la boucle.
+const MONITORING_STOP_TIMEOUT_MS = 8_000;
 
 export type StartBotParams = {
   commandId: string;
   botId: string;
   botName?: string;
+  // Snapshot brut (non fiable) transmis par le serveur dans
+  // START_BOT.publicPayload.monitoringSettings (Lot 4): toujours revalide
+  // ici, jamais fait confiance tel quel (section 4).
+  rawMonitoringSettings?: unknown;
 };
 
 export type StopBotParams = {
@@ -59,6 +70,7 @@ export class AgentBotManager {
 
   async startBot(params: StartBotParams): Promise<void> {
     const { commandId, botId } = params;
+    const settingsSnapshot = validateMonitoringSettings(params.rawMonitoringSettings, this.log);
 
     if (this.shuttingDown) {
       this.reporter.failed(commandId, "AGENT_CAPACITY_REACHED", "Agent en cours d'arret: aucune nouvelle commande acceptee.");
@@ -101,7 +113,9 @@ export class AgentBotManager {
         startedAt: new Date().toISOString(),
         lastActivityAt: new Date().toISOString(),
         lastError: null,
-        monitoringPrepared: false
+        monitoringPrepared: false,
+        settingsSnapshot,
+        monitoringRuntime: null
       };
       this.bots.set(botId, handle);
       this.wireUnexpectedClosure(handle);
@@ -158,6 +172,19 @@ export class AgentBotManager {
     try {
       handle.browser.removeAllListeners("disconnected");
       handle.browserProcess.removeAllListeners("exit");
+
+      // Section 11: annulation immediate de la boucle de surveillance
+      // (sleeps/tour de scan/attente humaine deja abortables, cf. Lot 4),
+      // avec un delai maximum avant de fermer Chrome de force quoi qu'il
+      // arrive: l'arret du navigateur ne doit jamais dependre de la boucle.
+      if (handle.monitoringRuntime) {
+        handle.monitoringRuntime.abortController.abort();
+        await Promise.race([
+          handle.monitoringRuntime.loopPromise,
+          new Promise<void>((resolve) => setTimeout(resolve, MONITORING_STOP_TIMEOUT_MS))
+        ]);
+        handle.monitoringRuntime = null;
+      }
 
       await closeBrowserWithTimeout(handle.browser);
       await killChromeProcess(handle.browserProcess);
@@ -231,9 +258,24 @@ export class AgentBotManager {
       handle.currentStatus = "MONITORING";
       handle.lastActivityAt = new Date().toISOString();
 
+      // Section 2 du cahier des charges Lot 4: AbortController + snapshot
+      // deja valides (a l'ouverture du bot) -> demarrage reel de la boucle
+      // -> BOT_STATUS MONITORING -> COMMAND_COMPLETED, dans cet ordre.
+      handle.monitoringRuntime = startMonitoring({
+        botId,
+        page: selection.page,
+        context: handle.context,
+        settings: handle.settingsSnapshot,
+        targetUrl: this.settings.targetUrl,
+        commandId,
+        reporter: this.reporter,
+        log: this.log,
+        isBotStillRegistered: () => this.bots.has(botId)
+      });
+
       this.reporter.botStatus(botId, commandId, "MONITORING");
       this.reporter.completed(commandId, { botId, status: "MONITORING", validated: true });
-      this.log("success", `Bot ${botId} valide: page reconnue (${maskUrlForLog(selection.page.url())}).`);
+      this.log("success", `Bot ${botId} valide: page reconnue (${maskUrlForLog(selection.page.url())}), surveillance demarree.`);
     } catch (error) {
       const commandError = toAgentCommandError(error, "PAGE_NOT_READY");
       this.log("error", `VALIDATE_BOT ${botId} echoue (${commandError.code}): ${commandError.message}`);
@@ -254,6 +296,7 @@ export class AgentBotManager {
         return;
       }
       this.log("warn", `Bot ${handle.botId}: navigateur ferme ou deconnecte de maniere inattendue.`);
+      handle.monitoringRuntime?.abortController.abort();
       this.leases.get(handle.botId)?.release();
       this.leases.delete(handle.botId);
       this.bots.delete(handle.botId);
@@ -280,7 +323,8 @@ export class AgentBotManager {
       BROWSER_CONNECTION_LOST: "La connexion au navigateur de ce bot a ete perdue.",
       PAGE_NOT_READY: "La page de rendez-vous n'est pas prete.",
       PAGE_CLOSED: "L'onglet du bot a ete ferme.",
-      VALIDATION_ALREADY_RUNNING: "Une verification de page est deja en cours pour ce bot."
+      VALIDATION_ALREADY_RUNNING: "Une verification de page est deja en cours pour ce bot.",
+      REFRESH_FAILED: "Le rafraichissement de la page a echoue de maniere repetee."
     };
     return messages[error.code] ?? "Erreur interne de l'agent.";
   }
@@ -299,6 +343,13 @@ export class AgentBotManager {
         this.reporter.botStatus(handle.botId, handle.startCommandId, "STOPPING");
       } catch {
         // best effort: la connexion serveur peut deja etre fermee.
+      }
+      if (handle.monitoringRuntime) {
+        handle.monitoringRuntime.abortController.abort();
+        await Promise.race([
+          handle.monitoringRuntime.loopPromise,
+          new Promise<void>((resolve) => setTimeout(resolve, MONITORING_STOP_TIMEOUT_MS))
+        ]);
       }
       await closeBrowserWithTimeout(handle.browser);
       await killChromeProcess(handle.browserProcess);

@@ -27,6 +27,12 @@ type TurnInput = {
   domain: string;
   settings: ScanTurnSettings;
   log: Logger;
+  // Lot 4 (Phase 4): permet a un STOP_BOT d'interrompre immediatement
+  // l'attente d'un tour de scan, sans consommer de permis ni perturber les
+  // autres attentes du meme domaine (seul CE waiter precis est retire).
+  // Optionnel: absent, comportement identique a avant (jamais annulable),
+  // donc aucun changement pour le chemin legacy_vm.
+  signal?: AbortSignal;
 };
 
 const domainStates = new Map<string, DomainState>();
@@ -37,6 +43,34 @@ const COVERAGE_WAKE_MAX_MS = 45_000;
 const RESERVATION_HOLD_RECHECK_MINUTES = 119;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Meme contrat que sleep(), mais resout immediatement des que le signal
+// s'active (STOP_BOT), sans jamais rejeter: l'appelant traite une fin
+// anticipee exactement comme un delai ecoule, seul le contexte appelant sait
+// s'il doit alors s'arreter (via signal.aborted).
+const abortableSleep = (ms: number, signal?: AbortSignal): Promise<void> => {
+  if (!signal) {
+    return sleep(ms);
+  }
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = (): void => {
+      cleanup();
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+};
 
 const getState = (domain: string): DomainState => {
   const existing = domainStates.get(domain);
@@ -191,8 +225,15 @@ export const waitRandomDelay = async (
   log?: Logger,
   label = "Attente",
   wakeOnAppointmentDomain?: string,
-  botName?: string
+  botName?: string,
+  // Lot 4: annulation cooperative (STOP_BOT). Optionnel, sans effet si
+  // absent: comportement inchange pour le chemin legacy_vm existant.
+  signal?: AbortSignal
 ): Promise<void> => {
+  if (signal?.aborted) {
+    return;
+  }
+
   const delayMs = randomBetween(min, max);
   if (delayMs > 0) {
     log?.("info", `${label}: ${delayMs}ms.`);
@@ -209,6 +250,7 @@ export const waitRandomDelay = async (
           if (botName) {
             state.coverageSleepers.delete(botName);
           }
+          signal?.removeEventListener("abort", onAbort);
         };
 
         const finish = (value: boolean) => {
@@ -225,9 +267,17 @@ export const waitRandomDelay = async (
           finish(false);
         };
 
+        const onAbort = () => {
+          finish(false);
+        };
+
         const timer = setTimeout(() => {
           finish(false);
         }, delayMs);
+
+        if (signal) {
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
 
         if (botName) {
           state.coverageSleepers.set(botName, wakeCoverage);
@@ -248,21 +298,34 @@ export const waitRandomDelay = async (
       return;
     }
 
-    await sleep(delayMs);
+    await abortableSleep(delayMs, signal);
   }
 };
 
-export const waitForScanTurn = async ({ botName, domain, settings, log }: TurnInput): Promise<void> => {
+// IMPORTANT (contrat d'annulation, Lot 4): cette fonction RESOUT
+// normalement dans les DEUX cas — permis reellement obtenu, OU `signal`
+// active pendant l'attente. Elle ne rejette jamais sur annulation (pour ne
+// pas transformer un STOP_BOT en exception a gerer partout). L'appelant DOIT
+// donc toujours verifier `signal?.aborted` juste apres avoir attendu cette
+// fonction avant de considerer qu'un permis a ete obtenu (monitor.ts le fait
+// deja systematiquement) — ne jamais se fier a la simple resolution de la
+// promesse.
+export const waitForScanTurn = async ({ botName, domain, settings, log, signal }: TurnInput): Promise<void> => {
   const label = botName ? `${botName}` : "Bot";
   touchParticipant(domain, botName);
 
   while (true) {
+    if (signal?.aborted) {
+      log("info", `Orchestration: attente de tour de scan annulee pour ${label} sur ${domain}.`);
+      return;
+    }
+
     const state = getState(domain);
     const now = Date.now();
     if (state.cooldownUntil > now) {
       const waitMs = state.cooldownUntil - now;
       log("warn", `Orchestration: ${domain} en cooldown rate-limit. ${label} attend ${Math.ceil(waitMs / 60_000)} min.`);
-      await sleep(Math.min(waitMs, 60_000));
+      await abortableSleep(Math.min(waitMs, 60_000), signal);
       continue;
     }
 
@@ -281,9 +344,50 @@ export const waitForScanTurn = async ({ botName, domain, settings, log }: TurnIn
     }
 
     log("info", `Orchestration: ${label} attend son tour pour ${domain}.`);
-    await new Promise<void>((resolve) => {
-      state.waiters.push(resolve);
+    // Le waiter n'octroie jamais lui-meme de permis: il ne fait que reveiller
+    // ce candidat precis pour qu'il reboucle et retente l'acquisition
+    // ci-dessus (comportement identique a avant). Seule nouveaute (Lot 4):
+    // si `signal` s'active pendant cette attente precise, CE waiter (et lui
+    // seul) est retire de state.waiters puis la fonction retourne sans avoir
+    // consomme de permis, sans perturber les autres bots en attente sur le
+    // meme domaine.
+    const acquiredTurn = await new Promise<boolean>((resolve) => {
+      let settled = false;
+
+      const waiter = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(true);
+      };
+
+      const onAbort = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        const index = state.waiters.indexOf(waiter);
+        if (index >= 0) {
+          state.waiters.splice(index, 1);
+        }
+        resolve(false);
+      };
+
+      const cleanup = (): void => {
+        signal?.removeEventListener("abort", onAbort);
+      };
+
+      state.waiters.push(waiter);
+      signal?.addEventListener("abort", onAbort, { once: true });
     });
+
+    if (!acquiredTurn) {
+      log("info", `Orchestration: attente de tour de scan annulee pour ${label} sur ${domain}.`);
+      return;
+    }
   }
 };
 

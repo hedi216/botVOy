@@ -3,6 +3,9 @@
 // fichier ne doit jamais importer quoi que ce soit depuis src/server.ts,
 // src/db.ts ou tout module cote serveur (cf. section 2 du cahier des charges).
 
+import type { AgentMonitoringSettings } from "./agentMonitoringSettings.js";
+import type { MonitoringRuntimeHandle } from "./agentMonitoringRuntime.js";
+
 export type AgentTargetMode = "production" | "fixture";
 
 export type AgentRuntimeSettings = {
@@ -49,6 +52,8 @@ export type AgentBotStatusValue =
   | "STARTING"
   | "WAITING_FOR_USER"
   | "MONITORING"
+  | "RATE_LIMITED"
+  | "SLOT_DETECTED"
   | "STOPPING"
   | "STOPPED"
   | "ERROR";
@@ -73,7 +78,9 @@ export const AGENT_COMMAND_ERROR_CODES = [
   "PAGE_CLOSED",
   "INVALID_BOT_STATE",
   "AGENT_NOT_CONNECTED",
-  "VALIDATION_ALREADY_RUNNING"
+  "VALIDATION_ALREADY_RUNNING",
+  // Lot 4 (surveillance reelle)
+  "REFRESH_FAILED"
 ] as const;
 
 export type AgentCommandErrorCode = typeof AGENT_COMMAND_ERROR_CODES[number];
@@ -93,8 +100,13 @@ export type AgentBotHandle = {
   startedAt: string;
   lastActivityAt: string;
   lastError: string | null;
-  // Lot 3: vrai seulement une fois VALIDATE_BOT reussi. Le Lot 3 ne demarre
-  // pas de boucle de scan reelle (Lot 4): ce champ documente seulement que
-  // la page a ete validee et que le moteur local est pret a commencer.
+  // Lot 3: vrai seulement une fois VALIDATE_BOT reussi et la boucle
+  // effectivement demarree (Lot 4).
   monitoringPrepared: boolean;
+  // Lot 4: snapshot deja valide/borne (jamais le payload brut du serveur),
+  // propre a CE bot (section 3/4).
+  settingsSnapshot: AgentMonitoringSettings;
+  // Lot 4: present uniquement pendant MONITORING (entre VALIDATE_BOT reussi
+  // et STOP_BOT/fermeture).
+  monitoringRuntime: MonitoringRuntimeHandle | null;
 };
