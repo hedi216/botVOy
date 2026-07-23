@@ -1,6 +1,8 @@
 import "dotenv/config";
 import os from "node:os";
 import path from "node:path";
+import agentVersionInfo from "./agentVersionInfo.json";
+import { getDefaultCredentialsPath } from "./agentStorage.js";
 import { AgentLogLevelSetting, AgentRuntimeSettings, AgentTargetMode } from "./types.js";
 
 // Version locale au runtime agent: independante du numero de version du
@@ -8,7 +10,14 @@ import { AgentLogLevelSetting, AgentRuntimeSettings, AgentTargetMode } from "./t
 // pas ce runtime). Alignee par defaut sur AGENT_MIN_VERSION cote serveur
 // (config.ts) pour qu'un agent fraichement demarre ne soit jamais rejete
 // comme VERSION_INCOMPATIBLE sans configuration explicite.
-export const AGENT_VERSION = process.env.AGENT_VERSION?.trim() || "0.1.0";
+//
+// Phase 5 (Lot 1, section 13): source UNIQUE de version, importee en JSON
+// (tsc copie automatiquement ce fichier a cote du .js compile, donc toujours
+// resolu par un chemin relatif stable, meme empaquete) plutot qu'une chaine
+// dupliquee en dur ici. Ne PAS changer agentVersionInfo.json sans decision
+// explicite (jamais un bump de version silencieux depuis ce fichier de code).
+export const AGENT_VERSION = process.env.AGENT_VERSION?.trim() || agentVersionInfo.agentVersion;
+export const AGENT_PROTOCOL_VERSION = agentVersionInfo.protocolVersion;
 
 const numberEnv = (key: string, fallback: number): number => {
   const raw = process.env[key];
@@ -103,17 +112,19 @@ export const loadAgentSettings = (): AgentRuntimeSettings => {
     );
   }
 
+  const dataRoot = resolveDataRoot();
+
   return {
     serverUrl: process.env.AGENT_SERVER_URL?.trim() || `http://localhost:${process.env.WEB_PORT || 3000}`,
     credentialsPath: process.env.AGENT_CREDENTIALS_PATH?.trim()
-      || path.join(process.cwd(), ".agent-test-credentials.json"),
+      || getDefaultCredentialsPath(dataRoot),
     computerName: process.env.AGENT_COMPUTER_NAME?.trim() || os.hostname(),
     version: AGENT_VERSION,
     targetMode,
     fixtureUrl,
     targetUrl,
     maxActiveBots: numberEnv("AGENT_MAX_ACTIVE_BOTS", 15),
-    dataRoot: resolveDataRoot(),
+    dataRoot,
     reconnectMinDelayMs,
     reconnectMaxDelayMs,
     reconnectJitterRatio: ratioEnv("AGENT_RECONNECT_JITTER_RATIO", 0.2),

@@ -1,6 +1,11 @@
 # Plan de transition Phase 5 — Packaging de l'Agent
 
-Ce document definit le perimetre envisage pour Phase 5 **sans rien implementer**. Il presente les decisions ouvertes avec leurs compromis, pour validation avant tout debut d'implementation. Phase 4/Lot 6 n'introduit aucun de ces elements.
+## 0. Statut
+
+- **Lot 1 (audit, choix de technologie, resolution des chemins, version centralisee, build compile minimal) : termine.** Voir [agent-packaging.md](agent-packaging.md) pour le detail complet (audit, matrice de decision, resultats de test). Resume : `tsc` (CommonJS) + copie de la fermeture de dependance agent/shared + installation isolee de 3 dependances runtime reelles (`playwright`, `socket.io-client`, `dotenv`) ; deux defauts reels corriges (classification de dependance, chemin de credentials par defaut base sur `process.cwd()`) ; version centralisee (`src/agent/agentVersionInfo.json`) ; build reproductible (`npm run agent:package:win`) valide de bout en bout (build copie hors du depot, execute via `node` seul, cycle fixture complet reussi) ; aucune regression Phase 4 (283/283 simule, 102/102 reel).
+- **Lots 2-5 : non commences.** Ce document reste le plan A PRIORI pour ces lots ; la section 17 ci-dessous precise le plan du Lot 2 tel qu'issu des conclusions du Lot 1.
+
+Ce document definit le perimetre envisage pour la suite de Phase 5 **sans rien implementer au-dela du Lot 1**. Il presente les decisions ouvertes avec leurs compromis, pour validation avant chaque nouveau lot.
 
 ## 1. Format cible
 
@@ -14,7 +19,7 @@ Ce document definit le perimetre envisage pour Phase 5 **sans rien implementer**
 | **pkg / nexe (binaire Node autonome) + NSIS/Inno Setup pour l'installeur** | Garde le runtime agent en Node.js pur (code actuel reutilisable tel quel), installeur separe et simple | Deux outils a maintenir plutot qu'un seul |
 | **Inno Setup seul, autour d'un Node.js embarque** | Tres controle, largement documente pour Windows | Necessite d'embarquer/verifier une version de Node.js correcte sur la machine cible |
 
-*Recommandation a valider avec l'equipe* : pkg/nexe pour le binaire + Inno Setup pour l'installeur, car cela isole le changement de packaging du code applicatif (`src/agent/*` resterait inchange).
+**Mise a jour post-Lot 1** : comparaison complete (incluant Node SEA, rejete pour pkg/nexe) dans [agent-packaging.md](agent-packaging.md) section 2. Decision retenue pour le Lot 1 : `tsc` seul (pas encore de binaire unique). Candidate pour le Lot 2/3 : **Node SEA** (support officiel Node.js, prefere a pkg/nexe dont le projet de reference est archive) pour produire l'executable unique, puis **Inno Setup** pour l'installateur (per-user, sans droits admin).
 
 ## 3. Contenu de l'installeur (a definir)
 
@@ -57,7 +62,7 @@ Non couvert par Phase 4. Necessaire avant toute distribution large pour eviter l
 
 ## 10. Gestion de version
 
-`AGENT_VERSION` existe deja (`src/agent/agentSettings.ts`) et alimente deja la verification de compatibilite serveur (`AGENT_MIN_VERSION`, code `AGENT_VERSION_INCOMPATIBLE`). Phase 5 devrait faire correspondre cette version a celle affichee par l'installeur/le numero de release — decision ouverte sur le format exact (semver strict vs numero de build).
+**Mise a jour post-Lot 1** : source unique creee (`src/agent/agentVersionInfo.json`, `{ agentVersion, protocolVersion }`), consommee par `src/agent/agentSettings.ts` et par `version.json` genere a chaque build. Version actuelle NON changee (`0.1.0`) — recommandation proposee (non appliquee) : `0.5.0` pour cette etape pre-installateur, `1.0.0` reserve a la fin du Lot 3. Decision a valider explicitement avant tout changement reel.
 
 ## 11. Telechargement depuis l'interface web
 
@@ -83,3 +88,16 @@ A definir : niveau de log par defaut en production (actuellement `AGENT_LOG_LEVE
 ## 16. Ce que Phase 5 n'annoncera PAS avant validation
 
 Aucun installeur, aucun service Windows, aucune mise a jour automatique, aucun stockage DPAPI definitif ne doit etre presente comme livre avant que l'implementation correspondante soit reellement terminee et validee — voir [phase4-known-limitations.md](phase4-known-limitations.md) pour l'etat actuel exact.
+
+## 17. Plan precis du Lot 2
+
+Objectif : credential store DPAPI, appairage local (ecran de pairage au premier lancement), verrou mono-instance, mode sans console visible.
+
+1. **`AgentCredentialStore` (interface)** : `load(): StoredAgentCredentials | null`, `save(credentials): void`, `clear(): void`. Implementations : `DevFileCredentialStore` (comportement actuel, fichier JSON en clair — conserve pour dev/test), `WindowsDpapiCredentialStore` (chiffrement via DPAPI `CurrentUser`, ecriture atomique, permissions restrictives), `TestCredentialStore` (en memoire, pour les tests unitaires). Selection explicite (jamais une detection implicite basee sur la plateforme seule) via un parametre de configuration valide au demarrage.
+2. **Migration** : au premier chargement, si un fichier de credentials en clair existe (ancien format) et qu'aucune donnee DPAPI n'existe encore, migrer automatiquement puis supprimer le fichier en clair UNIQUEMENT apres confirmation d'ecriture reussie du format chiffre (jamais de suppression avant confirmation).
+3. **Ecran d'appairage local** : au demarrage, si aucune credential valide n'est trouvee, afficher (console interactive pour ce lot, tray UI potentiellement Lot 3) une invite pour saisir le code d'appairage ; gerer explicitement code invalide/expire/trop de tentatives/serveur inaccessible/agent deja appaire.
+4. **Verrou mono-instance** : mutex nomme Windows (ou fichier de verrou avec PID + verification de vivacite), un second lancement detecte l'instance existante et se termine proprement avec un message clair (jamais une seconde connexion/surveillance dupliquee).
+5. **Mode sans console** : investiguer le lancement via `pythonw`-equivalent Windows (`node.exe` sans fenetre console visible, ex. via un petit lanceur natif ou `START /B` avec redirection) — Chrome doit rester visible, seule la fenetre console de l'agent doit disparaitre.
+6. **Tests** : `npm run test:agent:credentials:simulated` (store DPAPI simule/mock sur VM), test reel sur PC Windows pour la migration et le verrou mono-instance.
+
+Criteres d'acceptation proposes (a confirmer avant de commencer) : aucun token en clair sur disque en mode DPAPI ; migration testee (ancien format -> DPAPI) sans perte ; deuxieme instance detectee et refusee proprement ; non-regression Phase 4 et Lot 1 maintenue.

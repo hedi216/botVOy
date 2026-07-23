@@ -10,9 +10,12 @@
     "db:init": "tsx src/initDb.ts",
     "build": "tsc",
     "package:win": "powershell -ExecutionPolicy Bypass -File scripts/package-win.ps1",
+    "agent:package:win": "powershell -ExecutionPolicy Bypass -File scripts/agent-package-win.ps1",
     "start": "node dist/index.js",
     "web:start": "node dist/server.js",
     "playwright:install": "playwright install chromium",
+    "test:agent:packaging:simulated": "tsx scripts/test-agent-packaging-simulated.ts",
+    "test:agent:packaging:real": "tsx scripts/test-agent-packaging-real.ts",
     "test:agent:bot-status:simulated": "tsx scripts/test-agent-bot-status-simulated.ts",
     "test:agent:bot-status:real": "tsx scripts/test-agent-bot-status-real.ts",
     "test:agent:validate:simulated": "tsx scripts/test-agent-validate-simulated.ts",
@@ -40,14 +43,14 @@
     "express": "^5.2.1",
     "pg": "^8.22.0",
     "playwright": "^1.49.1",
-    "socket.io": "^4.8.3"
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
     "@types/cookie-parser": "^1.4.10",
     "@types/express": "^5.0.6",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.20.0",
-    "socket.io-client": "^4.8.3",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
