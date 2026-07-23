@@ -6,8 +6,10 @@
 //
 // Rappel du protocole reel (voir src/agentGateway.ts):
 // - namespace: io.of("/agent")
-// - handshake.auth en mode pairing:   { mode: "pair", pairingCode, computerName, version }
-// - handshake.auth en mode reconnect: { mode: "reconnect", agentId, token, computerName?, version }
+// - handshake.auth en mode pairing:   { mode: "pair", pairingCode, computerName, version, protocolVersion }
+// - handshake.auth en mode reconnect: { mode: "reconnect", agentId, token, computerName?, version, protocolVersion }
+// - protocolVersion (Phase 5, Lot 2 - correctif protocole) est obligatoire:
+//   absent/non numerique/inferieur au plancher serveur -> VERSION_INCOMPATIBLE.
 // - le serveur emet "AGENT_CONNECTED" avec { agentId, agencyId, token, heartbeatIntervalMs, offlineTimeoutMs }
 //   (token non-nul uniquement lors du premier appairage)
 // - l'agent doit emettre "AGENT_HEARTBEAT" avec { version?, activeBotCount? }
@@ -50,6 +52,7 @@ const STATUS_PING_INTERVAL_MS = 30_000;
 const TEST_COMPUTER_NAME = "TEST-PC";
 const TEST_DISPLAY_NAME = "PC Test Phase 1";
 const TEST_VERSION = "1.0.0";
+const TEST_PROTOCOL_VERSION = 1;
 
 const log = (label: string, message: string): void => {
   console.log(`[${new Date().toISOString()}] [${label}] ${message}`);
@@ -160,7 +163,8 @@ const runPairMode = (pairingCode: string): void => {
       mode: "pair",
       pairingCode,
       computerName: TEST_COMPUTER_NAME,
-      version: TEST_VERSION
+      version: TEST_VERSION,
+      protocolVersion: TEST_PROTOCOL_VERSION
     }
   });
 
@@ -208,7 +212,8 @@ const runReconnectMode = (): void => {
       agentId: credentials.agentId,
       token: credentials.token,
       computerName: credentials.computerName,
-      version: credentials.version
+      version: credentials.version,
+      protocolVersion: TEST_PROTOCOL_VERSION
     }
   });
 

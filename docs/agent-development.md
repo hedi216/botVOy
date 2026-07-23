@@ -1,4 +1,4 @@
-# Developpement Agent (Phase 4)
+# Developpement Agent (Phase 4 + Phase 5)
 
 ## 1. Prerequis
 
@@ -30,6 +30,9 @@ Variables agent utiles en developpement (voir `.env.example`, section "AGENT (PC
 - `AGENT_SERVER_URL` : URL du serveur (defaut `http://localhost:<WEB_PORT>`).
 - `AGENT_CREDENTIALS_PATH` / `AGENT_DATA_DIR` : isoler un agent de developpement du profil Windows reel.
 - `AGENT_TARGET_MODE=fixture` + `AGENT_FIXTURE_URL=<file://...>` : faire pointer l'agent vers la fixture locale plutot que la production, sans toucher au code.
+- `AGENT_RUNTIME_MODE` (Phase 5, Lot 2) : `development` (defaut, store credentials en clair, comportement historique) / `packaged` (DPAPI obligatoire, Windows uniquement) / `test` (store en memoire). Ne jamais forcer `packaged` en developpement courant sauf pour tester specifiquement le credential store DPAPI.
+
+Sans identifiants stockes et sans code passe en argument CLI, l'agent demarre desormais une **interface locale** (`http://127.0.0.1:<port>/`, port affiche dans les logs) pour saisir un code d'appairage — voir [agent-local-ui.md](agent-local-ui.md). Un seul agent peut tourner a la fois par dossier de donnees (`AGENT_DATA_DIR`) : un second lancement avec le meme `AGENT_DATA_DIR` ouvre l'interface de l'instance existante et se termine (voir verrou mono-instance, [agent-packaging.md](agent-packaging.md) section 9).
 
 ## 3. Ou modifier quoi
 
@@ -41,6 +44,8 @@ Variables agent utiles en developpement (voir `.env.example`, section "AGENT (PC
 | Nouveau type de commande serveur->agent | `src/agentCommandService.ts` (serveur) + `src/agent/agentBotManager.ts` (agent) — garder le protocole symetrique |
 | Nouveau champ expose au frontend pour un agent/bot | Passer par `toPublicAgent()`/`publicCommandFor()` (jamais un objet DB brut), puis mettre a jour la liste blanche de `scripts/test-agent-serialization.ts` |
 | Nouveau scenario de test | Voir [agent-testing.md](agent-testing.md) section 2 |
+| Stockage de credentials (Phase 5) | `src/agent/agentCredentialStore.ts`/`agentDpapiCredentialStore.ts` — jamais lire/ecrire `settings.credentialsPath` directement ailleurs, toujours via `AgentCredentialStore` |
+| Interface locale (Phase 5) | `src/agent/agentLocalUi.ts` (routes) + `agentLocalUiPage.ts` (page embarquee) — jamais une nouvelle dependance HTTP, `node:http` suffit |
 
 ## 4. Regles de conception a respecter
 
@@ -56,6 +61,8 @@ Variables agent utiles en developpement (voir `.env.example`, section "AGENT (PC
 ```cmd
 npx tsc --noEmit
 npm run test:phase4:final:simulated
+npm run test:agent:packaging:simulated
+npm run test:agent:packaging-lot2:simulated
 ```
 
 Pour toute modification touchant reellement Chrome/l'agent (profils, extensions, reconnexion, surveillance), executer aussi la suite reelle correspondante sur un PC Windows personnel (voir [agent-testing.md](agent-testing.md)), jamais sur la VM.

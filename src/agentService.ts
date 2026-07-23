@@ -181,14 +181,57 @@ export const getAgentById = async (agentId: number): Promise<DbAgent | null> => 
   return result.rows[0] ?? null;
 };
 
-export const verifyAgentToken = async (agentId: number, token: string): Promise<DbAgent | null> => {
+// Phase 5 (Lot 2 - correctif protocole, puis correctif de securite
+// complementaire): resultat structure remplacant l'ancien DbAgent|null
+// ambigu. Cause exacte du premier defaut trouve par l'audit : agent
+// inexistant, token errone, ET agent revoque produisaient tous les trois
+// EXACTEMENT le meme resultat (null), donc la meme reponse INVALID_TOKEN
+// cote protocole - un agent reellement revoque ne pouvait jamais
+// l'apprendre.
+//
+// Defaut complementaire trouve APRES ce premier correctif : verifier le
+// statut "revoked" AVANT la comparaison du token permettait a un client ne
+// connaissant PAS le vrai token de distinguer un agentId revoque (toujours
+// AGENT_REVOKED, quel que soit le token presente) d'un agentId inexistant ou
+// actif (INVALID_TOKEN) - une enumeration d'agentId sans jamais avoir besoin
+// du token reel. Corrige en deplacant la verification du token AVANT le
+// controle de revocation : AGENT_REVOKED n'est desormais renvoye QUE si le
+// token presente est reellement celui de cet agent. Le hash n'est jamais
+// efface a la revocation (revokeAgent() ne touche que status/revoked_at,
+// voir plus bas) - necessaire pour effectuer cette comparaison meme apres
+// revocation. Jamais de journalisation du token ni de son hash ici.
+export type AgentAuthenticationResult =
+  | { ok: true; agent: DbAgent }
+  | { ok: false; reason: "INVALID_TOKEN" }
+  | { ok: false; reason: "AGENT_REVOKED" };
+
+export const authenticateAgent = async (agentId: number, token: string): Promise<AgentAuthenticationResult> => {
   const agent = await getAgentById(agentId);
-  if (!agent || agent.status === "revoked") {
-    return null;
+  if (!agent) {
+    // Jamais reveler si cet agentId existe reellement : un agentId inconnu
+    // et un token errone pour un agent existant partagent EXACTEMENT la
+    // meme reponse publique.
+    return { ok: false, reason: "INVALID_TOKEN" };
   }
 
+  // Comparaison sure (bcrypt, temps constant par construction) AVANT tout
+  // controle de statut : un token errone ne doit jamais reveler si l'agent
+  // cible est actif, revoque, ou distinguer quoi que ce soit d'un agentId
+  // inexistant - toujours INVALID_TOKEN dans ces trois cas.
   const matches = await verifyPassword(token, agent.token_hash);
-  return matches ? agent : null;
+  if (!matches) {
+    return { ok: false, reason: "INVALID_TOKEN" };
+  }
+
+  // A partir d'ici, le token presente est PROUVE etre le veritable token de
+  // cet agent : reveler AGENT_REVOKED est desormais sans risque
+  // d'enumeration (le client possede deja la preuve que cet agentId existe
+  // et lui appartient).
+  if (agent.status === "revoked") {
+    return { ok: false, reason: "AGENT_REVOKED" };
+  }
+
+  return { ok: true, agent };
 };
 
 export const touchAgentSeen = async (agentId: number, version?: string): Promise<void> => {

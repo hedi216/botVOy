@@ -8,11 +8,19 @@ import type { MonitoringRuntimeHandle } from "./agentMonitoringRuntime.js";
 
 export type AgentTargetMode = "production" | "fixture";
 
+// Phase 5 (Lot 2, section 2): mode d'execution EXPLICITE, jamais devine a
+// partir de la presence d'un fichier ou de la plateforme seule. Determine le
+// choix de AgentCredentialStore (jamais un fallback silencieux vers un
+// fichier en clair en mode "packaged").
+export type AgentRuntimeMode = "development" | "packaged" | "test";
+
 export type AgentRuntimeSettings = {
   serverUrl: string;
   credentialsPath: string;
   computerName: string;
   version: string;
+  protocolVersion: number;
+  runtimeMode: AgentRuntimeMode;
   targetMode: AgentTargetMode;
   fixtureUrl: string | null;
   // URL de navigation initiale effective: settings.fixtureUrl en mode
@@ -48,6 +56,92 @@ export type StoredAgentCredentials = {
   displayName: string;
   version: string;
   pairedAt: string;
+};
+
+// -------- Phase 5 (Lot 2): stockage protege des credentials --------
+
+export type CredentialProtectionKind = "plaintext-dev" | "windows-dpapi-current-user" | "memory-test";
+
+// Jamais de secret ici (section 2): uniquement de quoi diagnostiquer/afficher
+// sans risque cote interface locale ou logs.
+export type CredentialStoreSecurityDescription = {
+  mode: AgentRuntimeMode;
+  protection: CredentialProtectionKind;
+  path: string | null;
+};
+
+// load()/save()/clear() manipulent toujours StoredAgentCredentials (jamais le
+// format sur disque, propre a chaque implementation): agentClient.ts n'a donc
+// jamais besoin de connaitre le mode de protection reel.
+export interface AgentCredentialStore {
+  load(): Promise<StoredAgentCredentials | null>;
+  save(credentials: StoredAgentCredentials): Promise<void>;
+  clear(): Promise<void>;
+  exists(): Promise<boolean>;
+  describeSecurity(): CredentialStoreSecurityDescription;
+}
+
+// Format versionne du fichier protege par DPAPI (section 4): jamais le token
+// en clair, uniquement protectedToken (base64 du blob DPAPI). agentId n'est
+// pas un secret en soi mais reste dans la meme enveloppe versionnee pour une
+// coherence de format et une eventuelle rotation future.
+export type ProtectedCredentialsFileV1 = {
+  formatVersion: 1;
+  protection: "windows-dpapi-current-user";
+  agentId: number;
+  protectedToken: string;
+  agencyId: number;
+  computerName: string;
+  displayName: string;
+  version: string;
+  pairedAt: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+// -------- Phase 5 (Lot 2): chemins centralises --------
+
+export type AgentPaths = {
+  dataRoot: string;
+  credentialsDir: string;
+  credentialsFilePath: string;
+  logsDir: string;
+  configDir: string;
+  profilesDir: string;
+  stateDir: string;
+};
+
+// -------- Phase 5 (Lot 2): verrou mono-instance --------
+
+export type AgentSingleInstanceLockInfo = {
+  pid: number;
+  localUiPort: number | null;
+  startedAt: string;
+};
+
+// -------- Phase 5 (Lot 2): interface locale --------
+
+export type AgentLocalUiState =
+  | "NOT_PAIRED"
+  | "CONNECTING"
+  | "CONNECTED"
+  | "SYNCING"
+  | "OFFLINE"
+  | "REVOKED"
+  | "VERSION_INCOMPATIBLE";
+
+// Jamais de token/blob/chemin complet/URL avec query string ici (section 7):
+// uniquement des champs deja surs a afficher tels quels.
+export type AgentLocalUiStatusPayload = {
+  state: AgentLocalUiState;
+  agentVersion: string;
+  protocolVersion: number;
+  computerName: string;
+  serverHost: string;
+  paired: boolean;
+  activeBotCount: number;
+  extensions: AgentExtensionPublicStatus[];
+  message: string | null;
 };
 
 export type AgentCommandEnvelope = {

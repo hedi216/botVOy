@@ -106,7 +106,8 @@ const run = async (): Promise<void> => {
       agentId: credentials.agentId,
       token: credentials.token,
       computerName: credentials.computerName,
-      version: credentials.version
+      version: credentials.version,
+      protocolVersion: 1
     }
   });
 

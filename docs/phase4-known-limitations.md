@@ -2,17 +2,19 @@
 
 Ce document liste explicitement ce que Phase 4 ne fait PAS, par choix deliberer ou par report vers Phase 5. Aucun de ces points n'est un defaut a corriger dans ce lot.
 
+**Mise a jour Phase 5 (Lots 1-2)** : les sections 1 et 2 ci-dessous ont partiellement evolue depuis la redaction initiale de ce document (fin Phase 4). Voir [phase5-packaging-plan.md](phase5-packaging-plan.md) et [agent-packaging.md](agent-packaging.md) pour l'etat exact et a jour.
+
 ## 1. Distribution et installation
 
-- Aucun installeur (`RendezBotAgentSetup.exe` ou equivalent) : l'agent se lance via `npm run agent:dev`, poste par poste, manuellement.
-- Aucun service Windows ni application de demarrage automatique : l'agent doit etre relance manuellement apres redemarrage du PC.
+- Aucun installeur (`RendezBotAgentSetup.exe` ou equivalent) : reste vrai (Lot 3, non commence). L'agent dispose desormais d'un **build compile autonome** (`npm run agent:package:win`, Phase 5 Lot 1) et d'une **interface locale d'appairage** (Lot 2), mais Node.js doit encore etre installe separement — pas encore le contrat final "fonctionner sans Node.js installe".
+- Aucun service Windows : reste vrai. Un **launcher candidat sans console** existe (Lot 2, `.vbs`, limites explicites documentees) mais aucun demarrage automatique au demarrage de Windows n'est encore configure (Lot 3).
 - Aucune mise a jour automatique de l'agent.
 - Aucune signature de code des binaires/scripts.
 - Aucune distribution automatique des extensions Chrome par agence : chaque profil doit etre prepare manuellement (voir README, procedure d'installation d'extension).
 
 ## 2. Stockage local
 
-- Les identifiants d'agent sont stockes localement (`AGENT_CREDENTIALS_PATH`) sans chiffrement DPAPI definitif — protection de niveau systeme de fichiers uniquement.
+- **Resolu au Lot 2** : les identifiants d'agent sont desormais proteges par DPAPI (Windows, `CurrentUser`) en mode `AGENT_RUNTIME_MODE=packaged`, avec migration automatique depuis l'ancien stockage en clair — voir [agent-credential-store.md](agent-credential-store.md). Le mode `development` (`npm run agent:dev` sans configuration explicite) continue d'utiliser un stockage en clair par defaut, deliberement, pour ne pas changer le comportement historique sans configuration explicite.
 
 ## 3. Automatisation metier (hors perimetre, volontairement)
 

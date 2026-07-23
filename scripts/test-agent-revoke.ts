@@ -198,7 +198,7 @@ const pairAgent = (pairingCode: string, computerName: string): Promise<PairResul
     const socket = ioClient(`${BASE_URL}/agent`, {
       autoConnect: false,
       reconnection: false,
-      auth: { mode: "pair", pairingCode, computerName, version: "1.0.0" }
+      auth: { mode: "pair", pairingCode, computerName, version: "1.0.0", protocolVersion: 1 }
     });
 
     const timer = setTimeout(() => {
@@ -232,7 +232,7 @@ const attemptReconnect = (agentId: number, token: string): Promise<ReconnectOutc
     const socket = ioClient(`${BASE_URL}/agent`, {
       autoConnect: false,
       reconnection: false,
-      auth: { mode: "reconnect", agentId, token, version: "1.0.0" }
+      auth: { mode: "reconnect", agentId, token, version: "1.0.0", protocolVersion: 1 }
     });
 
     const finish = (result: ReconnectOutcome): void => {

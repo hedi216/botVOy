@@ -2,12 +2,12 @@ import { Server, Socket } from "socket.io";
 import { AgentCommandConfig, AgentGatewayConfig } from "./config.js";
 import { DbAgent, DbAgentCommand } from "./db.js";
 import {
+  authenticateAgent,
   computeLiveStatus,
   getAgentById,
   redeemPairingCode,
   touchAgentSeen,
   toPublicAgent,
-  verifyAgentToken,
   PublicAgent,
   PublicAgentExtension
 } from "./agentService.js";
@@ -76,8 +76,12 @@ const sanitizePublicRecord = (value: unknown, depth = 0): unknown => {
   return result;
 };
 
-type PairAuth = { mode: "pair"; pairingCode: string; computerName: string; version: string };
-type ReconnectAuth = { mode: "reconnect"; agentId: number; token: string; computerName?: string; version: string };
+// protocolVersion (Phase 5, Lot 2 - correctif protocole): obligatoire des
+// deux cotes du handshake, jamais suppose implicitement egal a une valeur
+// par defaut - un agent qui ne l'envoie pas est traite comme incompatible
+// (voir middleware ci-dessous), jamais silencieusement accepte.
+type PairAuth = { mode: "pair"; pairingCode: string; computerName: string; version: string; protocolVersion: number };
+type ReconnectAuth = { mode: "reconnect"; agentId: number; token: string; computerName?: string; version: string; protocolVersion: number };
 type AgentHandshakeAuth = PairAuth | ReconnectAuth;
 
 // Alias conserve pour les modules qui importaient deja ce nom: la forme reelle
@@ -256,6 +260,27 @@ export const registerAgentNamespace = (
       return;
     }
 
+    // Phase 5 (Lot 2 - correctif protocole, plage bornee): negociation de
+    // protocole AVANT toute authentification, pour les deux modes. Rejette
+    // explicitement: absence, type non numerique (string/objet/booleen),
+    // decimal, NaN, Infinity, negatif, trop ancien (< minProtocolVersion) ET
+    // trop recent (> maxProtocolVersion) - un plancher seul acceptait
+    // implicitement toute version future, jamais une intention explicite
+    // pour un champ de compatibilite. Jamais de dependance a src/agent (le
+    // serveur declare sa propre plage, independamment de
+    // agentVersionInfo.json cote agent). Rejete avant redeemPairingCode: un
+    // agent incompatible ne consomme jamais un code d'appairage valide.
+    const protocolVersion = (auth as Partial<AgentHandshakeAuth>).protocolVersion;
+    const protocolVersionValid = typeof protocolVersion === "number"
+      && Number.isInteger(protocolVersion)
+      && protocolVersion >= 0
+      && protocolVersion >= config.minProtocolVersion
+      && protocolVersion <= config.maxProtocolVersion;
+    if (!protocolVersionValid) {
+      next(new Error("VERSION_INCOMPATIBLE"));
+      return;
+    }
+
     if (auth.mode === "pair") {
       if (isIpRateLimited(remoteIp)) {
         next(new Error("TOO_MANY_ATTEMPTS"));
@@ -288,14 +313,14 @@ export const registerAgentNamespace = (
         return;
       }
 
-      const agent = await verifyAgentToken(agentId, token);
-      if (!agent) {
-        next(new Error("INVALID_TOKEN"));
+      const authResult = await authenticateAgent(agentId, token);
+      if (!authResult.ok) {
+        next(new Error(authResult.reason));
         return;
       }
 
-      socket.data.agentId = agent.id;
-      socket.data.agencyId = agent.agency_id;
+      socket.data.agentId = authResult.agent.id;
+      socket.data.agencyId = authResult.agent.agency_id;
       next();
       return;
     }

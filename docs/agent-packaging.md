@@ -138,7 +138,7 @@ Execution : `node agent/agentMain.js` (ou `... pair <CODE>`) depuis `app/`. Veri
 
 **Version actuelle non modifiee dans ce lot** : `0.1.0`. Recommandation a valider explicitement avant application (jamais applique unilateralement ici) : passer a `0.5.0` pour marquer cette etape de packaging pre-installateur, en reservant `1.0.0` a la fin du Lot 3 (installateur + demarrage automatique + DPAPI complets).
 
-`protocolVersion: 1` est defini mais pas encore exploite dans le protocole de handshake (aucune verification ajoutee dans `agentGateway.ts`/`agentClient.ts` — resterait a faire dans un lot ulterieur si un besoin de compatibilite de protocole distinct de la version applicative se manifeste).
+**Mise a jour (correctif protocole)** : `protocolVersion: 1` est desormais reellement valide au handshake (`src/agentGateway.ts`, contre `config.minProtocolVersion`, variable serveur `AGENT_MIN_PROTOCOL_VERSION`) — voir section 10.
 
 ## 5. Build reproductible
 
@@ -162,6 +162,72 @@ Construit le build, le copie **entierement hors du depot** (dossier temporaire),
 
 `test:phase4:final:simulated` : 283/283 (avant et apres les changements du Lot 1). `test:phase4:final:real` : 102/102 (avant et apres). Aucune regression introduite par les corrections de ce lot.
 
-## 8. Explicitement HORS PERIMETRE de ce Lot 1
+## 8. Explicitement HORS PERIMETRE du Lot 1
 
-Aucun installateur, aucun executable unique, aucun credential store DPAPI, aucune interface tray, aucun demarrage automatique, aucun verrou mono-instance, aucune signature de code, aucune mise a jour automatique. Voir [phase5-packaging-plan.md](phase5-packaging-plan.md) (mis a jour) pour le plan detaille des lots suivants.
+Aucun installateur, aucun executable unique, aucun credential store DPAPI, aucune interface locale, aucun demarrage automatique, aucun verrou mono-instance, aucune signature de code, aucune mise a jour automatique. Le Lot 2 (section 9) a leve les elements credential store/interface locale/mono-instance/launcher candidat ; le reste demeure au Lot 3 — voir [phase5-packaging-plan.md](phase5-packaging-plan.md).
+
+## 9. Lot 2 — credential store DPAPI, appairage local, mono-instance
+
+### 9.1 Perimetre livre
+
+- **`AgentCredentialStore`** (interface, `src/agent/agentCredentialStore.ts`) avec 3 implementations (`DevFileCredentialStore`, `WindowsDpapiCredentialStore`, `TestCredentialStore`), selectionnees explicitement via `AGENT_RUNTIME_MODE` (`development` par defaut, `packaged`, `test`). Detail complet, matrice DPAPI et format de fichier : [agent-credential-store.md](agent-credential-store.md).
+- **Migration** du fichier en clair (Lot 1) vers le store protege, idempotente, jamais destructive en cas d'echec.
+- **Interface locale HTTP** (loopback, `node:http`, aucune nouvelle dependance) pour l'appairage et le diagnostic sans PowerShell : [agent-local-ui.md](agent-local-ui.md).
+- **Verrou mono-instance** (`src/agent/agentSingleInstanceLock.ts`) : fichier de verrou + PID + verification de vivacite (jamais un mutex/named pipe natif — meme raisonnement anti-dependance-native que le choix DPAPI). Un second lancement ouvre l'interface de l'instance existante et se termine avec le code 0.
+- **Launcher candidat sans console** (`scripts/agent-launch-no-console.vbs`, copie dans le build a cote de `agent/agentMain.js`) : WScript avec fenetre masquee. **Limite explicite, jamais presentee comme definitive** : solution transitoire (necessite encore Node.js installe separement), remplacee au Lot 3 par un executable Node SEA avec sous-systeme Windows natif. Ne masque jamais une erreur : les logs et l'etat de l'interface locale restent la source de verite.
+- **Politique de revocation/token invalide/version incompatible** (`src/agent/agentMain.ts`) : `AGENT_REVOKED`/`INVALID_TOKEN`/`INVALID_AUTH_MODE`/`INVALID_OR_EXPIRED`/`TOO_MANY_ATTEMPTS` effacent l'identite locale (credentials + retour a l'ecran d'appairage) ; `VERSION_INCOMPATIBLE` conserve les credentials et bloque sans detruire l'identite.
+- **Dissociation locale** ("Dissocier cet ordinateur") : arrete les bots, ferme Chrome, deconnecte le socket, efface le credential store — conserve logs/profils/extensions par defaut (reserve a la desinstallation, Lot 3).
+
+### 9.2 Defauts reels trouves et corriges pendant ce lot
+
+| # | Defaut | Preuve | Correction |
+|---|---|---|---|
+| 1 | `saveStoredCredentials()` n'assurait pas l'existence du dossier parent (deja note au Lot 1 pour le cas par defaut, mais le meme risque existe pour tout chemin explicite) | Confirme par le test reel packaging | `ensureDir` avant ecriture (deja corrige au Lot 1, reconfirme) |
+| 2 | Le protocole reel collapse **revocation** et **token corrompu/errone** dans la MEME raison `INVALID_TOKEN` (verifie par lecture de `verifyAgentToken()`) ; `AGENT_REVOKED`/`VERSION_INCOMPATIBLE` ne sont **jamais** emis comme raison de `connect_error` par le serveur actuel | Audit du code serveur (`agentService.ts`, `agentGateway.ts`) | Documente honnetement (voir 9.3) ; politique locale traite `INVALID_TOKEN` comme "identite invalide, quelle qu'en soit la cause exacte" |
+| 3 | `INVALID_OR_EXPIRED`/`TOO_MANY_ATTEMPTS` (code d'appairage invalide/expire/trop de tentatives) etaient traites comme des erreurs TRANSITOIRES par `agentClient.ts` (retry infini silencieux sur un code deja rejete) | Lecture du code + lien direct avec le nouveau besoin d'appairage interactif (Lot 2, section 6) | Ajoutes a `PERMANENT_FAILURE_REASONS` (specifiques au chemin "pair", jamais emis en mode "reconnect" — sans risque de traiter a tort une coupure reseau comme definitive) |
+| 4 | `permanentFailure`/`stopped` (AgentClient) n'etaient jamais reinitialises entre deux appels a `start()` | Consequence directe de l'appairage interactif repete (Réessayer/nouvel appairage apres dissociation), jamais rencontre avant (un seul `start()` par process avant le Lot 2) | `start()` reinitialise les deux drapeaux en debut d'appel |
+| 5 | Migration : la suppression de l'ancien fichier en clair s'executait meme quand son chemin coincidait avec celui du nouveau store (cas courant), effacant les identifiants venant d'etre migres | Trouve par le test simule Lot 2 (assertion "identifiants migres corrects" en echec) | Suppression sautee quand `candidatePath === targetStore.describeSecurity().path` |
+| 6 | `exists()` du store cible ne suffit pas a determiner "deja migre" (un fichier en clair au meme chemin par defaut rend aussi `exists()` vrai) | Trouve par le test simule Lot 2 | Remplace par un `load()` reussi (non-null) comme critere de "deja protege" |
+
+### 9.3 (Historique) Limite initialement documentee, RESOLUE depuis — voir section 10
+
+A la cloture initiale du Lot 2, le protocole reel n'emettait **jamais** `AGENT_REVOKED` ni `VERSION_INCOMPATIBLE` comme raison de `connect_error` — uniquement `INVALID_TOKEN` (revocation ET token errone confondus), `INVALID_AUTH_MODE`, `INVALID_OR_EXPIRED`, `TOO_MANY_ATTEMPTS`. Corrige par le correctif protocole decrit en section 10 : les trois raisons sont desormais reellement distinctes et testees contre le vrai serveur.
+
+### 9.4 Tests (etat a la cloture initiale du Lot 2, avant correctif — voir section 10 pour l'etat a jour)
+
+- `npm run test:agent:packaging-lot2:simulated` : **45/45**, VM-safe, aucun Chrome de bot (store DPAPI reel exerce si Windows ; selection de store, migration, chemins Unicode/espaces, mono-instance via vrais process distincts, interface locale complete, redaction).
+- `npm run test:agent:packaging-lot2:real` : **20/20** sur ce PC Windows (scenarios A-M du cahier des charges ; N/VERSION_INCOMPATIBLE omis a l'epoque, desormais couvert — voir section 10).
+- Variante "hors depot" (build compile copie hors du depot, premier appairage local, redemarrage+reconnexion DPAPI, mono-instance, aucune ecriture programme) : **10/10**.
+- Non-regression : `test:agent:packaging:simulated` 25/25, `test:agent:packaging:real` 9/9, `test:phase4:final:simulated` 283/283, `test:phase4:final:real` 102/102 (une premiere execution a rencontre un echec isole de demarrage serveur dans la suite resilience-real — reproduit non reproductible : rerun standalone 13/13, puis rerun complet du runner 102/102 — diagnostique comme transitoire/environnemental, meme categorie que le precedent deja documente au Lot 6, pas une regression du Lot 2).
+
+### 9.5 Hors perimetre du Lot 2 (reste au Lot 3)
+
+Installateur Inno Setup, demarrage automatique Windows (tache planifiee/raccourci Demarrage), desinstallation, mise a niveau par installateur, auto-update, signature de code, publication de l'artefact, frontend de telechargement final, executable Node SEA unique (le launcher `.vbs` reste un candidat transitoire).
+
+## 10. Correctif protocole post-Lot 2 : INVALID_TOKEN / AGENT_REVOKED / VERSION_INCOMPATIBLE reellement distincts
+
+### 10.1 Cause exacte de l'ambiguite
+
+`verifyAgentToken()` (devenu `authenticateAgent()`) renvoyait `null` pour TROIS cas distincts : agent inexistant, token errone, agent revoque — tous trois produisaient donc la meme reponse `INVALID_TOKEN`. Un agent reellement revoque n'avait aucun moyen de l'apprendre et rejouait indefiniment le meme cycle de reconnexion/backoff. Par ailleurs `VERSION_INCOMPATIBLE` n'etait jamais emis par le handshake (seulement calcule cote serveur comme statut d'affichage `computeLiveStatus()`), et `protocolVersion` n'etait ni envoye par l'agent ni valide par le serveur.
+
+### 10.2 Protocole corrige
+
+- `src/agentService.ts` : `authenticateAgent(agentId, token)` renvoie desormais `{ ok: true, agent } | { ok: false, reason: "INVALID_TOKEN" } | { ok: false, reason: "AGENT_REVOKED" }`. Le statut `revoked` est verifie **avant** la comparaison du token (etat definitif, jamais dependant de la validite du token presente). Un agent inexistant et un token errone pour un agent existant-non-revoque partagent volontairement la meme reponse `INVALID_TOKEN` (jamais d'enumeration d'agentId possible).
+- `src/config.ts` : nouveau `AgentGatewayConfig.minProtocolVersion` (`AGENT_MIN_PROTOCOL_VERSION`, defaut `1`) — plancher de PROTOCOLE cote serveur, distinct de `minAgentVersion` (version applicative), jamais importe depuis `src/agent` (pas de duplication de source, deux plancher independants par conception).
+- `src/agentGateway.ts` : le handshake valide `protocolVersion` **avant** toute authentification/redemption de code (pour les deux modes pair/reconnect) — absent, non numerique, ou inferieur au plancher -> `VERSION_INCOMPATIBLE`, rejete avant `redeemPairingCode` (un code d'appairage rejete pour incompatibilite reste utilisable par un agent compatible).
+- `src/agent/agentClient.ts` : envoie `protocolVersion: this.settings.protocolVersion` (source unique `agentVersionInfo.json`) dans les DEUX modes, **y compris** la reassignation interne de `lastAuth` apres un premier appairage reussi (voir 10.3, defaut #1).
+
+### 10.3 Defauts reels trouves par les nouveaux tests (avant meme d'etre livres)
+
+| # | Defaut | Preuve | Correction |
+|---|---|---|---|
+| 1 | `agentClient.ts` reassigne `this.lastAuth` (mode reconnect) apres un appairage reussi SANS `protocolVersion` — un troisieme site de construction du payload d'auth, distinct des deux dans `start()` | Trouve par `test-agent-protocol-auth-real.ts` (scenario G) : un agent fraichement appaire se faisait rejeter `VERSION_INCOMPATIBLE` des sa premiere reconnexion automatique | `protocolVersion` ajoute a cette troisieme reassignation |
+| 2 | Un credential local illisible/corrompu (echec de dechiffrement DPAPI) faisait CRASHER tout le process agent (`credentialStore.load()` levait avant meme la tentative reseau, jamais rattrape) | Trouve par le meme test (scenario H) : `[agentMain] Arret: ...`, process termine au lieu de proposer un nouvel appairage | `client.start()` (chemin reconnect sans code CLI) enveloppe desormais d'un `try/catch` : identifiants effaces, etat NOT_PAIRED, interface locale ouverte |
+
+### 10.4 Tests ajoutes
+
+`scripts/test-agent-protocol-auth-real.ts` (`npm run test:agent:protocol-auth:real`), **29/29**, scenarios A-J complets (agent valide, token invalide avec non-enumeration, agent revoque, protocolVersion incompatible en pair ET reconnect avec code d'appairage reutilisable, aucune commande pour un agent revoque/incompatible, suppression DPAPI reelle sur AGENT_REVOKED, suppression sur credential corrompu localement, conservation stricte du fichier de credentials sur VERSION_INCOMPATIBLE avec contenu octet-pour-octet identique, absence de fuite de token/token_hash/Authorization dans les logs). Stable sur 2 executions consecutives.
+
+### 10.5 Regressions
+
+`npx tsc --noEmit` clean. `test-agent-resilience-simulated.ts` : une assertion mise a jour (`INVALID_TOKEN` -> `AGENT_REVOKED` pour son scenario "agent revoque ne peut plus se reconnecter", qui testait deja exactement ce cas). Tous les scripts simules construisant un handshake manuel (11 fichiers) mis a jour avec `protocolVersion`. `test:agent:packaging-lot2:simulated` 45/45, `test:agent:packaging-lot2:real` 20/20 (log desormais correctement `AGENT_REVOKED`), `test:phase4:final:simulated` 283/283, `test:phase4:final:real` **102/102 x2 executions consecutives** (un echec isole standalone de `test-agent-bot-status-simulated.ts` rencontre pendant la validation, memes symptomes que le precedent Lot 6 (process node.exe residuels d'une execution anterieure dans cette meme session tres longue) — reproduit non reproductible apres nettoyage, rerun complet 283/283 confirme).

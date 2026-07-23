@@ -191,7 +191,7 @@ const pairAgent = (pairingCode: string, computerName: string): Promise<PairResul
     const socket = ioClient(`${BASE_URL}/agent`, {
       autoConnect: false,
       reconnection: false,
-      auth: { mode: "pair", pairingCode, computerName, version: "1.0.0" }
+      auth: { mode: "pair", pairingCode, computerName, version: "1.0.0", protocolVersion: 1 }
     });
 
     const timer = setTimeout(() => {

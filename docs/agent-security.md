@@ -1,4 +1,4 @@
-# Securite Agent (Phase 4)
+# Securite Agent (Phase 4 + Phase 5)
 
 ## 1. Principes
 
@@ -36,10 +36,25 @@ Deux listes noires independantes, qui doivent rester alignees :
 | Agent revoque / non synchronise / hors ligne | Commandes refusees, pas de reactivation silencieuse d'un bot STOPPED | `test-phase3-backend.ts`, `test-agent-resilience-simulated.ts`/`-real.ts` |
 | Rejeu d'`eventId` / commande dupliquee | Idempotence verifiee | `test-phase3-backend.ts` |
 
+## 4bis. Phase 5 (Lot 2) — credentials proteges et surface locale
+
+Sentinelles supplementaires utilisees par `test-agent-packaging-lot2-simulated.ts`/`test-agent-packaging-lot2-real.ts` : `TEST_SECRET_AGENT_TOKEN`, `TEST_SECRET_PAIRING_CODE`, `TEST_SECRET_DPAPI_BLOB`. Verifications additionnelles :
+
+| Categorie | Verification |
+|---|---|
+| Token jamais en clair sur disque | Le fichier de credentials protege ne contient jamais la valeur du token, uniquement `protectedToken` (blob DPAPI base64) |
+| Code d'appairage jamais journalise/persiste | Ni dans les logs agent, ni dans un objet public de l'interface locale, ni conserve apres la tentative |
+| Interface locale (loopback) | Bind `127.0.0.1` uniquement, nonce de session requis, verification d'origine, Content-Type strict, limite de taille (413), aucune route ne lit un chemin fourni par la requete |
+| Traversee de chemin / race d'appairage | Verrou mono-instance empeche deux process de manipuler le meme credential store simultanement |
+| JSON malforme (credential store) | Rejet strict avec `CredentialFileCorruptedError`, y compris cle `__proto__`/`prototype`/`constructor` (anti-pollution de prototype) |
+| Fichier remplace entre validation et ecriture | Ecriture atomique (fichier temporaire + `rename()`) : jamais de fichier partiel visible |
+
+Le blob DPAPI peut exister uniquement dans le fichier de credentials protege (`%LOCALAPPDATA%\RendezBot\credentials\agent-credentials.json`), jamais dans un log, un objet public, ou une reponse de l'interface locale — confirme par `test-agent-packaging-lot2-simulated.ts` (grep du fichier brut) et par l'absence du champ dans `AgentLocalUiStatusPayload`/`CredentialStoreSecurityDescription`.
+
 ## 5. Ce que l'agent ne fait jamais (rappel de perimetre)
 
 L'agent n'automatise et ne doit jamais automatiser : la connexion TLScontact, la saisie d'identifiants/mots de passe candidat, la resolution de CAPTCHA, le contournement de controle humain ou Cloudflare, la rotation d'IP/proxy, ni le contournement de rate-limit. Toute tentative d'ajouter une telle capacite doit etre refusee au niveau de la revue de code, pas seulement au niveau des tests.
 
 ## 6. Limites connues
 
-Voir [phase4-known-limitations.md](phase4-known-limitations.md) pour les limites de securite deja identifiees et deliberement hors perimetre de ce lot (DPAPI definitif, signature de code, distribution automatique d'extensions).
+Le stockage DPAPI des identifiants est desormais implemente et valide (Phase 5, Lot 2 — voir [agent-credential-store.md](agent-credential-store.md)). Restent hors perimetre : signature de code, distribution automatique d'extensions, installateur/desinstallation (Lot 3) — voir [phase4-known-limitations.md](phase4-known-limitations.md) et [phase5-packaging-plan.md](phase5-packaging-plan.md).

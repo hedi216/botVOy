@@ -198,7 +198,7 @@ const pairFakeAgent = (baseUrl: string, pairingCode: string, computerName: strin
     const socket = ioClient(`${baseUrl}/agent`, {
       autoConnect: false,
       reconnection: false,
-      auth: { mode: "pair", pairingCode, computerName, version }
+      auth: { mode: "pair", pairingCode, computerName, version, protocolVersion: 1 }
     });
     const timer = setTimeout(() => { socket.disconnect(); reject(new Error(`Timeout appairage ${computerName}`)); }, 8_000);
     socket.on("connect_error", (error: Error) => { clearTimeout(timer); reject(new Error(`Appairage rejete: ${error.message}`)); });
@@ -218,7 +218,7 @@ const reconnectFakeAgent = (baseUrl: string, agentId: number, token: string, ver
     const socket = ioClient(`${baseUrl}/agent`, {
       autoConnect: false,
       reconnection: false,
-      auth: { mode: "reconnect", agentId, token, version }
+      auth: { mode: "reconnect", agentId, token, version, protocolVersion: 1 }
     });
     const timer = setTimeout(() => { socket.disconnect(); reject(new Error("Timeout reconnexion agent fantome.")); }, 8_000);
     socket.on("connect_error", (error: Error) => { clearTimeout(timer); reject(new Error(`Reconnexion rejetee: ${error.message}`)); });

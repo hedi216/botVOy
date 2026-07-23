@@ -194,8 +194,8 @@ const cleanupTestData = async (): Promise<void> => {
 // --- Agent fantome pilotable ---
 
 type FakeAgentAuth =
-  | { mode: "pair"; pairingCode: string; computerName: string; version: string }
-  | { mode: "reconnect"; agentId: number; token: string; version: string };
+  | { mode: "pair"; pairingCode: string; computerName: string; version: string; protocolVersion: number }
+  | { mode: "reconnect"; agentId: number; token: string; version: string; protocolVersion: number };
 
 type FakeAgentHandle = { agentId: number; token: string; socket: Socket };
 
@@ -239,7 +239,7 @@ const pairAgentWithBehavior = async (
 ): Promise<FakeAgentHandle> => {
   const pairing = await requestJson(baseUrl, "POST", "/api/agents/pairing-codes", managerCookie, {});
   const code = (pairing.body as { pairing: { code: string } }).pairing.code;
-  return connectFakeAgent(baseUrl, { mode: "pair", pairingCode: code, computerName, version }, onCommand);
+  return connectFakeAgent(baseUrl, { mode: "pair", pairingCode: code, computerName, version, protocolVersion: 1 }, onCommand);
 };
 
 // Simule un agent qui accuse reception, remonte STARTING/WAITING_FOR_USER

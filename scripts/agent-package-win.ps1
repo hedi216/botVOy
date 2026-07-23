@@ -2,10 +2,12 @@ param(
   [switch]$SkipTests
 )
 
-# Phase 5 (Lot 1): construit un runtime agent COMPILE (tsc, aucun tsx requis
-# a l'execution) et autonome (dependances runtime propres, copiable et
-# executable hors du depot). Ne produit PAS encore d'executable unique ni
-# d'installateur: ces etapes sont reservees aux lots suivants (voir
+# Phase 5 (Lot 1+2): construit un runtime agent COMPILE (tsc, aucun tsx
+# requis a l'execution) et autonome (dependances runtime propres, copiable et
+# executable hors du depot), incluant depuis le Lot 2 le credential store
+# DPAPI, l'interface locale d'appairage/diagnostic, le verrou mono-instance
+# et le launcher candidat sans console. Ne produit PAS encore d'executable
+# unique ni d'installateur: ces etapes sont reservees aux lots suivants (voir
 # docs/agent-packaging.md).
 #
 # Usage:
@@ -73,6 +75,10 @@ Copy-Item -Path (Join-Path $root "dist\agent\*") -Destination (Join-Path $appDir
 Copy-Item -Path (Join-Path $root "dist\shared\*") -Destination (Join-Path $appDir "shared") -Recurse
 Copy-Item -Path (Join-Path $root "dist\logger.js") -Destination (Join-Path $appDir "logger.js")
 
+# Lot 2: launcher candidat sans console (limites documentees dans le fichier
+# lui-meme et docs/agent-packaging.md) - doit rester a cote de agent\agentMain.js.
+Copy-Item -Path (Join-Path $root "scripts\agent-launch-no-console.vbs") -Destination (Join-Path $appDir "agent-launch-no-console.vbs")
+
 # package.json minimal: UNIQUEMENT les 3 dependances runtime reellement
 # importees par src/agent et src/shared (verifie par grep exhaustif, voir
 # docs/agent-packaging.md) - jamais express/pg/cookie-parser/socket.io
@@ -118,7 +124,7 @@ try {
 Write-Host "--- Verification anti-secret (aucune chaine interdite dans le dossier livre) ---"
 $forbiddenPatterns = @("BREVO_API_KEY", "PGPASSWORD", "HtlsH2030", "POSTGRES_PASSWORD", "PGUSER", "PGDATABASE")
 $offending = @()
-Get-ChildItem -Path $appDir -Recurse -File -Include *.js,*.json,*.ts | ForEach-Object {
+Get-ChildItem -Path $appDir -Recurse -File -Include *.js,*.json,*.ts,*.vbs | ForEach-Object {
   $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
   if ($content) {
     foreach ($pattern in $forbiddenPatterns) {
@@ -166,6 +172,7 @@ $buildManifest = [ordered]@{
 Write-Utf8NoBom -Path (Join-Path $release "build-manifest.json") -Content ($buildManifest | ConvertTo-Json -Depth 8)
 
 Write-Host ""
-Write-Host "Build agent (Lot 1) pret: $release"
-Write-Host "Aucun installateur n'est produit a ce stade (Lot 1 = build compile + dependances minimales uniquement)."
-Write-Host "Pour tester: copier '$appDir' hors du depot puis lancer 'node agent/agentMain.js' depuis ce dossier."
+Write-Host "Build agent (Lot 1+2) pret: $release"
+Write-Host "Aucun installateur n'est produit a ce stade (voir docs/agent-packaging.md pour le perimetre exact par lot)."
+Write-Host "Pour tester: copier '$appDir' hors du depot puis lancer 'node agent/agentMain.js' (ou agent-launch-no-console.vbs, candidat sans console) depuis ce dossier."
+Write-Host "Au premier lancement sans identifiants, une interface locale s'ouvre sur http://127.0.0.1:<port>/ pour l'appairage."

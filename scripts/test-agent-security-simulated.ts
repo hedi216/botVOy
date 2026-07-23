@@ -163,7 +163,7 @@ const pairFakeAgent = async (baseUrl: string, managerCookie: string, computerNam
   return new Promise((resolve, reject) => {
     const socket = ioClient(`${baseUrl}/agent`, {
       autoConnect: false, reconnection: false, forceNew: true,
-      auth: { mode: "pair", pairingCode: pairing.body.pairing.code, computerName, version: "1.0.0" }
+      auth: { mode: "pair", pairingCode: pairing.body.pairing.code, computerName, version: "1.0.0", protocolVersion: 1 }
     });
     const t = setTimeout(() => { socket.disconnect(); reject(new Error("Timeout agent fantome.")); }, 8_000);
     socket.on("connect_error", (e: Error) => { clearTimeout(t); reject(e); });

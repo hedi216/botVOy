@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import agentVersionInfo from "./agentVersionInfo.json";
 import { getDefaultCredentialsPath } from "./agentStorage.js";
-import { AgentLogLevelSetting, AgentRuntimeSettings, AgentTargetMode } from "./types.js";
+import { AgentLogLevelSetting, AgentRuntimeMode, AgentRuntimeSettings, AgentTargetMode } from "./types.js";
 
 // Version locale au runtime agent: independante du numero de version du
 // package serveur (rdv-agent/package.json, qui designe le serveur lui-meme,
@@ -67,6 +67,23 @@ const resolveTargetMode = (): AgentTargetMode => {
   );
 };
 
+// Phase 5 (Lot 2, section 2): mode d'execution EXPLICITE. "development" reste
+// le defaut (comportement historique de `npm run agent:dev` inchange), pour
+// ne jamais casser un usage existant sans configuration explicite - jamais
+// devine depuis la plateforme ou la presence d'un fichier.
+const resolveRuntimeMode = (): AgentRuntimeMode => {
+  const raw = process.env.AGENT_RUNTIME_MODE?.trim();
+  if (!raw || raw === "development") {
+    return "development";
+  }
+  if (raw === "packaged" || raw === "test") {
+    return raw;
+  }
+  throw new Error(
+    `AGENT_RUNTIME_MODE invalide: "${raw}". Valeurs acceptees: "development" (defaut), "packaged", "test".`
+  );
+};
+
 // Emplacement local Windows attendu (sections 7/11/12 du cahier des
 // charges): jamais le dossier du projet. AGENT_DATA_DIR reste disponible
 // pour les tests automatises (fixture) qui doivent isoler leurs donnees.
@@ -120,6 +137,8 @@ export const loadAgentSettings = (): AgentRuntimeSettings => {
       || getDefaultCredentialsPath(dataRoot),
     computerName: process.env.AGENT_COMPUTER_NAME?.trim() || os.hostname(),
     version: AGENT_VERSION,
+    protocolVersion: AGENT_PROTOCOL_VERSION,
+    runtimeMode: resolveRuntimeMode(),
     targetMode,
     fixtureUrl,
     targetUrl,

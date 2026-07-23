@@ -12,16 +12,19 @@ Ce document est une **proposition** de note de version technique pour la prochai
 - **Reconnexion progressive** de l'agent au serveur en cas de coupure (delai croissant avec gigue), avec buffer local borne des evenements en attente et resynchronisation complete au retour (reconstruction de l'etat des bots cote serveur).
 - **Extensions locales par agence** : configuration et utilisation de profils Chrome persistants avec extension d'enregistrement d'ecran, installation manuelle.
 - **Securite** : redaction systematique des secrets dans les logs (serveur et agent), reponses publiques strictement filtrees par liste blanche, isolation stricte entre agences.
-- **Limites connues** : voir [phase4-known-limitations.md](phase4-known-limitations.md).
+- **Stockage protege des identifiants** (Phase 5, Lot 2) : chiffrement DPAPI (Windows, `CurrentUser`) en mode packaged, migration automatique et non destructive depuis l'ancien stockage en clair.
+- **Premier appairage sans PowerShell** (Phase 5, Lot 2) : interface locale (loopback) pour saisir le code d'appairage et diagnostiquer l'agent (etat, logs, dossier de configuration).
+- **Verrou mono-instance** (Phase 5, Lot 2) : un seul agent actif par poste/dossier de donnees.
+- **Limites connues** : voir [phase4-known-limitations.md](phase4-known-limitations.md) (mis a jour Phase 5).
 
-### PAS encore annonce (reserve a Phase 5, non implemente)
+### PAS encore annonce (reserve au Lot 3, non implemente)
 
 - Aucun installeur (`RendezBotAgentSetup.exe`).
-- Aucun service Windows ni demarrage automatique de l'agent.
+- Aucun service Windows ni demarrage automatique de l'agent au demarrage de Windows (un launcher candidat sans console existe, limites explicites — pas la solution finale).
 - Aucune mise a jour automatique.
-- Aucun stockage DPAPI definitif des identifiants d'agent (stockage fichier local actuel uniquement).
 - Aucune signature de code.
 - Aucune distribution automatique des extensions Chrome.
+- L'agent necessite encore Node.js installe separement (build compile disponible, pas encore un executable unique).
 
 ## Ton et perimetre de communication recommandes
 
@@ -29,6 +32,6 @@ Ce document est une **proposition** de note de version technique pour la prochai
 - Rappeler explicitement que la validation humaine reste obligatoire et qu'aucun contournement de controle du site cible n'est ajoute.
 - Ne pas mentionner d'installeur ou de service Windows tant qu'ils ne sont pas reellement livres (voir [phase5-packaging-plan.md](phase5-packaging-plan.md)).
 
-## Preuves associees (voir rapport final Lot 6)
+## Preuves associees
 
-Regression complete (simulee + reelle), tests de securite dedies, test de stabilite courte, compatibilite `legacy_vm` verifiee, documentation technique a jour.
+Phase 4 (Lot 6) : regression complete (simulee + reelle), tests de securite dedies, test de stabilite courte, compatibilite `legacy_vm` verifiee. Phase 5 (Lots 1-2) : build compile autonome valide (25/25 simule, 9/9 reel), credential store DPAPI/appairage local/mono-instance valides (45/45 simule, 20/20 reel, 10/10 hors depot), aucune regression Phase 4 (283/283 simule, 102/102 reel).

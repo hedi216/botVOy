@@ -2,10 +2,11 @@
 
 ## 0. Statut
 
-- **Lot 1 (audit, choix de technologie, resolution des chemins, version centralisee, build compile minimal) : termine.** Voir [agent-packaging.md](agent-packaging.md) pour le detail complet (audit, matrice de decision, resultats de test). Resume : `tsc` (CommonJS) + copie de la fermeture de dependance agent/shared + installation isolee de 3 dependances runtime reelles (`playwright`, `socket.io-client`, `dotenv`) ; deux defauts reels corriges (classification de dependance, chemin de credentials par defaut base sur `process.cwd()`) ; version centralisee (`src/agent/agentVersionInfo.json`) ; build reproductible (`npm run agent:package:win`) valide de bout en bout (build copie hors du depot, execute via `node` seul, cycle fixture complet reussi) ; aucune regression Phase 4 (283/283 simule, 102/102 reel).
-- **Lots 2-5 : non commences.** Ce document reste le plan A PRIORI pour ces lots ; la section 17 ci-dessous precise le plan du Lot 2 tel qu'issu des conclusions du Lot 1.
+- **Lot 1 (audit, choix de technologie, resolution des chemins, version centralisee, build compile minimal) : termine.** Voir [agent-packaging.md](agent-packaging.md) section 1-8 pour le detail complet.
+- **Lot 2 (credential store DPAPI, migration, appairage local sans PowerShell, interface locale, verrou mono-instance, launcher candidat sans console) : termine.** Voir [agent-packaging.md](agent-packaging.md) section 9, [agent-credential-store.md](agent-credential-store.md) et [agent-local-ui.md](agent-local-ui.md) pour le detail complet. Resume : `AgentCredentialStore` (Dev/Dpapi/Test) selectionne explicitement via `AGENT_RUNTIME_MODE` ; migration idempotente et non destructive ; interface HTTP loopback (node:http natif, toujours 3 dependances runtime) ; verrou mono-instance par fichier+PID ; politique de revocation/token invalide/version incompatible ; six defauts reels trouves et corriges (voir agent-packaging.md section 9.2) ; 45/45 simule, 20/20 reel, 10/10 hors depot, aucune regression Phase 4 (283/283 simule, 102/102 reel).
+- **Lots 3-5 : non commences.** La section 18 ci-dessous precise le plan du Lot 3 tel qu'issu des conclusions du Lot 2.
 
-Ce document definit le perimetre envisage pour la suite de Phase 5 **sans rien implementer au-dela du Lot 1**. Il presente les decisions ouvertes avec leurs compromis, pour validation avant chaque nouveau lot.
+Ce document definit le perimetre envisage pour la suite de Phase 5 **sans rien implementer au-dela des Lots 1 et 2**. Il presente les decisions ouvertes avec leurs compromis, pour validation avant chaque nouveau lot.
 
 ## 1. Format cible
 
@@ -46,7 +47,7 @@ Options ouvertes, non tranchees :
 
 ## 6. Stockage des identifiants (DPAPI)
 
-Le stockage actuel (fichier local, `AGENT_CREDENTIALS_PATH`) resterait en `AppData` chiffre via DPAPI (Windows Data Protection API, lie au compte utilisateur Windows) plutot qu'en clair. Points ouverts : migration des identifiants existants stockes en clair par les agents deja en usage (Phase 4), format de version du fichier de credentials pour permettre cette migration sans re-appairage force.
+**Termine au Lot 2.** Voir [agent-credential-store.md](agent-credential-store.md) pour l'implementation complete (`AgentCredentialStore`, `WindowsDpapiCredentialStore`, format versionne, migration idempotente depuis le fichier en clair).
 
 ## 7. Desinstallation
 
@@ -87,17 +88,22 @@ A definir : niveau de log par defaut en production (actuellement `AGENT_LOG_LEVE
 
 ## 16. Ce que Phase 5 n'annoncera PAS avant validation
 
-Aucun installeur, aucun service Windows, aucune mise a jour automatique, aucun stockage DPAPI definitif ne doit etre presente comme livre avant que l'implementation correspondante soit reellement terminee et validee — voir [phase4-known-limitations.md](phase4-known-limitations.md) pour l'etat actuel exact.
+Aucun installeur, aucun service Windows, aucune mise a jour automatique ne doit etre presente comme livre avant que l'implementation correspondante soit reellement terminee et validee — voir [phase4-known-limitations.md](phase4-known-limitations.md). Le stockage DPAPI (Lot 2) EST desormais reellement implemente et valide (voir [agent-credential-store.md](agent-credential-store.md)) ; le launcher sans console (Lot 2) reste un candidat transitoire explicitement documente comme tel, pas la solution finale.
 
-## 17. Plan precis du Lot 2
+## 17. Plan du Lot 2 — termine
 
-Objectif : credential store DPAPI, appairage local (ecran de pairage au premier lancement), verrou mono-instance, mode sans console visible.
+Voir [agent-packaging.md](agent-packaging.md) section 9 pour le bilan complet (perimetre livre, defauts corriges, resultats de test). Les six points du plan initial (credential store, migration, ecran d'appairage local, verrou mono-instance, mode sans console, tests) ont ete livres — l'ecran d'appairage local est une interface HTTP loopback plutot qu'une invite console, choix documente dans [agent-local-ui.md](agent-local-ui.md).
 
-1. **`AgentCredentialStore` (interface)** : `load(): StoredAgentCredentials | null`, `save(credentials): void`, `clear(): void`. Implementations : `DevFileCredentialStore` (comportement actuel, fichier JSON en clair — conserve pour dev/test), `WindowsDpapiCredentialStore` (chiffrement via DPAPI `CurrentUser`, ecriture atomique, permissions restrictives), `TestCredentialStore` (en memoire, pour les tests unitaires). Selection explicite (jamais une detection implicite basee sur la plateforme seule) via un parametre de configuration valide au demarrage.
-2. **Migration** : au premier chargement, si un fichier de credentials en clair existe (ancien format) et qu'aucune donnee DPAPI n'existe encore, migrer automatiquement puis supprimer le fichier en clair UNIQUEMENT apres confirmation d'ecriture reussie du format chiffre (jamais de suppression avant confirmation).
-3. **Ecran d'appairage local** : au demarrage, si aucune credential valide n'est trouvee, afficher (console interactive pour ce lot, tray UI potentiellement Lot 3) une invite pour saisir le code d'appairage ; gerer explicitement code invalide/expire/trop de tentatives/serveur inaccessible/agent deja appaire.
-4. **Verrou mono-instance** : mutex nomme Windows (ou fichier de verrou avec PID + verification de vivacite), un second lancement detecte l'instance existante et se termine proprement avec un message clair (jamais une seconde connexion/surveillance dupliquee).
-5. **Mode sans console** : investiguer le lancement via `pythonw`-equivalent Windows (`node.exe` sans fenetre console visible, ex. via un petit lanceur natif ou `START /B` avec redirection) — Chrome doit rester visible, seule la fenetre console de l'agent doit disparaitre.
-6. **Tests** : `npm run test:agent:credentials:simulated` (store DPAPI simule/mock sur VM), test reel sur PC Windows pour la migration et le verrou mono-instance.
+## 18. Plan precis du Lot 3
 
-Criteres d'acceptation proposes (a confirmer avant de commencer) : aucun token en clair sur disque en mode DPAPI ; migration testee (ancien format -> DPAPI) sans perte ; deuxieme instance detectee et refusee proprement ; non-regression Phase 4 et Lot 1 maintenue.
+Objectif : installateur Inno Setup, demarrage automatique Windows, desinstallation, mise a niveau par installateur.
+
+1. **Executable unique** : evaluer Node SEA (candidat retenu au Lot 1) pour fusionner le runtime compile + dependances en un seul `RendezBotAgent.exe`, avec sous-systeme Windows natif (remplace le launcher `.vbs` transitoire du Lot 2). Point d'attention : compatibilite des dependances a bindings natifs optionnels (`ws`) avec l'embarquement SEA — a valider concretement.
+2. **Installateur Inno Setup** : `RendezBotAgentSetup.exe`, installation per-user par defaut (`PrivilegesRequired=lowest`, coherent avec la decision de la section 5), cree les dossiers `%LOCALAPPDATA%\RendezBot\*` necessaires, raccourci menu Demarrer, option raccourci bureau.
+3. **Demarrage automatique** : raccourci dans le dossier "Demarrage" Windows (decision de la section 4/5 — pas de service Windows, incompatible avec un Chrome visible).
+4. **Desinstallation** : retire binaire/raccourcis ; conserve par defaut credentials/logs/profils/extensions (option explicite "supprimer toutes les donnees locales").
+5. **Mise a niveau** : installation par-dessus une version existante, arret propre de l'ancienne instance (verrou mono-instance deja disponible depuis le Lot 2) avant remplacement, conservation credentials/config/profils.
+6. **Signature de code** : preparer les commandes de signature sans cle reelle (voir section 9), documenter l'avertissement SmartScreen attendu sans certificat.
+7. **Tests** : `npm run test:agent:packaging-lot3:simulated` (structure installateur, chemins, matrice premiere-installation/reinstallation/mise-a-niveau/reparation/desinstallation) et `npm run test:agent:packaging-lot3:real` (installation/desinstallation reelles dans un dossier de test, jamais l'installation reelle du poste).
+
+Criteres d'acceptation proposes (a confirmer avant de commencer) : l'installateur fonctionne sans droits administrateur ; une mise a niveau conserve l'identite de l'agent (credentials DPAPI) ; une desinstallation standard ne supprime jamais les donnees utilisateur sans confirmation explicite ; non-regression Phase 4 et Lots 1-2 maintenue ; aucune signature de code reelle n'est prealablement annoncee sans certificat obtenu.

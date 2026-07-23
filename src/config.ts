@@ -16,6 +16,25 @@ const numberEnv = (key: string, fallback: number): number => {
   return value;
 };
 
+// Phase 5 (Lot 2 - correctif protocole complementaire): un plancher de
+// protocole sans plafond acceptait implicitement toute version future -
+// jamais souhaitable pour un champ de compatibilite. Entier strict (jamais
+// de decimal), jamais negatif.
+const integerEnv = (key: string, fallback: number): number => {
+  const raw = process.env[key];
+
+  if (!raw || raw.trim().length === 0) {
+    return fallback;
+  }
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`Variable d'environnement invalide: ${key} (entier positif attendu)`);
+  }
+
+  return value;
+};
+
 const booleanEnv = (key: string, fallback: boolean): boolean => {
   const raw = process.env[key];
 
@@ -30,17 +49,40 @@ export type AgentGatewayConfig = {
   heartbeatIntervalMs: number;
   offlineTimeoutMs: number;
   minAgentVersion: string;
+  // Phase 5 (Lot 2 - correctif protocole): plancher de PROTOCOLE, distinct de
+  // minAgentVersion (version applicative). Valeur par defaut alignee sur
+  // agentVersionInfo.json (protocolVersion actuel de l'agent, "1") par
+  // convention documentee - jamais importee depuis src/agent (le serveur ne
+  // doit jamais dependre du runtime agent), donc pas une duplication de la
+  // meme source, mais bien le plancher de compatibilite propre au serveur.
+  minProtocolVersion: number;
+  // Plafond explicite (correctif de securite complementaire): sans lui,
+  // AGENT_MIN_PROTOCOL_VERSION seul acceptait implicitement toute version
+  // future, jamais une intention explicite pour un champ de compatibilite.
+  maxProtocolVersion: number;
   pairingCodeTtlMinutes: number;
   pairingMaxAttemptsPerCode: number;
 };
 
-export const loadAgentGatewayConfig = (): AgentGatewayConfig => ({
-  heartbeatIntervalMs: numberEnv("AGENT_HEARTBEAT_INTERVAL_MS", 10_000),
-  offlineTimeoutMs: numberEnv("AGENT_OFFLINE_TIMEOUT_MS", 40_000),
-  minAgentVersion: process.env.AGENT_MIN_VERSION?.trim() || "0.1.0",
-  pairingCodeTtlMinutes: numberEnv("AGENT_PAIRING_CODE_TTL_MINUTES", 10),
-  pairingMaxAttemptsPerCode: numberEnv("AGENT_PAIRING_MAX_ATTEMPTS", 5)
-});
+export const loadAgentGatewayConfig = (): AgentGatewayConfig => {
+  const minProtocolVersion = integerEnv("AGENT_MIN_PROTOCOL_VERSION", 1);
+  const maxProtocolVersion = integerEnv("AGENT_MAX_PROTOCOL_VERSION", 1);
+  if (minProtocolVersion > maxProtocolVersion) {
+    throw new Error(
+      `AGENT_MIN_PROTOCOL_VERSION (${minProtocolVersion}) ne doit pas depasser AGENT_MAX_PROTOCOL_VERSION (${maxProtocolVersion}).`
+    );
+  }
+
+  return {
+    heartbeatIntervalMs: numberEnv("AGENT_HEARTBEAT_INTERVAL_MS", 10_000),
+    offlineTimeoutMs: numberEnv("AGENT_OFFLINE_TIMEOUT_MS", 40_000),
+    minAgentVersion: process.env.AGENT_MIN_VERSION?.trim() || "0.1.0",
+    minProtocolVersion,
+    maxProtocolVersion,
+    pairingCodeTtlMinutes: numberEnv("AGENT_PAIRING_CODE_TTL_MINUTES", 10),
+    pairingMaxAttemptsPerCode: numberEnv("AGENT_PAIRING_MAX_ATTEMPTS", 5)
+  };
+};
 
 export type AgentCommandConfig = {
   ackTimeoutMs: number;

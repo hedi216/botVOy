@@ -156,7 +156,7 @@ const pairFakeAgent = async (baseUrl: string, managerCookie: string, computerNam
   return new Promise((resolve, reject) => {
     const socket = ioClient(`${baseUrl}/agent`, {
       autoConnect: false, reconnection: false, forceNew: true,
-      auth: { mode: "pair", pairingCode: pairing.body.pairing.code, computerName, version: "1.0.0" }
+      auth: { mode: "pair", pairingCode: pairing.body.pairing.code, computerName, version: "1.0.0", protocolVersion: 1 }
     });
     const t = setTimeout(() => { socket.disconnect(); reject(new Error("Timeout agent fantome.")); }, 8_000);
     socket.on("connect_error", (e: Error) => { clearTimeout(t); reject(e); });
@@ -173,7 +173,7 @@ const reconnectFakeAgent = (baseUrl: string, agentId: number, token: string, com
   new Promise((resolve) => {
     const socket = ioClient(`${baseUrl}/agent`, {
       autoConnect: false, reconnection: false, forceNew: true,
-      auth: { mode: "reconnect", agentId, token, computerName, version: "1.0.0" }
+      auth: { mode: "reconnect", agentId, token, computerName, version: "1.0.0", protocolVersion: 1 }
     });
     const t = setTimeout(() => { socket.disconnect(); resolve({ ok: false, reason: "TIMEOUT" }); }, 8_000);
     socket.on("connect_error", (e: Error) => { clearTimeout(t); resolve({ ok: false, reason: e.message }); });
@@ -402,7 +402,7 @@ const main = async (): Promise<void> => {
       const notReadySocket: Socket = await new Promise((resolve, reject) => {
         const socket = ioClient(`${server.baseUrl}/agent`, {
           autoConnect: false, reconnection: false, forceNew: true,
-          auth: { mode: "pair", pairingCode: pairing.body.pairing.code, computerName: "NOT-READY-PC", version: "1.0.0" }
+          auth: { mode: "pair", pairingCode: pairing.body.pairing.code, computerName: "NOT-READY-PC", version: "1.0.0", protocolVersion: 1 }
         });
         const t = setTimeout(() => reject(new Error("timeout")), 8_000);
         socket.on("AGENT_CONNECTED", () => { clearTimeout(t); resolve(socket); });
@@ -574,7 +574,13 @@ const main = async (): Promise<void> => {
       const reconnectResult = await reconnectFakeAgent(server.baseUrl, agent.agentId, agent.token, "REVOKE-RECONNECT-PC");
       assert(!reconnectResult.ok, "La reconnexion d'un agent revoque est refusee");
       if (!reconnectResult.ok) {
-        assert(reconnectResult.reason === "INVALID_TOKEN", `La raison du refus est INVALID_TOKEN (recu: ${reconnectResult.reason})`);
+        // Phase 5 (Lot 2 - correctif protocole): AGENT_REVOKED est desormais
+        // distinct d'INVALID_TOKEN (cause exacte de l'ambiguite corrigee,
+        // voir docs/agent-packaging.md section 9.2/10). Un token PARFAITEMENT
+        // valide presente pour un agent explicitement revoque doit produire
+        // AGENT_REVOKED, jamais INVALID_TOKEN (reserve a un token errone/
+        // agent inexistant).
+        assert(reconnectResult.reason === "AGENT_REVOKED", `La raison du refus est AGENT_REVOKED (recu: ${reconnectResult.reason})`);
       }
     }
 

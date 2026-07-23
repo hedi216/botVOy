@@ -20,16 +20,24 @@ export const getLogsDir = (settings: AgentRuntimeSettings): string =>
 export const getConfigDir = (settings: AgentRuntimeSettings): string =>
   ensureDir(path.join(settings.dataRoot, "config"));
 
-// Phase 5 (Lot 1, section 3/4): fonction centrale de resolution du chemin de
-// credentials par defaut, appelee UNIQUEMENT quand AGENT_CREDENTIALS_PATH
-// n'est pas fourni explicitement. Prend `dataRoot` directement (pas
-// `settings`, pas encore construit a cet instant dans agentSettings.ts)
-// pour rester coherente avec profiles/logs/config: jamais process.cwd()
-// (qui, en execution packagee, pointerait vers un dossier d'installation
-// potentiellement non inscriptible comme Program Files - defaut trouve et
-// corrige au Lot 1 de la Phase 5).
+// Phase 5 (Lot 2, section 13): etat runtime local non sensible (verrou
+// mono-instance). Jamais de credential ici.
+export const getStateDir = (settings: AgentRuntimeSettings): string =>
+  ensureDir(path.join(settings.dataRoot, "state"));
+
+// Phase 5 (Lot 1, section 3/4; chemin affine au Lot 2 section 4): fonction
+// centrale de resolution du chemin de credentials par defaut, appelee
+// UNIQUEMENT quand AGENT_CREDENTIALS_PATH n'est pas fourni explicitement.
+// Prend `dataRoot` directement (pas `settings`, pas encore construit a cet
+// instant dans agentSettings.ts) pour rester coherente avec
+// profiles/logs/config: jamais process.cwd() (qui, en execution packagee,
+// pointerait vers un dossier d'installation potentiellement non inscriptible
+// comme Program Files - defaut trouve et corrige au Lot 1 de la Phase 5).
+// Dossier dedie "credentials/" (plutot que "config/", utilise au Lot 1):
+// Phase 5 n'a encore livre aucun artefact a un client reel, ce changement de
+// chemin par defaut est donc sans risque de migration a ce stade.
 export const getDefaultCredentialsPath = (dataRoot: string): string =>
-  path.join(ensureDir(path.join(dataRoot, "config")), "credentials.json");
+  path.join(ensureDir(path.join(dataRoot, "credentials")), "agent-credentials.json");
 
 export const loadStoredCredentials = (settings: AgentRuntimeSettings): StoredAgentCredentials | null => {
   if (!existsSync(settings.credentialsPath)) {
