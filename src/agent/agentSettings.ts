@@ -91,6 +91,18 @@ export const loadAgentSettings = (): AgentRuntimeSettings => {
     ? fixtureUrl!
     : (process.env.AGENT_TARGET_URL?.trim() || "about:blank");
 
+  const reconnectMinDelayMs = numberEnv("AGENT_RECONNECT_MIN_DELAY_MS", 1_000);
+  const reconnectMaxDelayMs = numberEnv("AGENT_RECONNECT_MAX_DELAY_MS", 30_000);
+  if (reconnectMinDelayMs > reconnectMaxDelayMs) {
+    // Section 11 (Lot 6): erreur claire au demarrage plutot qu'un
+    // comportement silencieusement degrade (le backoff sauterait sa montee
+    // progressive et resterait bloque au maximum des la premiere tentative),
+    // coherent avec les autres validations deja strictes de ce fichier.
+    throw new Error(
+      `AGENT_RECONNECT_MIN_DELAY_MS (${reconnectMinDelayMs}) ne doit pas depasser AGENT_RECONNECT_MAX_DELAY_MS (${reconnectMaxDelayMs}).`
+    );
+  }
+
   return {
     serverUrl: process.env.AGENT_SERVER_URL?.trim() || `http://localhost:${process.env.WEB_PORT || 3000}`,
     credentialsPath: process.env.AGENT_CREDENTIALS_PATH?.trim()
@@ -102,8 +114,8 @@ export const loadAgentSettings = (): AgentRuntimeSettings => {
     targetUrl,
     maxActiveBots: numberEnv("AGENT_MAX_ACTIVE_BOTS", 15),
     dataRoot: resolveDataRoot(),
-    reconnectMinDelayMs: numberEnv("AGENT_RECONNECT_MIN_DELAY_MS", 1_000),
-    reconnectMaxDelayMs: numberEnv("AGENT_RECONNECT_MAX_DELAY_MS", 30_000),
+    reconnectMinDelayMs,
+    reconnectMaxDelayMs,
     reconnectJitterRatio: ratioEnv("AGENT_RECONNECT_JITTER_RATIO", 0.2),
     offlineEventBufferMax: numberEnv("AGENT_OFFLINE_EVENT_BUFFER_MAX", 500),
     logMaxFileSizeMb: numberEnv("AGENT_LOG_MAX_FILE_SIZE_MB", 5),

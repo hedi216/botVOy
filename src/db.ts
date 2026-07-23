@@ -1,5 +1,6 @@
 import pg from "pg";
 import { logger } from "./logger.js";
+import { requireValidPort } from "./envValidation.js";
 
 const { Pool, Client } = pg;
 
@@ -151,7 +152,7 @@ export const DB_NAME = "vrdv";
 
 const dbConfig = {
   host: process.env.PGHOST || "localhost",
-  port: Number(process.env.PGPORT || 5432),
+  port: requireValidPort("PGPORT", process.env.PGPORT, 5432),
   user: process.env.PGUSER || "postgres",
   password: process.env.PGPASSWORD || POSTGRES_PASSWORD,
   database: process.env.PGDATABASE || DB_NAME

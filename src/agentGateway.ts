@@ -46,7 +46,18 @@ const clampString = (value: unknown, maxLength: number): string => {
 // Defense en profondeur: meme si un agent legitime ne devrait jamais envoyer
 // de tel champ, un resultat/details ne doit jamais pouvoir vehiculer un
 // secret vers la base ou vers l'interface web (cf. section 5 et 16).
-const FORBIDDEN_KEY_SUBSTRINGS = ["token", "secret", "password", "code_hash", "codehash"];
+//
+// Lot 6 (audit final, section 7): CORRECTIF - cette liste ne couvrait que
+// token/secret/password/code_hash/codehash. Un test de securite dedie a
+// demontre qu'un champ nomme "cookie", "profilePath", "debugPort",
+// "Authorization" ou "apiKey" glisse dans public_result/public_payload
+// passait au travers SANS ETRE FILTRE (verifie present en base PostgreSQL
+// et dans les reponses REST). Alignee desormais sur la liste (deja plus
+// large) cote agent (agentLocalLogger.ts).
+const FORBIDDEN_KEY_SUBSTRINGS = [
+  "token", "secret", "password", "code_hash", "codehash",
+  "cookie", "authorization", "profilepath", "debugport", "apikey", "api_key"
+];
 
 const sanitizePublicRecord = (value: unknown, depth = 0): unknown => {
   if (depth > 4 || value === null || typeof value !== "object") {

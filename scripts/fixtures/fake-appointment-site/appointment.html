@@ -21,20 +21,41 @@
   AGENT_FIXTURE_URL explicite):
     - no-slots (defaut): mois courant/suivant sans disponibilite, message
       officiel "plus de creneaux disponibles".
-    - slot-available: creneau disponible + reservation qui aboutit (contenu
-      reconnu par hasReservationConfirmation), pour tester la detection ET
-      l'alerte SLOT_DETECTED avec deduplication.
+    - slot-available: un creneau disponible + reservation qui aboutit
+      (contenu reconnu par hasReservationConfirmation), pour tester la
+      detection ET l'alerte SLOT_DETECTED avec deduplication.
+    - multi-slot: PLUSIEURS creneaux disponibles simultanement (le moteur
+      selectionne et reserve le premier candidat actionable trouve).
     - month-change: mois courant indisponible, mois suivant disponible
       (teste le changement de mois et les delais associes).
     - rate-limited: texte "Error 1015" (motif rate-limit reconnu), qui se
       dissipe automatiquement apres clearAfterMs (defaut 30000) pour valider
-      la reprise MONITORING sans dependre d'un vrai site.
+      la reprise MONITORING (sortie de rate limit) sans dependre d'un vrai site.
     - refresh-required: etat "non pret" au premier chargement, devient pret
       seulement apres un reload() reel (sessionStorage), pour valider le
-      refresh periodique.
+      refresh periodique reussi.
+    - refresh-failed: reste TOUJOURS "non pret", meme apres reload() reel -
+      pour valider REFRESH_FAILED (echecs consecutifs -> BOT_STATUS ERROR),
+      jamais de boucle infinie.
+    - invalid: page reconnue par VALIDATE_BOT (marqueur fixture present) mais
+      dont le contenu ne correspond a AUCUN etat connu (ni pret, ni "aucun
+      creneau" officiel) - simule une page inattendue/ambigue.
+    - incomplete: DOM partiel (mois courant present, mois suivant ABSENT du
+      DOM plutot que simplement desactive) - verifie la robustesse des
+      detecteurs partages face a un element manquant plutot que desactive.
+    - unavailable-style: bouton de creneau present dans le DOM mais rendu
+      non actionable par CSS (pointer-events/opacite), jamais par l'attribut
+      disabled - verifie que isActionable() le traite bien comme indisponible.
 
   Parametres additionnels: clearAfterMs (rate-limited), monthDelayMs
-  (month-change, delai avant que le mois suivant affiche son contenu).
+  (month-change/navigation lente, delai avant que le mois suivant affiche
+  son contenu).
+
+  Pour ajouter un nouveau scenario: ajouter une fonction renderXxx() ci-dessous
+  qui peuple #fixture-root avec les MEMES data-testid/motifs de texte que la
+  production (jamais une logique de detection parallele), puis un cas dans le
+  switch en bas de ce script. Documenter le nouveau scenario dans ce
+  commentaire et dans docs/agent-testing.md.
 -->
 <div data-testid="fixture-appointment-page">
   <div id="fixture-root"></div>
@@ -57,16 +78,32 @@
       '<p>' + NO_SLOTS_TEXT + '</p>';
   };
 
+  var attachReserveHandler = function () {
+    var reserveBtn = document.getElementById("fixture-reserve-btn");
+    if (!reserveBtn) { return; }
+    reserveBtn.addEventListener("click", function () {
+      document.getElementById("fixture-confirmation").textContent = CONFIRMATION_TEXT;
+    });
+  };
+
   var renderSlotAvailable = function () {
     root.innerHTML =
       '<button data-testid="btn-current-month-available">Mois courant</button>' +
       '<button data-testid="btn-available-slot">14:30</button>' +
       '<button id="fixture-reserve-btn">' + RESERVE_TEXT + '</button>' +
       '<div id="fixture-confirmation"></div>';
+    attachReserveHandler();
+  };
 
-    document.getElementById("fixture-reserve-btn").addEventListener("click", function () {
-      document.getElementById("fixture-confirmation").textContent = CONFIRMATION_TEXT;
-    });
+  var renderMultiSlot = function () {
+    root.innerHTML =
+      '<button data-testid="btn-current-month-available">Mois courant</button>' +
+      '<button data-testid="btn-available-slot">09:00</button>' +
+      '<button data-testid="btn-available-slot">11:15</button>' +
+      '<button data-testid="btn-available-slot">16:45</button>' +
+      '<button id="fixture-reserve-btn">' + RESERVE_TEXT + '</button>' +
+      '<div id="fixture-confirmation"></div>';
+    attachReserveHandler();
   };
 
   var renderMonthChange = function () {
@@ -108,12 +145,64 @@
     root.innerHTML = "<p>Chargement en cours (etat volontairement non pret avant refresh)...</p>";
   };
 
+  // Contrairement a refresh-required, ne devient JAMAIS pret, meme apres un
+  // reload() reel: verifie que des refresh consecutifs qui echouent tous
+  // aboutissent bien a REFRESH_FAILED / BOT_STATUS ERROR (agentMonitoringRuntime.ts),
+  // jamais a une boucle infinie de refresh.
+  var renderRefreshFailed = function () {
+    root.innerHTML = "<p>Chargement en cours (ne devient jamais pret - test REFRESH_FAILED).</p>";
+  };
+
+  // Reconnue par VALIDATE_BOT (marqueur fixture present) mais dont le
+  // contenu ne correspond a AUCUN etat connu du moteur partage: ni pret
+  // (isAppointmentPageReady), ni "aucun creneau" officiel. Simule une page
+  // inattendue/ambigue (ex. contenu partiellement charge, texte inconnu).
+  var renderInvalid = function () {
+    root.innerHTML = "<p>Contenu de test non reconnu par les detecteurs (scenario invalid).</p>";
+  };
+
+  // DOM partiel: le mois suivant est ABSENT (pas seulement desactive) -
+  // verifie que les detecteurs partages restent robustes face a un element
+  // manquant plutot que simplement inactif (readVisibleText/locator sur un
+  // selecteur qui ne correspond a rien doit rester silencieux, jamais lever).
+  var renderIncomplete = function () {
+    root.innerHTML =
+      '<button data-testid="btn-current-month-unavailable" disabled>Mois courant</button>' +
+      '<p>Contenu incomplet (mois suivant absent du DOM).</p>';
+  };
+
+  // Le bouton de creneau existe dans le DOM (data-testid correct) mais est
+  // rendu non actionable par CSS (opacite/pointer-events), jamais par
+  // l'attribut disabled: verifie que isActionable() (detectors.ts) le
+  // traite bien comme indisponible plutot que de tenter un clic dessus.
+  var renderUnavailableStyle = function () {
+    root.innerHTML =
+      '<button data-testid="btn-current-month-available">Mois courant</button>' +
+      '<button data-testid="btn-available-slot" style="pointer-events:none;opacity:0.2;">10:00</button>' +
+      '<p>Creneau temporairement indisponible (style, pas attribut disabled).</p>';
+  };
+
   switch (scenario) {
     case "slot-available":
       renderSlotAvailable();
       break;
+    case "multi-slot":
+      renderMultiSlot();
+      break;
     case "month-change":
       renderMonthChange();
+      break;
+    case "refresh-failed":
+      renderRefreshFailed();
+      break;
+    case "invalid":
+      renderInvalid();
+      break;
+    case "incomplete":
+      renderIncomplete();
+      break;
+    case "unavailable-style":
+      renderUnavailableStyle();
       break;
     case "rate-limited":
       renderRateLimited();

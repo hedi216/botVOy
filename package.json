@@ -20,7 +20,12 @@
     "test:agent:monitoring:simulated": "tsx scripts/test-agent-monitoring-simulated.ts",
     "test:agent:monitoring:real": "tsx scripts/test-agent-monitoring-real.ts",
     "test:agent:resilience:simulated": "tsx scripts/test-agent-resilience-simulated.ts",
-    "test:agent:resilience:real": "tsx scripts/test-agent-resilience-real.ts"
+    "test:agent:resilience:real": "tsx scripts/test-agent-resilience-real.ts",
+    "test:agent:security:simulated": "tsx scripts/test-agent-security-simulated.ts",
+    "test:agent:soak:real": "tsx scripts/test-agent-soak-real.ts",
+    "test:phase4:final:simulated": "tsx scripts/test-phase4-final-simulated.ts",
+    "test:phase4:final:real": "tsx scripts/test-phase4-final-real.ts",
+    "test:phase4:smoke": "tsx scripts/test-phase4-smoke.ts"
   },
   "keywords": [
     "playwright",

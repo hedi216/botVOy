@@ -113,8 +113,13 @@ const makeSettings = (overrides: Partial<AgentRuntimeSettings> = {}): AgentRunti
   ...overrides
 });
 
-const cleanupChromeAndDir = async (): Promise<void> => {
-  const stray = (await listChromeProcs()).map((p) => p.pid);
+// Lot 6 (audit final, section 1/8): CORRECTIF - cette fonction tuait
+// auparavant TOUS les chrome.exe du systeme sans filtrage, y compris un
+// Chrome personnel de l'utilisateur ouvert independamment du test. Elle
+// exige desormais une baseline (PIDs deja presents AVANT que ce test ne
+// lance quoi que ce soit) et ne touche jamais qu'aux process apparus depuis.
+const cleanupChromeAndDir = async (baselinePids: string[]): Promise<void> => {
+  const stray = (await listChromeProcs()).map((p) => p.pid).filter((pid) => !baselinePids.includes(pid));
   if (stray.length > 0) {
     await killPids(stray);
   }
@@ -125,7 +130,12 @@ const cleanupChromeAndDir = async (): Promise<void> => {
 
 const runSuiteA = async (): Promise<void> => {
   log("SUITE-A", "=== AgentBotManager (appels directs) ===");
+  // Capture AVANT tout lancement de Chrome par ce test: le nettoyage final
+  // (finally ci-dessous) ne doit jamais toucher un Chrome deja present pour
+  // une autre raison (session personnelle de l'utilisateur, par exemple).
+  const suiteABaseline = (await listChromeProcs()).map((p) => p.pid);
 
+  try {
   // --- botId malveillant ---
   {
     const settings = makeSettings();
@@ -315,8 +325,12 @@ const runSuiteA = async (): Promise<void> => {
     assert(stillAlive.length === 0, "shutdownAll() (Ctrl+C) ferme tous les navigateurs actifs sans exception");
     assert(manager.activeCount() === 0, "le registre local est vide apres shutdownAll()");
   }
-
-  await cleanupChromeAndDir();
+  } finally {
+    // Lot 6: deplace dans un finally (auparavant en fin de fonction: un
+    // throw plus haut - assertion echouee, exception - sautait ce nettoyage
+    // et pouvait laisser un Chrome de test orphelin).
+    await cleanupChromeAndDir(suiteABaseline);
+  }
 };
 
 // --- Suite B: bout en bout reel (serveur + agent:dev + dispatch socket) ---
@@ -355,7 +369,25 @@ const runSuiteB = async (): Promise<void> => {
 
   const chromeBaseline = (await listChromeProcs()).map((p) => p.pid);
 
-  const server = spawn(process.platform === "win32" ? "npx.cmd" : "npx", ["tsx", "src/server.ts"], {
+  // Declares en amont (jamais const a l'interieur du try) et initialises:
+  // le finally ci-dessous doit pouvoir les lire meme si une exception
+  // interrompt le try AVANT que ces variables n'aient ete assignees (une
+  // const referencee dans un finally alors qu'elle n'a jamais ete atteinte
+  // dans le try leve sa propre ReferenceError - "temporal dead zone" - qui
+  // masquerait l'erreur d'origine et interromprait le nettoyage a son tour).
+  let server: ChildProcess | undefined;
+  let agent: ChildProcess | undefined;
+  let uiSocket: Socket | undefined;
+  let agencyName = "";
+  let managerLogin = "";
+
+  // Lot 6: le corps de cette suite est enveloppe dans try/finally pour
+  // garantir que le nettoyage (process serveur/agent, Chrome orphelin,
+  // lignes DB, fichiers temporaires) s'execute meme si une
+  // assertion/etape intermediaire echoue avec une exception.
+  try {
+
+  server = spawn(process.platform === "win32" ? "npx.cmd" : "npx", ["tsx", "src/server.ts"], {
     env: { ...process.env, WEB_PORT: String(port), BOT_EXECUTION_MODE: "agent", AGENT_UI_ENABLED: "true", AGENT_DOWNLOAD_URL: "http://example.test" },
     stdio: ["ignore", "pipe", "pipe"],
     shell: process.platform === "win32"
@@ -366,9 +398,9 @@ const runSuiteB = async (): Promise<void> => {
   await waitForServerReady(baseUrl);
 
   const adminCookie = (await requestJson(baseUrl, "POST", "/api/login", undefined, { login: "admin", password: "HtlsH2030*" })).cookie!;
-  const agencyName = `Test Lot2 ${RUN_SUFFIX}`;
+  agencyName = `Test Lot2 ${RUN_SUFFIX}`;
   const agencyId = (await requestJson(baseUrl, "POST", "/api/agencies", adminCookie, { name: agencyName, maxActiveClients: 15 })).body.agency.id;
-  const managerLogin = `test-lot2-${RUN_SUFFIX}`;
+  managerLogin = `test-lot2-${RUN_SUFFIX}`;
   const userRes = await requestJson(baseUrl, "POST", "/api/users", adminCookie, { agencyId, login: managerLogin, name: "Lot2 Manager", email: `${managerLogin}@example.test`, role: 1 });
   const managerPassword = userRes.body.temporaryPassword;
   const managerCookie = (await requestJson(baseUrl, "POST", "/api/login", undefined, { login: managerLogin, password: managerPassword })).cookie!;
@@ -382,7 +414,7 @@ const runSuiteB = async (): Promise<void> => {
   // node reellement charge de src/agent/agentMain.ts.
   const tsxPreflight = path.join(process.cwd(), "node_modules", "tsx", "dist", "preflight.cjs");
   const tsxLoader = path.join(process.cwd(), "node_modules", "tsx", "dist", "loader.mjs");
-  const agent: ChildProcess = spawn(process.execPath, [
+  agent = spawn(process.execPath, [
     "--require", tsxPreflight,
     "--import", `file://${tsxLoader.replace(/\\/g, "/")}`,
     "src/agent/agentMain.ts", "pair", code
@@ -406,7 +438,7 @@ const runSuiteB = async (): Promise<void> => {
 
   await sleep(2_500);
 
-  const uiSocket: Socket = await new Promise((resolve, reject) => {
+  uiSocket = await new Promise((resolve, reject) => {
     const s = ioClient(baseUrl, { autoConnect: false, reconnection: false, extraHeaders: { Cookie: managerCookie } });
     const t = setTimeout(() => reject(new Error("timeout ui socket")), 8_000);
     s.on("connect", () => { clearTimeout(t); resolve(s); });
@@ -523,32 +555,34 @@ const runSuiteB = async (): Promise<void> => {
   const chromeAfterSigint = await listChromeProcs();
   assert(!newBeforeSigint.some((p) => chromeAfterSigint.some((c) => c.pid === p.pid)), "SIGINT (Ctrl+C) ferme tous les navigateurs restants, aucun orphelin");
 
-  // --- nettoyage ---
   uiSocket.disconnect();
+  } finally {
+    // Lot 6: nettoyage garanti (voir commentaire au debut de la fonction),
+    // execute meme si une assertion/etape ci-dessus a leve une exception.
+    const killTree = (pid: number | undefined): Promise<void> => new Promise((resolve) => {
+      if (!pid) { resolve(); return; }
+      if (process.platform === "win32") {
+        const k = spawn("taskkill", ["/PID", String(pid), "/T", "/F"]);
+        k.once("exit", () => resolve());
+        k.once("error", () => resolve());
+        return;
+      }
+      try { process.kill(pid, "SIGKILL"); } catch { /* deja mort */ }
+      resolve();
+    });
+    await killTree(server?.pid);
+    await killTree(agent?.pid);
 
-  const killTree = (pid: number | undefined): Promise<void> => new Promise((resolve) => {
-    if (!pid) { resolve(); return; }
-    if (process.platform === "win32") {
-      const k = spawn("taskkill", ["/PID", String(pid), "/T", "/F"]);
-      k.once("exit", () => resolve());
-      k.once("error", () => resolve());
-      return;
+    const strayChrome = (await listChromeProcs()).filter((p) => !chromeBaseline.includes(p.pid));
+    if (strayChrome.length > 0) {
+      await killPids(strayChrome.map((p) => p.pid));
     }
-    try { process.kill(pid, "SIGKILL"); } catch { /* deja mort */ }
-    resolve();
-  });
-  await killTree(agent.pid);
-  await killTree(server.pid);
 
-  const strayChrome = (await listChromeProcs()).filter((p) => !chromeBaseline.includes(p.pid));
-  if (strayChrome.length > 0) {
-    await killPids(strayChrome.map((p) => p.pid));
+    await pool.query("DELETE FROM users WHERE login = $1", [managerLogin]).catch(() => undefined);
+    await pool.query("DELETE FROM agencies WHERE name = $1", [agencyName]).catch(() => undefined);
+    if (existsSync(credPath)) rmSync(credPath, { force: true });
+    if (existsSync(agentDataRoot)) rmSync(agentDataRoot, { recursive: true, force: true });
   }
-
-  await pool.query("DELETE FROM users WHERE login = $1", [managerLogin]);
-  await pool.query("DELETE FROM agencies WHERE name = $1", [agencyName]);
-  if (existsSync(credPath)) rmSync(credPath);
-  if (existsSync(agentDataRoot)) rmSync(agentDataRoot, { recursive: true, force: true });
 };
 
 const main = async (): Promise<void> => {
@@ -558,9 +592,11 @@ const main = async (): Promise<void> => {
     try {
       await runSuiteA();
     } catch (error) {
+      // Lot 6: le nettoyage lui-meme est desormais garanti par le
+      // finally de runSuiteA() (baseline-aware), meme sur ce throw -
+      // aucun appel redondant necessaire ici.
       console.error("[FATAL SUITE A]", error);
       failCount += 1;
-      await cleanupChromeAndDir().catch(() => undefined);
     }
   }
 

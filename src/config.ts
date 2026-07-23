@@ -72,21 +72,39 @@ export const loadPhase2FeatureFlags = (): Phase2FeatureFlags => ({
   botExecutionMode: process.env.BOT_EXECUTION_MODE?.trim() === "agent" ? "agent" : "legacy_vm"
 });
 
-export const loadConfig = (): AppConfig => ({
-  targetUrl: process.env.TARGET_URL?.trim() || "about:blank",
-  connectToExistingChrome: booleanEnv("CONNECT_TO_EXISTING_CHROME", false),
-  chromeDebugUrl: process.env.CHROME_DEBUG_URL?.trim() || "http://127.0.0.1:9222",
-  refreshIntervalMs: numberEnv("REFRESH_INTERVAL_MS", 180_000),
-  headless: booleanEnv("HEADLESS", false),
-  slowMoMs: numberEnv("SLOW_MO_MS", 200),
-  debugKeepBrowserOpen: booleanEnv("DEBUG_KEEP_BROWSER_OPEN", true),
-  maxRefreshAttempts: numberEnv("MAX_REFRESH_ATTEMPTS", 0),
-  scanMonthCount: numberEnv("SCAN_MONTH_COUNT", 0),
-  maxParallelScansPerDomain: numberEnv("MAX_PARALLEL_SCANS_PER_DOMAIN", 1),
-  monthClickMinDelayMs: numberEnv("MONTH_CLICK_MIN_DELAY_MS", 5_000),
-  monthClickMaxDelayMs: numberEnv("MONTH_CLICK_MAX_DELAY_MS", 10_000),
-  botCycleCooldownMinMs: numberEnv("BOT_CYCLE_COOLDOWN_MIN_MS", 120_000),
-  botCycleCooldownMaxMs: numberEnv("BOT_CYCLE_COOLDOWN_MAX_MS", 240_000),
-  refreshEveryCycles: numberEnv("REFRESH_EVERY_CYCLES", 20),
-  rateLimitCooldownMinutes: numberEnv("RATE_LIMIT_COOLDOWN_MINUTES", 45)
-});
+// Lot 6 (section 11): les cas min > max sont deja geres de maniere
+// defensive a l'usage (orchestrator.ts randomBetween() clampe silencieusement),
+// donc jamais bloquant au demarrage - mais une configuration incoherente
+// merite un avertissement explicite plutot qu'un silence total.
+const warnIfInverted = (label: string, min: number, max: number): void => {
+  if (min > max) {
+    // eslint-disable-next-line no-console
+    console.warn(`[config] ${label}: la valeur minimale (${min}) depasse la valeur maximale (${max}). Les delais reels seront tout de meme bornes correctement a l'usage, mais corrigez cette configuration.`);
+  }
+};
+
+export const loadConfig = (): AppConfig => {
+  const config: AppConfig = {
+    targetUrl: process.env.TARGET_URL?.trim() || "about:blank",
+    connectToExistingChrome: booleanEnv("CONNECT_TO_EXISTING_CHROME", false),
+    chromeDebugUrl: process.env.CHROME_DEBUG_URL?.trim() || "http://127.0.0.1:9222",
+    refreshIntervalMs: numberEnv("REFRESH_INTERVAL_MS", 180_000),
+    headless: booleanEnv("HEADLESS", false),
+    slowMoMs: numberEnv("SLOW_MO_MS", 200),
+    debugKeepBrowserOpen: booleanEnv("DEBUG_KEEP_BROWSER_OPEN", true),
+    maxRefreshAttempts: numberEnv("MAX_REFRESH_ATTEMPTS", 0),
+    scanMonthCount: numberEnv("SCAN_MONTH_COUNT", 0),
+    maxParallelScansPerDomain: numberEnv("MAX_PARALLEL_SCANS_PER_DOMAIN", 1),
+    monthClickMinDelayMs: numberEnv("MONTH_CLICK_MIN_DELAY_MS", 5_000),
+    monthClickMaxDelayMs: numberEnv("MONTH_CLICK_MAX_DELAY_MS", 10_000),
+    botCycleCooldownMinMs: numberEnv("BOT_CYCLE_COOLDOWN_MIN_MS", 120_000),
+    botCycleCooldownMaxMs: numberEnv("BOT_CYCLE_COOLDOWN_MAX_MS", 240_000),
+    refreshEveryCycles: numberEnv("REFRESH_EVERY_CYCLES", 20),
+    rateLimitCooldownMinutes: numberEnv("RATE_LIMIT_COOLDOWN_MINUTES", 45)
+  };
+
+  warnIfInverted("MONTH_CLICK_MIN_DELAY_MS/MAX_DELAY_MS", config.monthClickMinDelayMs, config.monthClickMaxDelayMs);
+  warnIfInverted("BOT_CYCLE_COOLDOWN_MIN_MS/MAX_MS", config.botCycleCooldownMinMs, config.botCycleCooldownMaxMs);
+
+  return config;
+};

@@ -30,7 +30,13 @@ const ALLOWED_KEYS = new Set([
   "activeBotCount",
   "createdAt",
   "updatedAt",
-  "revokedAt"
+  "revokedAt",
+  // Lot 5 (Phase 4): READY_FOR_COMMANDS et inventaire public d'extensions -
+  // deja assainis a la source (jamais de localPath, cf. agentExtensionConfig.ts
+  // toPublicExtensionStatus()), whitelistes ici pour que ce test reste le
+  // garde-fou reel sur toute FUTURE cle ajoutee sans revue.
+  "readyForCommands",
+  "extensions"
 ]);
 
 const failures: string[] = [];

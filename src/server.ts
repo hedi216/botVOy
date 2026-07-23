@@ -46,6 +46,7 @@ import {
 import { notifyUserIfNeeded } from "./notifications.js";
 import { sendAppAlert } from "./appAlertService.js";
 import { loadAgentCommandConfig, loadAgentGatewayConfig, loadPhase2FeatureFlags } from "./config.js";
+import { requirePositiveInt, requireValidPort } from "./envValidation.js";
 import { createPairingCode, listAgentsForAgency, renameAgent, revokeAgent } from "./agentService.js";
 import {
   AgentSnapshot,
@@ -87,8 +88,8 @@ type StoredLog = {
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
-const preferredPort = Number(process.env.WEB_PORT ?? 3000);
-const maxClients = Number(process.env.MAX_CLIENTS_PER_VM ?? 15);
+const preferredPort = requireValidPort("WEB_PORT", process.env.WEB_PORT, 3000);
+const maxClients = requirePositiveInt("MAX_CLIENTS_PER_VM", process.env.MAX_CLIENTS_PER_VM, 15);
 const agentGatewayConfig = loadAgentGatewayConfig();
 const featureFlags = loadPhase2FeatureFlags();
 const agentCommandConfig = loadAgentCommandConfig();
@@ -674,6 +675,23 @@ app.use((error: Error, _req: express.Request, res: express.Response, _next: expr
   // atteindre le client, meme si l'analyse ci-dessus (requireAgencyId, etc.)
   // a deja neutralise les cas connus.
   if (error instanceof TypeError || error instanceof RangeError) {
+    res.status(400).json({ error: "Requete invalide." });
+    return;
+  }
+
+  // Lot 6 (audit final, section 7): CORRECTIF - une erreur brute du pilote
+  // PostgreSQL (ex: "invalid input syntax for type uuid: ...") est un objet
+  // Error ordinaire, indiscernable ici d'une erreur metier deliberee sans
+  // verification supplementaire: elle atteignait donc le client tel quel,
+  // avant ce correctif (confirme par un test de securite dedie). Le pilote
+  // "pg" expose systematiquement un code SQLSTATE a 5 caracteres
+  // (ex: "22P02") sur ces erreurs, jamais present sur les Error metier
+  // volontairement levees dans ce fichier: c'est un marqueur fiable pour ne
+  // filtrer QUE les erreurs de bas niveau, sans toucher aux messages
+  // francais deliberes (ex: "Agence introuvable.") dont ce handler reste
+  // par ailleurs le relais legitime.
+  const pgErrorCode = (error as { code?: unknown }).code;
+  if (typeof pgErrorCode === "string" && /^[0-9A-Z]{5}$/.test(pgErrorCode)) {
     res.status(400).json({ error: "Requete invalide." });
     return;
   }
