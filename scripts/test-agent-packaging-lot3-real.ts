@@ -269,7 +269,11 @@ const main = async (): Promise<void> => {
     const noNodeCheck = await new Promise<boolean>((resolve) => {
       const child = spawn(path.join(appDir, "RendezBotAgent.exe"), ["agent\\agentMain.js"], {
         cwd: appDir,
-        env: { PATH: "", SystemRoot: process.env.SystemRoot ?? "", AGENT_DATA_DIR: path.join(os.tmpdir(), `rendezbot-lot3-nonode-${RUN_SUFFIX}`), AGENT_SERVER_URL: "http://127.0.0.1:1" },
+        // AGENT_RUNTIME_MODE force a "development": ce scenario cible
+        // UNIQUEMENT l'absence de dependance Node.js systeme, jamais le
+        // detecteur automatique de mode packaged (le scenario dedie
+        // ci-dessous verifie precisement ce detecteur, avec un PATH normal).
+        env: { PATH: "", SystemRoot: process.env.SystemRoot ?? "", AGENT_DATA_DIR: path.join(os.tmpdir(), `rendezbot-lot3-nonode-${RUN_SUFFIX}`), AGENT_SERVER_URL: "http://127.0.0.1:1", AGENT_RUNTIME_MODE: "development" },
         stdio: ["ignore", "ignore", "ignore"]
       });
       setTimeout(() => { const alive = child.exitCode === null; if (alive) child.kill(); resolve(alive); }, 2_500);
@@ -283,6 +287,60 @@ const main = async (): Promise<void> => {
     assert(!existsSync(path.join(testDir, "src")) && !existsSync(path.join(testDir, ".env")), "Scenario D: aucun fichier source/.env dans le dossier installe");
     autostartCreated = existsSync(startupShortcutPath());
     assert(autostartCreated, "Scenario L: la tache 'autostart' cree bien un raccourci dans le dossier Demarrage de l'utilisateur");
+
+    // ===================== D2 (defaut trouve en test manuel VM, defense runtime): RendezBotAgent.exe lance DIRECTEMENT (sans passer par le launcher .vbs) SANS AUCUNE variable Windows -> mode packaged auto-detecte -> app.rendezbot.xyz =====================
+    // Reproduit exactement le defaut constate manuellement: aucune variable
+    // Process/User/Machine (AGENT_SERVER_URL, AGENT_RUNTIME_MODE) definie -
+    // seul AGENT_DATA_DIR est fourni, pour isoler ce test (n'affecte jamais
+    // la resolution du serveur). PATH normal (DPAPI doit fonctionner). Cette
+    // etape contourne DELIBEREMENT le launcher .vbs pour prouver la DEFENSE
+    // COTE RUNTIME (detection via le nom de l'executable) independamment de
+    // la correction du launcher, verifiee separement en D3.
+    const cleanLaunchDataRoot = path.join(os.tmpdir(), `rendezbot-lot3-cleanlaunch-${RUN_SUFFIX}`);
+    const cleanLaunchOutput = await new Promise<string>((resolve) => {
+      const child = spawn(path.join(testDir, "RendezBotAgent.exe"), ["agent\\agentMain.js"], {
+        cwd: testDir,
+        env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, AGENT_DATA_DIR: cleanLaunchDataRoot },
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      let output = "";
+      child.stdout?.on("data", (c: Buffer) => { const t = c.toString(); output += t; log("CLEAN-LAUNCH", t.trim()); });
+      child.stderr?.on("data", (c: Buffer) => { output += c.toString(); });
+      setTimeout(async () => {
+        await killTree(child.pid);
+        resolve(output);
+      }, 3_000);
+    });
+    assert(/Serveur: https:\/\/app\.rendezbot\.xyz/.test(cleanLaunchOutput), `Scenario D2: RendezBotAgent.exe lance directement, sans aucune variable Windows -> https://app.rendezbot.xyz (defense runtime, sortie: ${cleanLaunchOutput.slice(0, 300)})`);
+    if (existsSync(cleanLaunchDataRoot)) rmSync(cleanLaunchDataRoot, { recursive: true, force: true });
+
+    // ===================== D3: le VRAI launcher .vbs (celui utilise par tous les raccourcis) transmet bien le mode packaged =====================
+    // Cette fois via wscript.exe + le .vbs installe reellement, exactement
+    // comme le ferait un clic sur un raccourci - preuve directe que la
+    // correction du launcher (pas seulement la defense runtime de D2)
+    // fonctionne. Le launcher lance RendezBotAgent.exe detache (shell.Run,
+    // fenetre masquee) : impossible de capturer son stdout directement, donc
+    // verification via le fichier agent.log reellement ecrit dans le
+    // dataRoot isole.
+    const vbsLaunchDataRoot = path.join(os.tmpdir(), `rendezbot-lot3-vbslaunch-${RUN_SUFFIX}`);
+    const vbsLogPath = path.join(vbsLaunchDataRoot, "logs", "agent.log");
+    const vbsLockPath = path.join(vbsLaunchDataRoot, "state", "agent.lock");
+    spawn("wscript.exe", [path.join(testDir, "agent-launch-no-console.vbs")], {
+      cwd: testDir,
+      env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, AGENT_DATA_DIR: vbsLaunchDataRoot },
+      stdio: "ignore",
+      detached: true
+    }).unref();
+    const vbsLogReady = await waitUntil(() => existsSync(vbsLogPath) && readFileSync(vbsLogPath, "utf8").includes("Serveur:"), 8_000);
+    const vbsLogContent = vbsLogReady ? readFileSync(vbsLogPath, "utf8") : "";
+    assert(/Serveur: https:\/\/app\.rendezbot\.xyz/.test(vbsLogContent), `Scenario D3: le launcher .vbs installe (celui de TOUS les raccourcis) transmet bien AGENT_RUNTIME_MODE=packaged -> https://app.rendezbot.xyz (log: ${vbsLogContent.slice(0, 300) || "absent"})`);
+    if (existsSync(vbsLockPath)) {
+      try {
+        const lockInfo = JSON.parse(readFileSync(vbsLockPath, "utf8"));
+        if (typeof lockInfo.pid === "number") await killTree(lockInfo.pid);
+      } catch { /* best effort */ }
+    }
+    if (existsSync(vbsLaunchDataRoot)) rmSync(vbsLaunchDataRoot, { recursive: true, force: true });
 
     // ===================== Serveur de test + agence/manager =====================
     server = await startServer(SERVER_PORT, { AGENT_UI_ENABLED: "true", BOT_EXECUTION_MODE: "agent" });

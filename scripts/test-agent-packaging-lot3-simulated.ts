@@ -11,6 +11,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
+import { loadAgentSettings } from "../src/agent/agentSettings.js";
 
 let passCount = 0;
 let failCount = 0;
@@ -117,7 +118,12 @@ const main = async (): Promise<void> => {
   const verifyResult = await new Promise<{ started: boolean }>((resolve) => {
     const child = spawn(path.join(APP_DIR, "RendezBotAgent.exe"), ["agent\\agentMain.js"], {
       cwd: APP_DIR,
-      env: { PATH: "", SystemRoot: process.env.SystemRoot ?? "", AGENT_DATA_DIR: verifyDataRoot, AGENT_SERVER_URL: "http://127.0.0.1:1" },
+      // AGENT_RUNTIME_MODE force a "development": cette verification cible
+      // UNIQUEMENT l'absence de dependance Node.js systeme, jamais le
+      // detecteur automatique de mode packaged (qui, combine au PATH vide
+      // ci-dessous, ferait echouer DPAPI - un probleme distinct, deja
+      // couvert par ses propres tests plus bas).
+      env: { PATH: "", SystemRoot: process.env.SystemRoot ?? "", AGENT_DATA_DIR: verifyDataRoot, AGENT_SERVER_URL: "http://127.0.0.1:1", AGENT_RUNTIME_MODE: "development" },
       stdio: ["ignore", "ignore", "ignore"]
     });
     let started = true;
@@ -130,6 +136,29 @@ const main = async (): Promise<void> => {
   });
   assert(verifyResult.started, "RendezBotAgent.exe demarre avec PATH vide (aucune dependance a un Node.js systeme installe)");
   if (existsSync(verifyDataRoot)) rmSync(verifyDataRoot, { recursive: true, force: true });
+
+  // ===================== 3bis. Lancement installe SANS AUCUNE variable Windows -> mode packaged auto-detecte (defaut trouve en test manuel VM) =====================
+  const cleanLaunchDataRoot = path.join(ROOT, `.test-lot3-sim-cleanlaunch-${Date.now()}`);
+  const cleanLaunchOutput = await new Promise<string>((resolve) => {
+    const child = spawn(path.join(APP_DIR, "RendezBotAgent.exe"), ["agent\\agentMain.js"], {
+      cwd: APP_DIR,
+      // PATH normal (DPAPI doit fonctionner ici) - AUCUN AGENT_RUNTIME_MODE,
+      // AUCUN AGENT_SERVER_URL: reproduit exactement un lancement installe
+      // (raccourci) sans la moindre variable Windows definie, comme
+      // reellement constate en test manuel VM.
+      env: { PATH: process.env.PATH ?? "", SystemRoot: process.env.SystemRoot ?? "", AGENT_DATA_DIR: cleanLaunchDataRoot },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let output = "";
+    child.stdout?.on("data", (c: Buffer) => { output += c.toString(); });
+    child.stderr?.on("data", (c: Buffer) => { output += c.toString(); });
+    setTimeout(() => {
+      if (child.exitCode === null) child.kill();
+      resolve(output);
+    }, 3_000);
+  });
+  assert(/Serveur: https:\/\/app\.rendezbot\.xyz/.test(cleanLaunchOutput), `Lancement sans aucune variable Windows -> mode packaged auto-detecte -> https://app.rendezbot.xyz (sortie: ${cleanLaunchOutput.slice(0, 300)})`);
+  if (existsSync(cleanLaunchDataRoot)) rmSync(cleanLaunchDataRoot, { recursive: true, force: true });
 
   // ===================== 4. Script Inno Setup: structure statique =====================
   const iss = readFileSync(ISS_PATH, "utf8");
@@ -157,6 +186,25 @@ const main = async (): Promise<void> => {
   assert(/DELETEALLDATA/.test(codeSection), "La suppression complete en mode silencieux exige le parametre explicite /DELETEALLDATA=1 (jamais par defaut)");
   assert(/CompareVersions/.test(codeSection) && /GetInstalledVersion/.test(codeSection), "Detection de downgrade presente (CompareVersions/GetInstalledVersion)");
   assert(/PrepareToInstall/.test(codeSection) && /StopRunningAgentGracefully/.test(codeSection), "PrepareToInstall declenche l'arret gracieux avant remplacement de fichiers");
+
+  // Tous les raccourcis (menu Demarrer, Bureau, Demarrage) et l'action
+  // "Lancer maintenant" post-installation utilisent le MEME fichier .vbs -
+  // un seul correctif du launcher (mode packaged transmis) couvre donc tous
+  // les points d'entree (defaut trouve pendant un test manuel VM).
+  const launcherReferences = iss.match(/Parameters:\s*"*\{app\}\\\{#MyAppLauncher\}/g) ?? [];
+  assert(launcherReferences.length === 4, `Les 4 points de lancement (Menu Demarrer, Bureau, Demarrage, "Lancer maintenant") utilisent le meme launcher .vbs (obtenu: ${launcherReferences.length})`);
+
+  // ===================== 4bis. Launcher .vbs livre: transmet explicitement le mode packaged =====================
+  const launcherPath = path.join(ROOT, "scripts", "agent-launch-no-console.vbs");
+  const launcherSource = readFileSync(launcherPath, "utf8");
+  assert(/shell\.Environment\("Process"\)/i.test(launcherSource), "Le launcher .vbs definit l'environnement en portee 'Process' uniquement");
+  assert(/processEnv\("AGENT_RUNTIME_MODE"\)\s*=\s*"packaged"/.test(launcherSource), "Le launcher .vbs transmet explicitement AGENT_RUNTIME_MODE=packaged avant de lancer l'agent (defaut trouve en VM: sans cela, le runtime retombait sur 'development'/localhost:3000)");
+  assert(!/shell\.Environment\("User"\)/i.test(launcherSource) && !/shell\.Environment\("System"\)/i.test(launcherSource), "Le launcher .vbs ne depend jamais d'une variable d'environnement User/Machine (portee Process uniquement)");
+  const shippedLauncherPath = path.join(APP_DIR, "agent-launch-no-console.vbs");
+  if (existsSync(shippedLauncherPath)) {
+    const shippedLauncher = readFileSync(shippedLauncherPath, "utf8");
+    assert(shippedLauncher === launcherSource, "Le launcher livre dans le build correspond exactement au launcher source (aucune ancienne copie residuelle)");
+  }
 
   // ===================== 5. Compilation ISCC (si l'outil est disponible sur cette VM) =====================
   const isccPath = findIsccPath();
@@ -213,6 +261,94 @@ const main = async (): Promise<void> => {
       const sumsMap = new Map(sumsLines.map((l) => { const [hash, ...rest] = l.split(/\s+/); return [rest.join(" "), hash]; }));
       const allMatch = manifest.files.every((f: any) => sumsMap.get(f.name) === f.sha256);
       assert(allMatch && sumsMap.size === manifest.files.length, "SHA256SUMS.txt correspond exactement aux entrees du manifeste (memes fichiers, memes hashes)");
+    }
+
+    const manifestFilesText = manifest.files.map((f: any) => f.name).join("\n");
+    assert(!/AGENT_SERVER_URL/.test(manifestText), "Manifeste: aucune valeur AGENT_SERVER_URL du poste de build n'est jamais serialisee");
+    assert(!offendingFiles.includes("app/.env") && !manifestFilesText.includes(".env"), "Aucun .env (build ou local) n'est jamais reference/livre");
+  }
+
+  // ===================== 7. Resolution de l'URL serveur par mode (defaut trouve en test manuel VM: interface locale affichait localhost:3000 apres une vraie installation) =====================
+  {
+    const withEnv = async (overrides: Record<string, string | undefined>, fn: () => void): Promise<void> => {
+      const previous = { ...process.env };
+      try {
+        for (const [key, value] of Object.entries(overrides)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        fn();
+      } finally {
+        process.env = previous;
+      }
+    };
+
+    await withEnv({ AGENT_RUNTIME_MODE: "packaged", AGENT_SERVER_URL: undefined, AGENT_DATA_DIR: path.join(ROOT, ".test-lot3-sim-serverurl-1") }, () => {
+      const settings = loadAgentSettings();
+      assert(settings.serverUrl === "https://app.rendezbot.xyz", `Packaged sans variable -> defaut de production https://app.rendezbot.xyz (obtenu: ${settings.serverUrl})`);
+    });
+
+    await withEnv({ AGENT_RUNTIME_MODE: "packaged", AGENT_SERVER_URL: "http://example.com", AGENT_DATA_DIR: path.join(ROOT, ".test-lot3-sim-serverurl-2") }, () => {
+      let threw = false;
+      try { loadAgentSettings(); } catch { threw = true; }
+      assert(threw, "Packaged avec HTTP distant (non-loopback) -> refus (HTTPS obligatoire pour un serveur distant)");
+    });
+
+    await withEnv({ AGENT_RUNTIME_MODE: "packaged", AGENT_SERVER_URL: "https://example.com", AGENT_DATA_DIR: path.join(ROOT, ".test-lot3-sim-serverurl-3") }, () => {
+      let threw = false;
+      let settings: any;
+      try { settings = loadAgentSettings(); } catch { threw = true; }
+      assert(!threw && settings.serverUrl === "https://example.com", "Packaged avec HTTPS distant explicite -> accepte tel quel");
+    });
+
+    await withEnv({ AGENT_RUNTIME_MODE: "packaged", AGENT_SERVER_URL: "http://127.0.0.1:1", AGENT_DATA_DIR: path.join(ROOT, ".test-lot3-sim-serverurl-4") }, () => {
+      let threw = false;
+      let settings: any;
+      try { settings = loadAgentSettings(); } catch { threw = true; }
+      assert(!threw && settings.serverUrl === "http://127.0.0.1:1", "Packaged avec un hote loopback explicite (tests internes du runtime packaged) -> accepte, jamais refuse");
+    });
+
+    await withEnv({ AGENT_RUNTIME_MODE: "development", AGENT_SERVER_URL: "http://localhost:3000", AGENT_DATA_DIR: path.join(ROOT, ".test-lot3-sim-serverurl-5") }, () => {
+      const settings = loadAgentSettings();
+      assert(settings.serverUrl === "http://localhost:3000", "Dev avec localhost explicite -> accepte");
+    });
+
+    await withEnv({ AGENT_RUNTIME_MODE: "development", AGENT_SERVER_URL: undefined, AGENT_DATA_DIR: path.join(ROOT, ".test-lot3-sim-serverurl-6") }, () => {
+      const settings = loadAgentSettings();
+      assert(settings.serverUrl.startsWith("http://localhost:"), "Dev sans variable -> comportement historique conserve (localhost par defaut)");
+    });
+
+    await withEnv({ AGENT_RUNTIME_MODE: "test", AGENT_SERVER_URL: undefined, AGENT_DATA_DIR: path.join(ROOT, ".test-lot3-sim-serverurl-7") }, () => {
+      let threw = false;
+      try { loadAgentSettings(); } catch { threw = true; }
+      assert(threw, "Test sans variable -> refus (aucun serveur par defaut en mode test)");
+    });
+
+    await withEnv({ AGENT_RUNTIME_MODE: "test", AGENT_SERVER_URL: "http://127.0.0.1:1", AGENT_DATA_DIR: path.join(ROOT, ".test-lot3-sim-serverurl-8") }, () => {
+      let threw = false;
+      let settings: any;
+      try { settings = loadAgentSettings(); } catch { threw = true; }
+      assert(!threw && settings.serverUrl === "http://127.0.0.1:1", "Test avec serveur local explicite -> accepte");
+    });
+
+    await withEnv({ AGENT_RUNTIME_MODE: "test", AGENT_SERVER_URL: "https://example.com", AGENT_DATA_DIR: path.join(ROOT, ".test-lot3-sim-serverurl-9") }, () => {
+      let threw = false;
+      try { loadAgentSettings(); } catch { threw = true; }
+      assert(threw, "Test avec serveur distant explicite -> refus (jamais de connexion Internet reelle en mode test)");
+    });
+
+    for (let i = 1; i <= 9; i += 1) {
+      const dir = path.join(ROOT, `.test-lot3-sim-serverurl-${i}`);
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  // ===================== 8. Aucune ancienne valeur de serveur embarquee dans le build compile =====================
+  {
+    const compiledSettingsPath = path.join(APP_DIR, "agent", "agentSettings.js");
+    if (existsSync(compiledSettingsPath)) {
+      const compiled = readFileSync(compiledSettingsPath, "utf8");
+      assert(compiled.includes("https://app.rendezbot.xyz"), "Le fichier compile livre contient bien le nouveau defaut de production");
     }
   }
 

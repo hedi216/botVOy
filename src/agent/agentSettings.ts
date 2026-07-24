@@ -67,16 +67,36 @@ const resolveTargetMode = (): AgentTargetMode => {
   );
 };
 
-// Phase 5 (Lot 2, section 2): mode d'execution EXPLICITE. "development" reste
-// le defaut (comportement historique de `npm run agent:dev` inchange), pour
-// ne jamais casser un usage existant sans configuration explicite - jamais
-// devine depuis la plateforme ou la presence d'un fichier.
+// Nom de l'executable embarque (copie renommee de node.exe, voir
+// agent-packaging.md section 11.1/11.2) - jamais present hors d'une
+// installation reelle (un `npm run agent:dev` execute toujours via le
+// `node.exe`/`tsx` systeme, jamais via une copie renommee). Sert de
+// "marqueur" fiable, genere par construction au build, pour detecter un
+// lancement installe SANS dependre d'un fichier ni de process.cwd().
+const PACKAGED_EXECUTABLE_BASENAME = "rendezbotagent.exe";
+
+const isRunningFromPackagedExecutable = (): boolean =>
+  path.basename(process.execPath).toLowerCase() === PACKAGED_EXECUTABLE_BASENAME;
+
+// Phase 5 (Lot 2, section 2 ; defense renforcee au Lot 3): mode d'execution
+// EXPLICITE. "development" reste le defaut HORS installation (comportement
+// historique de `npm run agent:dev` inchange), pour ne jamais casser un usage
+// existant sans configuration explicite - jamais devine depuis la plateforme
+// ou la presence d'un fichier.
+//
+// Defense supplementaire (defaut trouve au Lot 3, test manuel VM): un
+// lancement installe (raccourci menu Demarrer/Bureau/Demarrage/apres mise a
+// niveau) qui, pour quelque raison que ce soit, ne transmettrait PAS
+// AGENT_RUNTIME_MODE ne doit JAMAIS retomber silencieusement sur
+// "development" (et donc sur un serveur localhost) - il ne peut s'agir que
+// d'un build installe (voir PACKAGED_EXECUTABLE_BASENAME ci-dessus), jamais
+// d'un autre cas ambigu a deviner.
 const resolveRuntimeMode = (): AgentRuntimeMode => {
   const raw = process.env.AGENT_RUNTIME_MODE?.trim();
-  if (!raw || raw === "development") {
-    return "development";
+  if (!raw) {
+    return isRunningFromPackagedExecutable() ? "packaged" : "development";
   }
-  if (raw === "packaged" || raw === "test") {
+  if (raw === "development" || raw === "packaged" || raw === "test") {
     return raw;
   }
   throw new Error(
@@ -96,6 +116,79 @@ const resolveDataRoot = (): string => {
     return path.join(process.env.LOCALAPPDATA, "RendezBot");
   }
   return path.join(os.tmpdir(), "RendezBot");
+};
+
+// Defaut de production reel du runtime packaged (defaut trouve pendant un
+// test manuel sur VM Lot 3: sans configuration, l'interface locale affichait
+// "localhost:3000" apres une VRAIE installation - un runtime packaged n'a,
+// par construction, jamais de raison de tomber sur un serveur de
+// developpement local). Litteral en dur ici (jamais derive de process.cwd()
+// ni d'un fichier .env/de build/de test - aucun de ces mecanismes n'est
+// jamais lu pour CE defaut precis) : c'est la seule adresse qu'un runtime
+// packaged sans configuration doit jamais utiliser.
+const PRODUCTION_SERVER_URL = "https://app.rendezbot.xyz";
+
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const isLoopbackHost = (hostname: string): boolean => LOOPBACK_HOSTNAMES.has(hostname.toLowerCase());
+
+const parseServerUrl = (raw: string, context: string): URL => {
+  try {
+    return new URL(raw);
+  } catch {
+    throw new Error(`AGENT_SERVER_URL invalide ${context}: "${raw}".`);
+  }
+};
+
+// Resolution du serveur EXPLICITEMENT dependante du mode d'execution
+// (section "defaut trouve en VM", corrige au Lot 3) - jamais un seul defaut
+// partage entre packaged/development/test comme precedemment.
+const resolveServerUrl = (runtimeMode: AgentRuntimeMode): string => {
+  const explicit = process.env.AGENT_SERVER_URL?.trim();
+
+  if (runtimeMode === "packaged") {
+    // Aucun fallback implicite vers un serveur de developpement local:
+    // sans configuration explicite, un runtime packaged ne doit JAMAIS
+    // pointer ailleurs que sur le serveur de production reel.
+    if (!explicit) {
+      return PRODUCTION_SERVER_URL;
+    }
+    const parsed = parseServerUrl(explicit, "en mode packaged");
+    // Un hote local reste tolere explicitement (verifications internes du
+    // runtime packaged lui-meme, ex. tests reels de packaging) - jamais un
+    // defaut implicite, uniquement une configuration deliberee. Au-dela du
+    // loopback, un serveur DISTANT est obligatoirement HTTPS: jamais de
+    // trafic en clair vers un serveur reel.
+    if (!isLoopbackHost(parsed.hostname) && parsed.protocol !== "https:") {
+      throw new Error(
+        `AGENT_SERVER_URL doit utiliser https:// pour un serveur distant en mode packaged (obtenu: "${explicit}"). Jamais de HTTP en clair vers un serveur de production.`
+      );
+    }
+    return explicit;
+  }
+
+  if (runtimeMode === "test") {
+    // Section 3 (cahier des charges Lot 3, correctif serveur par defaut):
+    // jamais de serveur par defaut, jamais de connexion Internet reelle en
+    // mode test - uniquement un serveur local explicite.
+    if (!explicit) {
+      throw new Error(
+        "AGENT_SERVER_URL est requis explicitement en mode test (aucun serveur par defaut, jamais de connexion Internet implicite)."
+      );
+    }
+    const parsed = parseServerUrl(explicit, "en mode test");
+    if (!isLoopbackHost(parsed.hostname)) {
+      throw new Error(
+        `En mode test, AGENT_SERVER_URL doit pointer vers un serveur local (obtenu: "${explicit}") - jamais une connexion Internet reelle.`
+      );
+    }
+    return explicit;
+  }
+
+  // development: comportement historique conserve (localhost autorise,
+  // explicite via AGENT_SERVER_URL/WEB_PORT ou par le defaut de ce mode -
+  // jamais utilise en mode packaged/test, qui valident desormais chacun
+  // explicitement leur propre cas).
+  return explicit || `http://localhost:${process.env.WEB_PORT || 3000}`;
 };
 
 export const loadAgentSettings = (): AgentRuntimeSettings => {
@@ -130,15 +223,16 @@ export const loadAgentSettings = (): AgentRuntimeSettings => {
   }
 
   const dataRoot = resolveDataRoot();
+  const runtimeMode = resolveRuntimeMode();
 
   return {
-    serverUrl: process.env.AGENT_SERVER_URL?.trim() || `http://localhost:${process.env.WEB_PORT || 3000}`,
+    serverUrl: resolveServerUrl(runtimeMode),
     credentialsPath: process.env.AGENT_CREDENTIALS_PATH?.trim()
       || getDefaultCredentialsPath(dataRoot),
     computerName: process.env.AGENT_COMPUTER_NAME?.trim() || os.hostname(),
     version: AGENT_VERSION,
     protocolVersion: AGENT_PROTOCOL_VERSION,
-    runtimeMode: resolveRuntimeMode(),
+    runtimeMode,
     targetMode,
     fixtureUrl,
     targetUrl,

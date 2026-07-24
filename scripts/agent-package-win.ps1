@@ -177,6 +177,12 @@ try {
   $psi.EnvironmentVariables["SystemRoot"] = $env:SystemRoot
   $psi.EnvironmentVariables["AGENT_DATA_DIR"] = $verifyDataRoot
   $psi.EnvironmentVariables["AGENT_SERVER_URL"] = "http://127.0.0.1:1"
+  # Cette verification cible UNIQUEMENT l'absence de dependance Node.js
+  # systeme - jamais le comportement packaged/DPAPI (le detecteur
+  # automatique de mode packaged, base sur le nom de l'executable, ferait
+  # sinon echouer DPAPI a cause du PATH vide ci-dessus, ce qui est un
+  # probleme distinct, deja couvert par ses propres tests).
+  $psi.EnvironmentVariables["AGENT_RUNTIME_MODE"] = "development"
   $psi.UseShellExecute = $false
   $psi.RedirectStandardOutput = $true
   $proc = [System.Diagnostics.Process]::Start($psi)

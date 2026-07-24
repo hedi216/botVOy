@@ -20,7 +20,9 @@ Executer `npx tsc --noEmit` avant toute suite reelle : aucune suite ne doit etre
 
 ## 2. Scenarios explicitement NON couverts par l'automatisation (Lot 3)
 
-**Suppression complete du dataRoot** (`/DELETEALLDATA=1`, voir agent-uninstallation.md section 3) : la logique Pascal cible `%LOCALAPPDATA%\RendezBot` de maniere fixe, sans isolation possible au niveau installateur. Executer ce scenario automatiquement sur un poste de developpement risquerait de supprimer de vraies donnees (credentials, profils Chrome reels accumules). Ce scenario est valide par revue de code stricte (voir agent-packaging.md 11.3) et par la checklist manuelle ci-dessous, **uniquement sur une VM ou un compte Windows dedie et jetable**.
+**Suppression complete du dataRoot** (`/DELETEALLDATA=1`, voir agent-uninstallation.md section 3) : la logique Pascal cible `%LOCALAPPDATA%\RendezBot` de maniere fixe, sans isolation possible au niveau installateur. Executer ce scenario automatiquement sur le poste de developpement partage risquerait de supprimer de vraies donnees (credentials, profils Chrome reels accumules) — il reste donc hors de `test:agent:packaging-lot3:real` de facon permanente, pas seulement le temps de ce lot.
+
+**Valide reellement** : ce scenario a ete execute manuellement sur une VM Windows dediee et jetable (checklist ci-dessous, etapes 12-14) et confirme reussi : dataRoot supprime, dossier programme supprime, fichier temoin place en dehors de ces deux dossiers conserve, aucun processus `RendezBotAgent.exe`/`unins000.exe` residuel, raccourci de demarrage (`Startup`) supprime. Voir aussi [agent-packaging.md](agent-packaging.md) section 11.4.
 
 ## 3. Checklist de test manuel controle (VM ou compte Windows dedie et jetable)
 
@@ -37,10 +39,11 @@ Executer `npx tsc --noEmit` avant toute suite reelle : aucune suite ne doit etre
 9. Tenter de lancer une seconde fois `RendezBotAgent.exe` manuellement. Confirmer que l'interface de l'instance existante reprend le focus, sans erreur technique visible.
 10. Desinstaller via "Applications installees" (desinstallation standard, sans suppression complete). Confirmer : fichiers programme supprimes, `%LOCALAPPDATA%\RendezBot\` toujours present avec ses sous-dossiers, aucun raccourci de demarrage residuel.
 11. Reinstaller la meme version. Confirmer la reconnexion automatique sans nouveau code d'appairage (identifiants preserves de l'etape 10).
-12. **[Environnement jetable uniquement]** Desinstaller a nouveau, cette fois en choisissant "Oui" a la question de suppression complete. Confirmer la boite de dialogue de confirmation (bouton "Non" preselectionne), puis confirmer que `%LOCALAPPDATA%\RendezBot\` est integralement supprime apres validation.
-13. **[Environnement jetable uniquement]** Reinstaller apres l'etape 12. Confirmer qu'un NOUVEL appairage est desormais necessaire (les identifiants ont bien ete definitivement supprimes).
-14. **[Environnement jetable uniquement]** Verifier qu'aucun processus (`RendezBotAgent.exe`, `unins000.exe`, `chrome.exe` lie a l'agent) ni raccourci de demarrage ne subsiste apres un nettoyage complet de l'environnement de test.
+12. **[Environnement jetable uniquement] EXECUTE ET VALIDE** sur une VM Windows dediee et jetable : desinstaller a nouveau avec `/DELETEALLDATA=1` (suppression complete). Confirme : le dataRoot (`%LOCALAPPDATA%\RendezBot`) est integralement supprime ; le dossier programme est integralement supprime.
+13. **[Environnement jetable uniquement] EXECUTE ET VALIDE** : un fichier temoin place en dehors du dataRoot et du dossier programme (avant l'etape 12) est toujours present apres la suppression complete — preuve que celle-ci reste strictement scopee, jamais un dossier parent ou un chemin voisin.
+14. **[Environnement jetable uniquement] EXECUTE ET VALIDE** : aucun processus (`RendezBotAgent.exe`, `unins000.exe`) residuel, et le raccourci de demarrage automatique (dossier `Startup`) est bien supprime apres la suppression complete.
 15. Tenter d'installer une version anterieure par-dessus la version courante (si un installateur de version anterieure est disponible). Confirmer le refus explicite (message clair, aucune corruption des donnees existantes).
+16. **[Environnement jetable uniquement, reste a confirmer]** Reinstaller apres la suppression complete de l'etape 12. Confirmer qu'un NOUVEL appairage est desormais necessaire (les identifiants ont bien ete definitivement supprimes, pas seulement le dataRoot au niveau fichiers).
 
 ## 4. Limites connues documentees
 

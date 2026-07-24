@@ -28,12 +28,24 @@
 ' a cote de RendezBotAgent.exe, agent\agentMain.js, node_modules\, etc.
 
 Option Explicit
-Dim fso, shell, scriptDir, args, i, commandLine, exePath
+Dim fso, shell, scriptDir, args, i, commandLine, exePath, processEnv
 
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set shell = CreateObject("WScript.Shell")
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
 exePath = scriptDir & "\RendezBotAgent.exe"
+
+' Defaut trouve au Lot 3 (test manuel VM): ce launcher ne transmettait aucun
+' mode d'execution - sans AGENT_RUNTIME_MODE, le runtime retombait sur son
+' defaut "development" (localhost:3000), y compris pour un lancement 100%
+' installe (menu Demarrer/Bureau/Demarrage/apres mise a niveau - TOUS les
+' raccourcis generes par l'installateur ciblent ce MEME fichier .vbs, donc ce
+' seul correctif les couvre tous). Portee "Process" uniquement (jamais
+' "User"/"System" - shell.Environment("Process") ne modifie que
+' l'environnement du process enfant lance ci-dessous, jamais le registre ni
+' une variable globale persistante).
+Set processEnv = shell.Environment("Process")
+processEnv("AGENT_RUNTIME_MODE") = "packaged"
 
 commandLine = Chr(34) & exePath & Chr(34) & " agent\agentMain.js"
 For i = 0 To WScript.Arguments.Count - 1
