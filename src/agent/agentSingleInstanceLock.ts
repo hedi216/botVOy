@@ -117,7 +117,17 @@ export const openUrlInDefaultBrowser = (url: string): void => {
     return;
   }
   try {
-    spawn("cmd", ["/c", "start", "", url], { stdio: "ignore", detached: true, windowsHide: true }).unref();
+    const child = spawn("cmd", ["/c", "start", "", url], { stdio: "ignore", detached: true, windowsHide: true });
+    // Defaut trouve au Lot 3 (verification "aucune dependance a Node
+    // installe", PATH vide): spawn() rapporte un ENOENT (cmd introuvable)
+    // de maniere ASYNCHRONE via l'evenement "error", jamais via une
+    // exception synchrone - un ChildProcess sans handler "error" attache
+    // fait planter tout le process agent (comportement par defaut de
+    // Node pour un evenement "error" non ecoute), transformant une
+    // fonctionnalite de confort (ouvrir un onglet) en crash total de
+    // l'agent. Ce handler est necessaire meme si son corps reste vide.
+    child.on("error", () => undefined);
+    child.unref();
   } catch {
     // best effort uniquement.
   }

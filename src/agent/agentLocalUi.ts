@@ -251,7 +251,13 @@ export const openFolderInExplorer = (folderPath: string): void => {
     return;
   }
   try {
-    spawn("explorer.exe", [folderPath], { stdio: "ignore", detached: true }).unref();
+    // Meme defaut qu'openUrlInDefaultBrowser (Lot 3): un spawn() introuvable
+    // rapporte son erreur de maniere ASYNCHRONE ("error"), jamais par une
+    // exception synchrone - sans ce handler, une simple fonctionnalite de
+    // confort (ouvrir un dossier) peut faire planter tout l'agent.
+    const child = spawn("explorer.exe", [folderPath], { stdio: "ignore", detached: true });
+    child.on("error", () => undefined);
+    child.unref();
   } catch {
     // best effort uniquement.
   }

@@ -231,3 +231,67 @@ Installateur Inno Setup, demarrage automatique Windows (tache planifiee/raccourc
 ### 10.5 Regressions
 
 `npx tsc --noEmit` clean. `test-agent-resilience-simulated.ts` : une assertion mise a jour (`INVALID_TOKEN` -> `AGENT_REVOKED` pour son scenario "agent revoque ne peut plus se reconnecter", qui testait deja exactement ce cas). Tous les scripts simules construisant un handshake manuel (11 fichiers) mis a jour avec `protocolVersion`. `test:agent:packaging-lot2:simulated` 45/45, `test:agent:packaging-lot2:real` 20/20 (log desormais correctement `AGENT_REVOKED`), `test:phase4:final:simulated` 283/283, `test:phase4:final:real` **102/102 x2 executions consecutives** (un echec isole standalone de `test-agent-bot-status-simulated.ts` rencontre pendant la validation, memes symptomes que le precedent Lot 6 (process node.exe residuels d'une execution anterieure dans cette meme session tres longue) — reproduit non reproductible apres nettoyage, rerun complet 283/283 confirme).
+
+## 11. Lot 3 — executable autonome, installateur Inno Setup, cycle de vie complet
+
+### 11.1 Audit prealable (avant toute implementation)
+
+Prototype reel de **Node SEA** avec les dependances reelles de l'agent (playwright, socket.io-client, dotenv), conformement a l'exigence explicite du cahier des charges ("ne selectionner Node SEA qu'apres un prototype fonctionnel avec les dependances reelles"). Deux echecs independants, chacun documentant precisement sa cause :
+
+1. **Bundle complet (esbuild `--bundle`)** : `chromium-bidi` (dependance optionnelle de `playwright-core`, jamais installee car seul le mode CDP est utilise) casse la resolution de modules au bundling -> contournable via `--external:chromium-bidi`. Mais le bundle resultant echoue ensuite A L'EXECUTION avec `Cannot find module '...\package.json'` : le code pre-bundle interne de `playwright-core` fait un `require()` relatif vers son PROPRE `package.json`, chemin qui se rompt une fois aplati par un bundler externe. Non corrigible sans patcher le bundle vendor de playwright lui-meme.
+2. **Bundle partiel (dependances reelles laissees externes)** : fonctionne parfaitement sous `node` classique, mais echoue sous Node SEA avec `ERR_UNKNOWN_BUILTIN_MODULE` — le `require()` du script principal embarque par SEA est restreint aux modules natifs Node, IMPOSSIBLE de resoudre un `node_modules` sur disque depuis ce contexte (limitation documentee de `node:internal/main/embedding`).
+
+**Decision : Node SEA rejete**, cause precisement documentee (ci-dessus), conformement a la clause de repli explicite du cahier des charges ("si Node SEA echoue avec une dependance reelle, documenter precisement la cause et utiliser une alternative maitrisee, sans pretendre utiliser SEA").
+
+**Alternative retenue : copie privee de `node.exe`, renommee `RendezBotAgent.exe`**, embarquee avec le `node_modules` reel (deja audite et valide au Lot 1) tel quel — jamais le `node.exe` systeme modifie, toujours une copie dans le dossier de build. Champ `packaging` du manifeste : `"embedded-node-copy"` (nom honnete du mecanisme reel, jamais `"node-sea"`). Cette approche reutilise 100% du code Lot 1/2 deja valide (aucune reecriture du runtime agent), au prix d'une taille livree plus importante qu'un vrai binaire unique fusionne (le `node_modules` reste present tel quel a cote de l'executable).
+
+| Option | Verdict |
+|---|---|
+| Node SEA (bundle complet) | Rejete — casse playwright-core au bundling |
+| Node SEA (bundle partiel) | Rejete — `ERR_UNKNOWN_BUILTIN_MODULE` a l'execution |
+| **Copie privee de `node.exe` + `node_modules` reel** | **Retenu** |
+
+| Outil installateur | Verdict |
+|---|---|
+| Inno Setup 6 | **Retenu** — per-user (`PrivilegesRequired=lowest`), Pascal Script suffisant pour l'arret gracieux/la suppression conditionnelle/le refus de downgrade, disponible via `winget install JRSoftware.InnoSetup`, aucune dependance de build lourde ajoutee au depot |
+| NSIS | Non retenu — pas d'avantage concret sur Inno Setup pour ce perimetre, aurait duplique l'apprentissage sans benefice |
+
+### 11.2 Perimetre livre
+
+- **`RendezBotAgent.exe`** (copie renommee de `node.exe`) + `node_modules` reel + `agent/`, `shared/`, `logger.js` compiles — fonctionne sans aucune installation separee de Node.js/npm/tsx (verifie empiriquement par un lancement avec `PATH=""`, integre au build ET aux deux suites de tests).
+- **`scripts/agent-installer.iss`** (Inno Setup 6) : installation per-user (`%LOCALAPPDATA%\Programs\RendezBot Agent`), raccourcis Menu Demarrer/Bureau (optionnel)/Demarrage (optionnel, `Flags: checkedonce`), arret gracieux avant remplacement (reutilise `agent/agentStopHelper.js` + le verrou mono-instance du Lot 2, fallback `taskkill /PID <pid precis>` uniquement — jamais par nom d'image), **refus explicite de downgrade** (comparaison numerique de version, jamais lexicale), desinstallation standard (conserve `%LOCALAPPDATA%\RendezBot\*`), suppression complete optionnelle (jamais par defaut, jamais en silencieux sans le parametre explicite `/DELETEALLDATA=1`, validation stricte du chemin avant toute suppression). AUCUNE signature de code (voir [agent-signing.md](agent-signing.md)).
+- **`src/agent/agentStopHelper.ts`** (nouveau) : petit outil CLI (compile avec le reste de l'agent) qui interroge l'interface locale (`GET /local/status` puis `POST /local/quit`) pour un arret gracieux depuis Pascal Script, sans reimplementer la sequence d'arret (bots/Chrome/buffer/socket/interface locale/verrou) en dehors du runtime agent.
+- **`scripts/agent-launch-no-console.vbs`** : conserve comme lanceur transitoire (invoque desormais `RendezBotAgent.exe`, plus `node`), toujours documente comme non-definitif — aucun compilateur C/C++ disponible sur la machine de build pour produire un stub natif GUI-subsystem.
+- **`scripts/agent-package-win.ps1`** (reecrit) : construit le runtime autonome, copie `node.exe` (chemin configurable via `AGENT_EMBEDDED_NODE_PATH`), verifie empiriquement l'absence de dependance Node systeme (`PATH=""`), compile l'installateur (ISCC configurable via `INNO_SETUP_COMPILER_PATH`), genere `build-manifest.json` et `SHA256SUMS.txt` (forme exacte imposee par le cahier des charges, jamais de token/chemin utilisateur/secret), verifie l'absence de chaines secretes connues.
+
+### 11.3 Defauts reels trouves et corriges pendant ce lot
+
+| # | Defaut | Preuve | Correction |
+|---|---|---|---|
+| 1 | `openUrlInDefaultBrowser()` (Lot 2, `agentSingleInstanceLock.ts`) : un `spawn("cmd", ...)` introuvable (ENOENT) est rapporte de maniere ASYNCHRONE via l'evenement `"error"` — sans handler attache, un `ChildProcess` avec un evenement `"error"` non ecoute fait planter TOUT le process agent | Trouve par la nouvelle etape de build "verification aucune dependance Node systeme" (lancement avec `PATH=""`) : l'agent plantait au lieu de simplement ignorer l'echec d'ouverture d'onglet | `child.on("error", () => undefined)` ajoute avant `unref()` |
+| 2 | Meme defaut, proactivement identifie dans `openFolderInExplorer()` (Lot 2, `agentLocalUi.ts`, boutons "Ouvrir les logs"/"Ouvrir la configuration") | Lecture ciblee apres decouverte du defaut #1 | Meme correctif applique |
+| 3 | `WizardSilent()` appele dans `CurUninstallStepChanged` (contexte de DESINSTALLATION) : fonction valable uniquement pendant l'INSTALLATION, leve une erreur interne Pascal silencieusement avalee par `/SUPPRESSMSGBOXES` — resultat : le bloc entier de decision "supprimer les donnees ?" etait saute sans jamais s'executer, y compris en mode interactif | Trouve par un test reel d'installation/desinstallation isolee (log Inno Setup : `CurUninstallStepChanged raised an exception` / `Cannot call "WizardSilent" function during Uninstall`) | Remplace par `UninstallSilent()`, la fonction correcte pour ce contexte |
+| 4 | Aucune protection contre un downgrade (section 11 du cahier des charges pourtant explicite) : `PrepareToInstall` ne verifiait que l'arret gracieux, jamais la version deja installee | Releve par revue de code contre le cahier des charges, avant tout test | `CompareVersions`/`GetInstalledVersion` ajoutes ; `PrepareToInstall` refuse (message clair, code de sortie non-zero, silencieux ET interactif) une installation dont la version est strictement inferieure a la version deja enregistree |
+| 5 | `SHA256SUMS.txt` n'etait genere que dans `release/windows/` apres la reecriture du script de build Lot 3, alors que le test Lot 1 (`test:agent:packaging:simulated`) l'attend aussi dans `release/agent-win/` (comme `build-manifest.json`, deja ecrit aux deux emplacements) | Regression detectee par la re-execution complete des tests de non-regression (section 21) | Ecriture dupliquee ajoutee dans `release/agent-win/` egalement |
+
+### 11.4 Environnement de test isole — garde-fous specifiques
+
+Le poste de developpement utilise pour ce lot possede un vrai dossier `%LOCALAPPDATA%\RendezBot` (donnees reelles accumulees lors des Lots 1/2 : credentials, profils Chrome, logs). Toute validation reelle de ce lot a donc ete construite pour ne **jamais** toucher ce dossier :
+
+- Le runtime agent respecte `AGENT_DATA_DIR` (deja disponible depuis le Lot 1) — tous les lancements de test pointent vers un dossier temporaire dedie, jamais le dataRoot par defaut.
+- Les installations de test utilisent systematiquement `/DIR=<dossier temporaire isole>`, jamais l'emplacement par defaut.
+- **Limite structurelle identifiee** : la logique Pascal de suppression complete (et la recherche du verrou pour l'arret gracieux avant desinstallation) cible `{localappdata}\RendezBot` de maniere fixe, SANS mecanisme d'isolation au niveau installateur (contrairement au runtime agent). Un test automatise reel de la suppression complete (`/DELETEALLDATA=1`) sur ce poste toucherait donc le vrai dossier de production. **Decision, avec l'utilisateur** : ce scenario reste couvert par revue de code uniquement dans ce lot (voir 11.5) ; un test reel complet necessite une VM/un compte Windows dedie et jetable — voir [phase5-test-plan.md](phase5-test-plan.md).
+- `test:agent:packaging-lot3:real` refuse de s'executer (garde-fou explicite, premiere assertion du script) si une installation reelle de RendezBot Agent (meme cle de registre `AppId`, partagee quel que soit le chemin d'installation choisi) est deja presente sur la machine.
+
+### 11.5 Tests
+
+- `npm run test:agent:packaging-lot3:simulated` : **37/37**. VM-safe (aucune installation reelle, aucun Chrome de bot). Construit le runtime autonome, verifie l'inventaire de fichiers livres (aucun `src/`, `.env`, fixture, credential, log), l'absence de secrets, la coherence des 3 dependances runtime, le demarrage sans Node systeme, la structure statique du script Inno Setup (per-user, non signe, AppId stable, downgrade, `DelTree` unique et scope, `UninstallSilent` — jamais `WizardSilent` — en desinstallation), une compilation ISCC reelle si l'outil est present sur la VM (sinon explicitement journalise comme ignore, jamais un faux succes), le manifeste et les hashes s'ils existent deja.
+- `npm run test:agent:packaging-lot3:real` : **29/29**, scenarios A-Y du cahier des charges **sauf V/W** (suppression complete + suppression reelle du dataRoot — voir 11.4 pour la justification). Sur ce PC Windows, dans un environnement isole : build complet + VRAI installateur Inno Setup, lancement sans Node sur le PATH, premiere installation per-user (taches desactivees puis activees selon le scenario), inventaire de fichiers, raccourci de demarrage automatique cree/retire, appairage reel via l'interface locale, DPAPI, redemarrage + reconnexion, verrou mono-instance, START_BOT/STOP_BOT avec un VRAI Chrome visible sur la fixture locale, mise a niveau reelle (installateur de test a version superieure, credentials et profils Chrome preserves, reconnexion sans nouveau code), refus de downgrade reel (installateur de version inferieure, code de sortie 7, aucune corruption), desinstallation standard (dataRoot isole intact, journal de desinstallation ne mentionnant jamais le dossier de donnees), reinstallation (reconnexion via les identifiants preserves), nettoyage final verifie (aucune cle de registre residuelle, aucun raccourci de demarrage residuel).
+
+### 11.6 Non-regression (section 21 du cahier des charges)
+
+`npx tsc --noEmit` clean. `test:agent:packaging:simulated` **25/25** (apres correction du defaut #5 ci-dessus). `test:agent:packaging:real` **9/9**. `test:agent:packaging-lot2:simulated` **45/45**. `test:agent:packaging-lot2:real` **20/20**. `test:agent:protocol-auth:real` **43/43**. `test:agent:packaging-lot3:simulated` **37/37**. `test:agent:packaging-lot3:real` **29/29**. `test:phase4:final:simulated` **283/283**. `test:phase4:final:real` **102/102** (execute une derniere fois apres le build final, conformement a l'exigence explicite du cahier des charges).
+
+### 11.7 Hors perimetre du Lot 3 (reste au Lot 4+)
+
+Auto-update distant, publication automatique de l'artefact, signature de code reelle (certificat), bouton de telechargement final dans l'interface serveur, deploiement chez un client reel, service Windows Session 0, infrastructure de release complexe, test automatise reel de la suppression complete du dataRoot (necessite une VM/un compte Windows dedie et jetable — voir [phase5-test-plan.md](phase5-test-plan.md)), executable veritablement unique/fusionne (l'approche retenue livre une copie de `node.exe` a cote d'un `node_modules` complet, pas un binaire monolithique).
