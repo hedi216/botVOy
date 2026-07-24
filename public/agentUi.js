@@ -69,6 +69,8 @@
 
     commandsPanel: document.getElementById("agentCommandsPanel"),
     commandsTableBody: document.getElementById("agentCommandsTableBody"),
+    commandsMessage: document.getElementById("agentCommandsMessage"),
+    clearCommandsButton: document.getElementById("clearAgentCommands"),
 
     selectionModal: document.getElementById("agentSelectionModal"),
     selectionList: document.getElementById("agentSelectionList"),
@@ -322,12 +324,8 @@
     }
   };
 
-  agentEls.setupCopyCode.addEventListener("click", () => {
-    void navigator.clipboard.writeText(agentEls.setupPairingCode.textContent);
-  });
-  agentEls.agentPageCopyCode.addEventListener("click", () => {
-    void navigator.clipboard.writeText(agentEls.agentPagePairingCode.textContent);
-  });
+  APP.bindCopyButton(agentEls.setupCopyCode, agentEls.setupPairingCode);
+  APP.bindCopyButton(agentEls.agentPageCopyCode, agentEls.agentPagePairingCode);
 
   agentEls.setupGenerateCode.addEventListener("click", () => generatePairingCode("setup"));
   agentEls.agentPageGenerateCode.addEventListener("click", () => {
@@ -685,6 +683,27 @@
   // proposee pendant cette fenetre precise (cf. exigence Lot 2 point 3).
   const STOPPABLE_RUNTIME_STATUSES = new Set(["WAITING_FOR_USER", "MONITORING", "RATE_LIMITED", "SLOT_DETECTED", "ERROR"]);
 
+  // Nettoyage de l'historique: uniquement des lignes REELLEMENT terminees.
+  // Simple gate d'affichage (le serveur revalide integralement de son cote,
+  // cf. deleteCommandForAgency/clearTerminalCommandsForAgency): jamais
+  // COMPLETED/FAILED seuls, le bot associe doit aussi etre STOPPED ou
+  // totalement inconnu (jamais ERROR: un bot en erreur peut encore avoir
+  // Chrome ouvert et necessiter un arret explicite, cf. STOPPABLE_RUNTIME_STATUSES).
+  const TERMINAL_COMMAND_STATUSES = new Set(["COMPLETED", "FAILED", "EXPIRED", "CANCELLED"]);
+  const isRowDeletable = (command) =>
+    TERMINAL_COMMAND_STATUSES.has(command.status) && (command.botStatus == null || command.botStatus === "STOPPED");
+
+  const setCommandsMessage = (text, kind) => {
+    if (!agentEls.commandsMessage) {
+      return;
+    }
+    agentEls.commandsMessage.textContent = text;
+    agentEls.commandsMessage.className = "form-message";
+    if (kind) {
+      agentEls.commandsMessage.classList.add(kind);
+    }
+  };
+
   const RUNTIME_BADGE = {
     STARTING: { label: "Demarrage", cls: "amber" },
     WAITING_FOR_USER: { label: "Attente utilisateur", cls: "blue" },
@@ -750,11 +769,79 @@
         });
         actions.append(stop);
       }
+
+      if (isRowDeletable(command)) {
+        const remove = document.createElement("button");
+        remove.className = "outline danger-text";
+        remove.type = "button";
+        remove.textContent = "Supprimer";
+        remove.addEventListener("click", () => handleDeleteCommandRow(command, remove));
+        actions.append(remove);
+      }
       row.append(actions);
 
       agentEls.commandsTableBody.append(row);
     }
   };
+
+  // Supprime UNE ligne d'historique (jamais le bot/profil/agent lui-meme -
+  // uniquement l'enregistrement serveur de cette commande, cf.
+  // deleteCommandForAgency). Le serveur revalide integralement (agence,
+  // statut terminal, bot inactif): une reponse 409/404 ici reflete donc un
+  // vrai refus metier, jamais seulement un souci d'affichage.
+  const handleDeleteCommandRow = async (command, button) => {
+    if (!window.confirm("Supprimer cette ligne de l'historique ?")) {
+      return;
+    }
+    button.disabled = true;
+    try {
+      await APP.requestJson(`/api/agent-commands/${command.commandId}`, { method: "DELETE" });
+      agentCommands.delete(command.botId);
+      renderAgentCommandsPanel();
+      setCommandsMessage("Historique supprime.", "success");
+    } catch (error) {
+      button.disabled = false;
+      setCommandsMessage(error.message, "error");
+    }
+  };
+
+  // Bouton "Nettoyer l'historique": ne supprime cote serveur que les lignes
+  // deja terminees (meme regle que le bouton par ligne). Le nombre reellement
+  // supprime peut differer de ce que l'affichage local suggere (une commande
+  // devenue active entre-temps, un autre onglet ayant deja nettoye...): on ne
+  // retire donc du Map local QUE les lignes qui etaient deja marquees
+  // supprimables ici, plutot que de supposer que tout a disparu.
+  const handleClearAgentCommands = async () => {
+    if (!window.confirm("Nettoyer l'historique termine de cette agence ?")) {
+      return;
+    }
+    if (agentEls.clearCommandsButton) {
+      agentEls.clearCommandsButton.disabled = true;
+    }
+    try {
+      const { deletedCount } = await APP.requestJson("/api/agent-commands", { method: "DELETE" });
+      for (const [botId, command] of [...agentCommands.entries()]) {
+        if (isRowDeletable(command)) {
+          agentCommands.delete(botId);
+        }
+      }
+      renderAgentCommandsPanel();
+      setCommandsMessage(
+        deletedCount > 0 ? `Historique supprime (${deletedCount} ligne(s)).` : "Aucune ligne terminee a supprimer.",
+        "success"
+      );
+    } catch (error) {
+      setCommandsMessage(error.message, "error");
+    } finally {
+      if (agentEls.clearCommandsButton) {
+        agentEls.clearCommandsButton.disabled = false;
+      }
+    }
+  };
+
+  if (agentEls.clearCommandsButton) {
+    agentEls.clearCommandsButton.addEventListener("click", () => { void handleClearAgentCommands(); });
+  }
 
   // Fusionne un objet commande deja connu avec un nouvel objet recu (socket
   // temps reel OU reponse REST), plutot que de remplacer aveuglement.

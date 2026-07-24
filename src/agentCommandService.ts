@@ -285,6 +285,98 @@ export const listAgentCommandsForAgency = async (
   return result.rows;
 };
 
+// -------- Nettoyage de l'historique (uniquement des lignes terminees) --------
+
+// Statuts de LA COMMANDE consideres termines (jamais pending/sent/
+// acknowledged: une commande encore en vol ne doit jamais disparaitre de
+// l'historique, meme si le bot associe est par ailleurs inactif).
+const TERMINAL_COMMAND_STATUSES: readonly AgentCommandStatus[] = ["completed", "failed", "expired", "cancelled"];
+
+// Verite d'autorite pour "ce bot tourne-t-il encore ?": le registre en
+// memoire, jamais le seul statut de la commande - un START_BOT passe a
+// COMPLETED des que Chrome est lance, alors que le bot continue de
+// fonctionner (MONITORING) pendant des heures ensuite. Absence du bot du
+// registre (redemarrage serveur, ou botId jamais enregistre) ne prouve
+// aucune activite: on ne bloque alors la suppression que sur le statut de la
+// commande elle-meme.
+//
+// Deliberement PAS bot.active ici: ce flag traite ERROR comme "inactif", mais
+// un bot en ERROR peut toujours avoir Chrome ouvert et necessiter un arret
+// explicite (le bouton "Arreter" reste affiche pour ERROR cote UI, cf.
+// STOPPABLE_RUNTIME_STATUSES dans agentUi.js) - seul un botStatus
+// explicitement "STOPPED" est considere sur, conformement a la consigne
+// (COMPLETED/FAILED/STOPPED supprimables, tout le reste bloque).
+//
+// botStatus encore null (bot enregistre au dispatch de START_BOT, section
+// "start-bot" de server.ts, AVANT tout BOT_STATUS de l'agent) n'est PAS
+// traite comme actif: si la commande associee est deja FAILED (ex. Chrome
+// n'a jamais pu demarrer), aucun BOT_STATUS ne sera jamais emis et ce bot
+// resterait sinon bloque a supprimer indefiniment. Sans risque: le seul
+// autre cas ou une commande terminale peut coexister avec un botStatus
+// encore null est une minuscule fenetre de course (COMPLETED recu juste
+// avant le tout premier BOT_STATUS) deja quasi fermee par ailleurs (l'agent
+// envoie toujours BOT_STATUS avant COMMAND_COMPLETED, cf. sessionScenario 2
+// de test-agent-bot-status-simulated.ts) - jamais une fuite de secret ni un
+// Chrome livre a lui-meme, seulement une ligne d'historique disparaissant un
+// instant plus tot que d'ordinaire dans ce cas rarissime.
+const isBotStillActive = (botId: string): boolean => {
+  const bot = getAgentBot(botId);
+  if (!bot || bot.botStatus == null) {
+    return false;
+  }
+  return bot.botStatus !== "STOPPED";
+};
+
+export type DeleteCommandReason = "NOT_FOUND" | "COMMAND_ACTIVE" | "BOT_ACTIVE";
+export type DeleteCommandResult = { ok: true } | { ok: false; reason: DeleteCommandReason };
+
+// Suppression d'UNE ligne d'historique, strictement scopee a l'agence
+// appelante (jamais par commandId seul: cf. section 5 du cahier des
+// charges) - ne supprime jamais un profil Chrome, ne coupe jamais un bot,
+// ne revoque jamais un agent: uniquement la ligne agent_commands elle-meme.
+export const deleteCommandForAgency = async (agencyId: number, commandId: string): Promise<DeleteCommandResult> => {
+  const command = await getCommandForAgency(agencyId, commandId);
+  if (!command) {
+    return { ok: false, reason: "NOT_FOUND" };
+  }
+  if (!TERMINAL_COMMAND_STATUSES.includes(command.status)) {
+    return { ok: false, reason: "COMMAND_ACTIVE" };
+  }
+  if (isBotStillActive(command.bot_id)) {
+    return { ok: false, reason: "BOT_ACTIVE" };
+  }
+
+  const result = await pool.query(
+    "DELETE FROM agent_commands WHERE agency_id = $1 AND command_id = $2",
+    [agencyId, commandId]
+  );
+  return (result.rowCount ?? 0) > 0 ? { ok: true } : { ok: false, reason: "NOT_FOUND" };
+};
+
+// Nettoyage global (bouton "Nettoyer l'historique"): ne supprime jamais une
+// commande active ni un bot encore actif, meme parmi un grand nombre de
+// lignes - meme double verification que deleteCommandForAgency, appliquee a
+// chaque ligne candidate.
+export const clearTerminalCommandsForAgency = async (agencyId: number): Promise<number> => {
+  const candidates = await pool.query<{ command_id: string; bot_id: string }>(
+    "SELECT command_id, bot_id FROM agent_commands WHERE agency_id = $1 AND status = ANY($2::text[])",
+    [agencyId, TERMINAL_COMMAND_STATUSES]
+  );
+  const deletableIds = candidates.rows
+    .filter((row) => !isBotStillActive(row.bot_id))
+    .map((row) => row.command_id);
+
+  if (deletableIds.length === 0) {
+    return 0;
+  }
+
+  const result = await pool.query(
+    "DELETE FROM agent_commands WHERE agency_id = $1 AND command_id = ANY($2::uuid[])",
+    [agencyId, deletableIds]
+  );
+  return result.rowCount ?? 0;
+};
+
 export type CreatePendingCommandParams = {
   agencyId: number;
   agentId: number;

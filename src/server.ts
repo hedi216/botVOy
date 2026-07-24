@@ -60,6 +60,8 @@ import {
 import {
   BOT_STATUS_VALUES,
   PublicAgentCommand,
+  clearTerminalCommandsForAgency,
+  deleteCommandForAgency,
   dispatchAgentCommand,
   failNonTerminalOnRevoke,
   generateBotId,
@@ -665,6 +667,46 @@ app.get("/api/agent-commands/:commandId", requireAuth, async (req: Authenticated
   }
 
   res.json({ command: toPublicAgentCommandDetail(command) });
+});
+
+// Nettoyage rapide de l'historique (section "Bots pilotes par l'agent"):
+// supprime uniquement des LIGNES d'historique deja terminees - ne touche
+// jamais un profil Chrome, ne coupe jamais un bot, ne revoque jamais un
+// agent (deleteCommandForAgency/clearTerminalCommandsForAgency refusent
+// elles-memes toute commande/bot encore actif, cf. agentCommandService.ts).
+// Meme regle d'isolation que les routes GET ci-dessus: resolveViewAgencyId
+// force un non-admin sur SA seule agence, jamais un botId/commandId seul.
+app.delete("/api/agent-commands", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = resolveViewAgencyId(req.user!, req.query.agencyId);
+  if (!agencyId) {
+    res.status(400).json({ error: "Agence requise." });
+    return;
+  }
+
+  const deletedCount = await clearTerminalCommandsForAgency(agencyId);
+  res.json({ ok: true, deletedCount });
+});
+
+app.delete("/api/agent-commands/:commandId", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = resolveViewAgencyId(req.user!, req.query.agencyId);
+  if (!agencyId) {
+    res.status(400).json({ error: "Agence requise." });
+    return;
+  }
+
+  const result = await deleteCommandForAgency(agencyId, String(req.params.commandId));
+  if (!result.ok) {
+    const status = result.reason === "NOT_FOUND" ? 404 : 409;
+    const error = result.reason === "NOT_FOUND"
+      ? "Commande introuvable."
+      : result.reason === "BOT_ACTIVE"
+        ? "Ce bot est encore actif: arretez-le avant de supprimer cette ligne."
+        : "Cette commande est encore en cours: attendez sa fin avant de la supprimer.";
+    res.status(status).json({ error });
+    return;
+  }
+
+  res.json({ ok: true });
 });
 
 app.post("/api/agents/pairing-codes", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {

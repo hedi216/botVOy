@@ -275,6 +275,70 @@ const makeBadge = (text, className) => {
   return badge;
 };
 
+// Retour visuel unifie pour tout bouton "Copier" (mot de passe temporaire,
+// code d'appairage Agent, ...): jamais de secret transmis au reseau ni
+// journalise ici - navigator.clipboard.writeText() est une operation
+// strictement locale au navigateur.
+const COPY_FEEDBACK_MS = 2_000;
+
+const bindCopyButton = (button, sourceEl) => {
+  if (!button || !sourceEl) {
+    return;
+  }
+
+  const originalLabel = button.textContent;
+  // aria-live sur le bouton lui-meme: un changement de son propre texte
+  // ("Copie" -> "Copie ✓") est alors annonce, sans dependre d'une
+  // region separee ni de la seule couleur.
+  button.setAttribute("aria-live", "polite");
+  button.setAttribute("aria-atomic", "true");
+  let resetTimer = null;
+
+  // Repli accessible en cas d'echec (section 3): jamais force manuellement,
+  // uniquement une pre-selection pratique - l'utilisateur reste libre de
+  // copier lui-meme (Ctrl+C) sans dependre du bouton.
+  const selectSourceText = () => {
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(sourceEl);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } catch {
+      // Uniquement un confort: son echec ne doit jamais empecher l'affichage
+      // du message "Copie impossible" lui-meme.
+    }
+  };
+
+  button.addEventListener("click", async () => {
+    if (resetTimer) {
+      clearTimeout(resetTimer);
+      resetTimer = null;
+    }
+
+    const text = sourceEl.textContent || "";
+    if (!text) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(text);
+      button.textContent = "Copié ✓";
+      button.disabled = true;
+      resetTimer = setTimeout(() => {
+        button.textContent = originalLabel;
+        button.disabled = false;
+        resetTimer = null;
+      }, COPY_FEEDBACK_MS);
+    } catch {
+      // Jamais "Copie" en cas d'echec (section 3): le presse-papiers peut
+      // etre indisponible (permission refusee, contexte non securise...).
+      button.textContent = "Copie impossible";
+      selectSourceText();
+    }
+  });
+};
+
 const loadAgencies = async () => {
   if (state.user?.role !== 0) {
     state.agencies = [];
@@ -1026,9 +1090,7 @@ els.userTableBody.addEventListener("click", async (event) => {
   }
 });
 
-els.copyPassword.addEventListener("click", async () => {
-  await navigator.clipboard.writeText(els.temporaryPassword.textContent);
-});
+bindCopyButton(els.copyPassword, els.temporaryPassword);
 
 els.dismissPasswordNotice.addEventListener("click", () => {
   els.passwordNotice.hidden = true;
@@ -1252,6 +1314,7 @@ window.RendezBotApp = {
   formatDate,
   makeBadge,
   addCell,
+  bindCopyButton,
   updateStartBotAvailability,
   $,
   $$
