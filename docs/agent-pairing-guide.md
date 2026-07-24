@@ -34,3 +34,7 @@ Dans la fenetre de RendezBot Agent (ouverte automatiquement au premier lancement
 Depuis la fenetre de l'agent, le bouton "Dissocier cet ordinateur" efface les identifiants locaux (jamais vos logs ni vos profils Chrome) et fait revenir a l'ecran d'appairage - utile si vous voulez reappairer avec un autre compte/une autre agence.
 
 Un administrateur peut aussi revoquer l'acces d'un agent depuis RendezBot ("Agent local" > Revoquer) : l'agent detecte la revocation automatiquement et repasse a l'ecran d'appairage.
+
+---
+
+*Validation : ce parcours complet (appairage, reconnexion automatique via DPAPI apres redemarrage, revocation puis retour a "Non appaire") a ete confirme reellement sur une VM Windows de test, via le vrai domaine de production `https://app.rendezbot.xyz` - voir [phase5-release-candidate.md](phase5-release-candidate.md) section 5.2.*

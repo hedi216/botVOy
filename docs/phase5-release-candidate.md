@@ -2,7 +2,7 @@
 
 ## 0. Statut
 
-**Termine.** Ce document consolide le resultat du Lot 4 : publication versionnee de l'installateur, telechargement depuis l'ecran RendezBot, affichage version/hash/statut de signature, validation reelle du telechargement et de l'installation, documentation utilisateur/operationnelle.
+**Termine.** Ce document consolide le resultat du Lot 4 : publication versionnee de l'installateur, telechargement depuis l'ecran RendezBot, affichage version/hash/statut de signature, validation reelle du telechargement et de l'installation (y compris sur l'infrastructure de production reelle, `https://app.rendezbot.xyz` - voir section 5.2), documentation utilisateur/operationnelle.
 
 Perimetre explicitement EXCLU de ce lot (voir section 6) : auto-update automatique, installation silencieuse distante, signature reelle, publication publique GitHub Releases, deploiement client final, suppression du mode `legacy_vm`, infrastructure CDN.
 
@@ -49,9 +49,11 @@ Toutes les suites listees en section 3 sont vertes apres deux corrections reelle
 
 Un echec isole non reproductible (`TransportError`/`ECONNRESET` sur une connexion socket.io) a egalement ete rencontre une fois pendant cette campagne - reproduit non-reproductible au re-run standalone (meme categorie que les incidents similaires deja documentes aux Lots precedents), pas une regression de ce lot.
 
-## 5. Validation reelle et ses limites
+## 5. Validation reelle
 
-**Effectue reellement, sur ce poste** (stand-in local, un seul poste Windows disponible dans cet environnement) :
+### 5.1 Validation locale (ce poste, pendant le developpement du lot)
+
+**Effectue reellement, sur le poste de developpement** (stand-in local, avant la validation sur l'infrastructure reelle en 5.2) :
 - Connexion au serveur local reellement active avec la release configuree.
 - Lecture de `/api/agent/releases/latest` (authentifie) - metadonnees correctes.
 - Telechargement complet via HTTP du VRAI installateur du Lot 3 (`Content-Disposition`/`Content-Length`/`nosniff`/`Cache-Control` verifies).
@@ -62,7 +64,24 @@ Un echec isole non reproductible (`TransportError`/`ECONNRESET` sur une connexio
 - Cycle START_BOT / VALIDATE_BOT / surveillance / STOP_BOT reel sur la fixture locale (jamais TLScontact).
 - Revocation de l'agent de test et nettoyage complet (aucune donnee de test conservee, aucun process residuel).
 
-**Limite explicite, non contournable dans cet environnement** : les sections 13-16 du cahier des charges decrivent une validation sur la VRAIE VM serveur de production et un VRAI second environnement Windows physiquement distinct, via le vrai domaine `https://app.rendezbot.xyz`/Cloudflare Tunnel. Cet environnement ne dispose que d'un seul poste Windows et d'aucun acces a l'infrastructure de production reelle. La validation ci-dessus est donc un **equivalent local rigoureux** (memes verifications, meme artefact reel, mais un seul poste jouant les deux roles, via `localhost` plutot que le vrai domaine) - pas une validation sur l'infrastructure reelle. Cette derniere etape reste a executer par un operateur ayant acces a cette infrastructure, en suivant [agent-download-release.md](agent-download-release.md) section 3 et la checklist manuelle de [phase5-test-plan.md](phase5-test-plan.md).
+### 5.2 Validation reelle sur l'infrastructure de production (`https://app.rendezbot.xyz`)
+
+**Confirmee** sur une VM Windows de test, via le vrai domaine de production (et non plus un equivalent local) :
+
+- Page `/agent/setup` accessible via le domaine reel `https://app.rendezbot.xyz`.
+- Release `0.1.0` (channel `candidate`) affichee correctement.
+- Hash affiche a l'ecran : `48a72d142a0652cbdbce8b6c148c29cb76b46f7bd6c7b507149d8db8928a1695`.
+- Telechargement reel effectue via le bouton de l'interface.
+- Hash du fichier telecharge identique au hash affiche (verification manuelle post-telechargement).
+- Installation reelle sans droits administrateur.
+- Agent lance avec le serveur `app.rendezbot.xyz` (confirmation qu'aucun fallback vers un serveur local/de developpement ne s'est jamais produit - voir le correctif du Lot 3 sur la resolution du serveur par defaut).
+- Appairage reel reussi depuis cette installation.
+- Statut "Connecte" et `READY_FOR_COMMANDS` confirmes cote serveur.
+- Reconnexion automatique apres redemarrage de l'agent, via les identifiants proteges DPAPI (aucun nouveau code d'appairage necessaire).
+- Verrou mono-instance valide sur ce poste.
+- Revocation depuis le serveur validee : l'agent detecte la revocation et repasse a l'etat "Non appaire".
+
+Cette validation couvre desormais reellement les sections 14-16 du cahier des charges (telechargement/installation/appairage via le vrai domaine) sur un second environnement Windows distinct du poste de developpement. Reste hors de portee de cette validation : la copie de l'artefact directement sur la VM serveur de production suivant la procedure documentee en detail (section 3 de [agent-download-release.md](agent-download-release.md)) n'a pas ete decrite pas-a-pas ici - seul le resultat cote client (telechargement/installation/appairage reels via le domaine reel) est consigne dans cette section.
 
 ## 6. Ce que ce lot n'inclut PAS
 
@@ -78,4 +97,4 @@ Auto-update automatique, installation silencieuse distante, signature de code re
 
 ## 8. Prochaines etapes possibles (hors perimetre de ce lot, a valider explicitement avant tout debut)
 
-Signature de code reelle une fois un certificat obtenu ; validation sur la vraie infrastructure de production (section 5) ; publication publique de l'artefact ; auto-update avec confirmation explicite obligatoire ; premier deploiement chez un client reel, uniquement apres les points precedents.
+Signature de code reelle une fois un certificat obtenu ; publication publique de l'artefact ; auto-update avec confirmation explicite obligatoire ; premier deploiement chez un client reel, uniquement apres les points precedents. La validation sur la vraie infrastructure de production (telechargement/installation/appairage via `https://app.rendezbot.xyz`) est desormais confirmee - voir section 5.2.
