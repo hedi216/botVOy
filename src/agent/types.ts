@@ -203,7 +203,13 @@ export const AGENT_COMMAND_ERROR_CODES = [
   "REFRESH_FAILED",
   // Lot 5 (extensions locales, section 13)
   "EXTENSION_NOT_FOUND",
-  "EXTENSION_INVALID"
+  "EXTENSION_INVALID",
+  // Hotfix 0.1.2: aucune URL TLS de depart absolue/valide n'a pu etre
+  // resolue (startUrl absent ou invalide) alors qu'aucune extension locale
+  // ne prend le relais - jamais de tentative de navigation relative depuis
+  // about:blank (cf. src/shared/loginFlow.ts), jamais de boucle silencieuse
+  // de plusieurs minutes sur une configuration structurellement impossible.
+  "TLS_START_URL_INVALID"
 ] as const;
 
 export type AgentCommandErrorCode = typeof AGENT_COMMAND_ERROR_CODES[number];

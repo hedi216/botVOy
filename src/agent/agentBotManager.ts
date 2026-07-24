@@ -27,6 +27,29 @@ const MONITORING_STOP_TIMEOUT_MS = 8_000;
 const AUTO_NAV_ATTEMPTS_BEFORE_LONG_WAIT = 3;
 const AUTO_NAV_FINAL_ATTEMPT = 4;
 
+// Delai borne pour la navigation initiale vers l'URL TLS de depart (hotfix
+// 0.1.2): une navigation qui echoue (site injoignable) ne doit jamais
+// bloquer indefiniment le demarrage - la cascade d'auto-navigation qui suit
+// gere de toute facon les echecs de maniere resiliente.
+const INITIAL_NAVIGATION_TIMEOUT_MS = 15_000;
+
+// Hotfix 0.1.2 (points 3/5/6 du cahier des charges): validation locale,
+// simple et sans E/S - jamais "about:blank", jamais un schema autre que
+// http(s) (chrome://, file://, etc.), jamais une chaine qui n'est pas une
+// URL. Sert a la fois a decider si le demarrage peut continuer sans
+// extension locale et si une navigation initiale reelle doit etre tentee.
+const isValidAbsoluteStartUrl = (raw: string | undefined): raw is string => {
+  if (!raw) {
+    return false;
+  }
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
 export type StartBotParams = {
   commandId: string;
   botId: string;
@@ -44,6 +67,10 @@ export type StartBotParams = {
   // START_BOT.publicPayload.monitoringSettings (Lot 4): toujours revalide
   // ici, jamais fait confiance tel quel (section 4).
   rawMonitoringSettings?: unknown;
+  // Hotfix 0.1.2 (point 3): URL TLS de depart absolue, non sensible (transmise
+  // dans publicPayload, jamais transientPayload) - toujours revalidee ici
+  // (isValidAbsoluteStartUrl), jamais fait confiance telle quelle.
+  startUrl?: string;
 };
 
 export type StopBotParams = {
@@ -150,6 +177,23 @@ export class AgentBotManager {
       const extensionDirs = extensionResults.filter((result) => result.status === "ok").map((result) => result.localPath);
       const hasLocalExtension = extensionDirs.length > 0;
 
+      // Hotfix 0.1.2 (points 3/6 du cahier des charges): sans extension
+      // locale, le demarrage automatique DOIT pouvoir naviguer vers une vraie
+      // URL TLS - sans cela, la cascade tenterait indefiniment une navigation
+      // relative depuis about:blank (defaut trouve en 0.1.1: "Invalid URL").
+      // Refuse ici, AVANT tout lancement de Chrome (jamais un navigateur
+      // ouvert pour rien), plutot que de boucler silencieusement plusieurs
+      // minutes sur une configuration structurellement impossible. Avec une
+      // extension locale, celle-ci gere son propre chargement (section 4 du
+      // hotfix 0.1.1): l'absence de startUrl n'est alors jamais bloquante.
+      const validStartUrl = isValidAbsoluteStartUrl(params.startUrl) ? params.startUrl : undefined;
+      if (!hasLocalExtension && !validStartUrl) {
+        throw new AgentCommandError(
+          "TLS_START_URL_INVALID",
+          "Aucune URL TLS de depart valide fournie par le serveur (TARGET_URL absent ou invalide cote serveur) et aucune extension locale configuree: demarrage automatique impossible."
+        );
+      }
+
       lease = acquireProfileLock(this.settings, botId);
       this.leases.set(botId, lease);
 
@@ -195,7 +239,7 @@ export class AgentBotManager {
       });
       this.log("success", `Bot ${botId} demarre (Chrome visible, profil verrouille). Connexion automatique en cours...`);
 
-      void this.runAutoNavigation(handle, hasLocalExtension, login, password).catch((error) => {
+      void this.runAutoNavigation(handle, hasLocalExtension, login, password, validStartUrl).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
         this.log("error", `Bot ${botId}: demarrage automatique interrompu de maniere inattendue (${message}).`);
       });
@@ -396,12 +440,30 @@ export class AgentBotManager {
     handle: AgentBotHandle,
     hasLocalExtension: boolean,
     login: string | undefined,
-    password: string | undefined
+    password: string | undefined,
+    startUrl: string | undefined
   ): Promise<void> {
     const { botId } = handle;
     const stillRunning = (): boolean => this.bots.has(botId) && !this.stopping.has(botId);
     const navLog = (level: Parameters<AgentLogFn>[0], message: string): void =>
       this.log(level, `[Connexion auto ${botId}] ${message}`);
+
+    // Hotfix 0.1.2 (point 4 du cahier des charges): quitte reellement
+    // about:blank AVANT toute tentative de connexion automatique - jamais de
+    // navigation relative (new URL("/fr-fr/login", page.url())) tant que
+    // page.url() vaut encore about:blank (defaut trouve en 0.1.1). Un echec
+    // ici (site injoignable) n'interrompt jamais le demarrage: la cascade
+    // ci-dessous gere deja ce cas de maniere resiliente (jusqu'a l'escalade
+    // finale vers WAITING_FOR_USER).
+    if (startUrl && stillRunning() && !handle.page.isClosed()) {
+      try {
+        await handle.page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: INITIAL_NAVIGATION_TIMEOUT_MS });
+        navLog("success", `Navigation initiale vers l'URL TLS de depart reussie (${maskUrlForLog(startUrl)}).`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        navLog("warn", `Navigation initiale vers l'URL TLS de depart impossible (${message}).`);
+      }
+    }
 
     const isAtAppointmentPage = async (): Promise<boolean> => {
       if (!stillRunning() || !handle.browser.isConnected()) {
@@ -564,7 +626,8 @@ export class AgentBotManager {
       VALIDATION_ALREADY_RUNNING: "Une verification de page est deja en cours pour ce bot.",
       REFRESH_FAILED: "Le rafraichissement de la page a echoue de maniere repetee.",
       EXTENSION_NOT_FOUND: "Une extension Chrome obligatoire est introuvable sur cet ordinateur.",
-      EXTENSION_INVALID: "Une extension Chrome obligatoire est invalide sur cet ordinateur."
+      EXTENSION_INVALID: "Une extension Chrome obligatoire est invalide sur cet ordinateur.",
+      TLS_START_URL_INVALID: "Aucune URL TLS de depart n'est configuree cote serveur (TARGET_URL) et aucune extension locale ne prend le relais."
     };
     return messages[error.code] ?? "Erreur interne de l'agent.";
   }

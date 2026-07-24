@@ -137,6 +137,36 @@ export type AgentReleaseConfig = {
 const RELEASE_VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
+export type AgentTlsStartUrlResult = { ok: true; url: string } | { ok: false };
+
+// Hotfix 0.1.2 (point 1 du cahier des charges): reutilise TARGET_URL, deja la
+// source de verite existante pour l'URL TLS de depart du flux legacy_vm
+// historique (cf. loadConfig() ci-dessus) - jamais une nouvelle variable
+// d'environnement separee tant qu'une source existante suffit. Validee
+// INDEPENDAMMENT ici (absolue, https:// sauf hote local explicitement tolere
+// pour les tests, meme regle que validateDownloadUrlOverride ci-dessous) et
+// SANS jamais modifier loadConfig()/le flux legacy_vm existant: un TARGET_URL
+// deja tolerant/non valide pour legacy_vm ne doit jamais se mettre a faire
+// planter le serveur au demarrage a cause de cette fonction, appelee
+// uniquement a la demande (dispatch START_BOT), jamais au chargement.
+export const resolveAgentTlsStartUrl = (): AgentTlsStartUrlResult => {
+  const raw = process.env.TARGET_URL?.trim();
+  if (!raw || raw === "about:blank") {
+    return { ok: false };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return { ok: false };
+  }
+  const isLoopback = LOOPBACK_HOSTNAMES.has(parsed.hostname.toLowerCase());
+  if (parsed.protocol === "https:" || (parsed.protocol === "http:" && isLoopback)) {
+    return { ok: true, url: raw };
+  }
+  return { ok: false };
+};
+
 // Meme raisonnement que resolveServerUrl cote agent (Phase 5, Lot 3,
 // agentSettings.ts): un override HTTP distant serait un telechargement en
 // clair d'un executable Windows - jamais accepte. Un hote local reste tolere

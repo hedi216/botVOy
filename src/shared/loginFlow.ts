@@ -28,13 +28,37 @@ const clickLocatorIfVisible = async (locator: Locator, timeoutMs: number): Promi
 const clickFirstVisible = (page: Page, selector: string, timeoutMs: number): Promise<boolean> =>
   clickLocatorIfVisible(page.locator(selector).first(), timeoutMs);
 
+// Hotfix 0.1.2: new URL(chemin, base) exige une base hierarchique (http/
+// https) - "about:blank", "chrome://..." ou toute autre base non-HTTP(S) la
+// fait echouer avec "Invalid URL" (defaut reel constate en 0.1.1: l'agent
+// appelait cette fonction avant toute navigation reelle, page.url() valant
+// encore about:blank). Jamais de tentative dans ce cas: le point d'appel
+// (AgentBotManager.runAutoNavigation) est desormais cense avoir deja
+// navigue vers une vraie URL TLS avant d'appeler clickSeConnecter, mais
+// cette garde reste une seconde ligne de defense independante - jamais
+// supprimee meme si l'appelant est corrige par ailleurs.
+const isSafeNavigationBase = (rawUrl: string): boolean => {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
 // Le lien "Se connecter" pointe toujours vers /fr-fr/login, que ce soit en fenetre
 // large (visible directement) ou etroite (derriere un menu compte qui, en pratique,
 // se referme parfois avant qu'on ait pu cliquer dedans). Naviguer directement vers
 // cette URL connue evite toute dependance a ce menu deroulant peu fiable.
 const navigateToLogin = async (page: Page, log: LogFn): Promise<boolean> => {
+  const currentUrl = page.url();
+  if (!isSafeNavigationBase(currentUrl)) {
+    log("warn", `Navigation directe vers /fr-fr/login impossible: page actuelle non exploitable comme base (${currentUrl}).`);
+    return false;
+  }
+
   try {
-    const target = new URL("/fr-fr/login", page.url()).toString();
+    const target = new URL("/fr-fr/login", currentUrl).toString();
     await page.goto(target, { waitUntil: "domcontentloaded", timeout: 8_000 });
     log("success", `Navigation directe vers ${target}.`);
     return true;

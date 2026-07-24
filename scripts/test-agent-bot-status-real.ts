@@ -164,7 +164,17 @@ const main = async (): Promise<void> => {
 
   try {
     browser = await chromium.launch({ headless: true });
-    server = await startServer(3272, { AGENT_UI_ENABLED: "true", BOT_EXECUTION_MODE: "agent" });
+    // Hotfix 0.1.2: AgentBotManager.startBot() refuse desormais START_BOT
+    // immediatement (TLS_START_URL_INVALID) si aucune URL TLS de depart
+    // valide n'est configuree ET qu'aucune extension locale n'est presente -
+    // jamais plus de Chrome ouvert pour rien sur une configuration
+    // structurellement impossible. Ce test n'a pas besoin d'une vraie page
+    // TLS (garbage login "x"/"y", verifie uniquement le cycle de vie
+    // WAITING_FOR_USER/VALIDATE_BOT/STOP_BOT) - reutilise le propre serveur
+    // de test comme cible (URL http(s) valide et reellement joignable,
+    // suffisant pour satisfaire la validation sans dependre d'un site TLS
+    // reel ni d'une fixture supplementaire).
+    server = await startServer(3272, { AGENT_UI_ENABLED: "true", BOT_EXECUTION_MODE: "agent", TARGET_URL: "http://localhost:3272" });
 
     const adminCookie = await loginWithRetry(server.baseUrl, ADMIN_LOGIN, ADMIN_PASSWORD);
     const agencyName = `Test BotStatus Real ${RUN_SUFFIX}`;

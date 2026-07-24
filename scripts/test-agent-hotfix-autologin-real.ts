@@ -1,11 +1,18 @@
-// Test REEL cible - Hotfix Agent 0.1.1 (restauration du demarrage metier).
+// Test REEL cible - Hotfix Agent 0.1.1/0.1.2 (restauration du demarrage
+// metier + correction "Invalid URL" depuis about:blank).
 // Verifie, avec un FAUX site TLS local (jamais le vrai TLScontact) et un vrai
 // agent + vrai Chrome :
+// - Chrome demarre reellement sur about:blank (comme en production sans
+//   configuration prealable), puis quitte about:blank grace a l'URL TLS de
+//   depart (startUrl) transmise par le serveur via START_BOT ;
 // - START_BOT (sans extension) ouvre reellement le faux login, remplit
 //   identifiant/mot de passe automatiquement, atteint une fausse page
 //   appointment-booking - sans jamais passer par WAITING_FOR_USER ;
 // - aucun secret (login/mot de passe) n'apparait dans public_payload/
-//   public_result en base, ni dans les logs serveur/agent.
+//   public_result en base, ni dans les logs serveur/agent ;
+// - (regression 0.1.2) sans URL TLS de depart configuree cote serveur ET sans
+//   extension locale, START_BOT est refuse immediatement (TLS_START_URL_INVALID,
+//   jamais un Chrome ouvert pour rien) et "Invalid URL" n'apparait JAMAIS.
 //
 // A executer sur un PC Windows personnel avec une session interactive et
 // Google Chrome installe - JAMAIS sur la VM/serveur de production.
@@ -17,6 +24,7 @@ import { ChildProcess, spawn } from "node:child_process";
 import http, { Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { Browser, chromium } from "playwright";
+import { Socket, io as ioClient } from "socket.io-client";
 
 const ADMIN_LOGIN = "admin";
 const ADMIN_PASSWORD = "HtlsH2030*";
@@ -138,19 +146,22 @@ const loginWithRetry = async (baseUrl: string, loginName: string, password: stri
 };
 
 type RealAgentHandle = { child: ChildProcess; stdout: string[] };
-const spawnRealAgent = (serverUrl: string, dataRoot: string, fakeSiteUrl: string): RealAgentHandle => {
+const spawnRealAgent = (serverUrl: string, dataRoot: string, computerName: string): RealAgentHandle => {
   const child = spawn("npx.cmd", ["tsx", "src/agent/agentMain.ts"], {
     env: {
       ...process.env,
       AGENT_SERVER_URL: serverUrl,
       AGENT_DATA_DIR: dataRoot,
-      AGENT_COMPUTER_NAME: "REAL-HOTFIX-AUTOLOGIN-PC",
-      // Mode fixture (jamais production): targetUrl resout alors sur
-      // AGENT_FIXTURE_URL (le faux site local, jamais TLScontact reel), ET
-      // findAppointmentPage() utilise le detecteur fixture qui reconnait le
-      // marqueur data-testid="fixture-appointment-page" de la fausse page.
+      AGENT_COMPUTER_NAME: computerName,
+      // Hotfix 0.1.2 (point 7): Chrome doit reellement demarrer sur
+      // about:blank (comme en production sans configuration prealable) -
+      // c'est desormais startUrl, transmis par le SERVEUR via START_BOT
+      // (TARGET_URL cote serveur), qui doit faire quitter about:blank a
+      // l'agent, jamais AGENT_FIXTURE_URL. Mode fixture conserve uniquement
+      // pour que findAppointmentPage() utilise le detecteur fixture
+      // (marqueur data-testid="fixture-appointment-page").
       AGENT_TARGET_MODE: "fixture",
-      AGENT_FIXTURE_URL: fakeSiteUrl,
+      AGENT_FIXTURE_URL: "about:blank",
       AGENT_MAX_ACTIVE_BOTS: "5"
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -171,14 +182,8 @@ const localUiPost = async (port: number, route: string, nonce: string, extra?: R
   return { status: res.status, body: await res.json() };
 };
 
-const main = async (): Promise<void> => {
-  log("BOOT", "=== Test REEL cible - Hotfix Agent 0.1.1 (auto-connexion START_BOT) ===");
-
-  if (process.platform !== "win32") {
-    console.log("Plateforme non-Windows: ce test necessite Windows + Chrome. Ignore, 0 succes / 0 echec.");
-    process.exit(0);
-    return;
-  }
+const runPrimaryScenario = async (): Promise<void> => {
+  log("BOOT", "=== Scenario 1: auto-connexion START_BOT reelle (Chrome quitte about:blank via startUrl) ===");
 
   let fakeSite: { server: Server; baseUrl: string } | undefined;
   let server: ServerHandle | undefined;
@@ -192,7 +197,10 @@ const main = async (): Promise<void> => {
     fakeSite = await startFakeTlsSite();
     log("FIXTURE", `Faux site TLS local demarre: ${fakeSite.baseUrl}`);
 
-    server = await startServer(SERVER_PORT, { AGENT_UI_ENABLED: "true", BOT_EXECUTION_MODE: "agent" });
+    // Hotfix 0.1.2 (points 1-3): TARGET_URL cote serveur est la source de
+    // l'URL TLS de depart (startUrl) transmise a START_BOT - jamais
+    // AGENT_FIXTURE_URL cote agent pour cet usage desormais.
+    server = await startServer(SERVER_PORT, { AGENT_UI_ENABLED: "true", BOT_EXECUTION_MODE: "agent", TARGET_URL: fakeSite.baseUrl });
     const adminCookie = await loginWithRetry(server.baseUrl, ADMIN_LOGIN, ADMIN_PASSWORD);
     const agencyName = `Test Hotfix Autologin ${RUN_SUFFIX}`;
     agencyNames.push(agencyName);
@@ -206,7 +214,7 @@ const main = async (): Promise<void> => {
     const managerCookie = await loginWithRetry(server.baseUrl, managerLogin, managerPassword);
 
     // ===================== Agent reel, appaire via l'interface locale =====================
-    agent = spawnRealAgent(server.baseUrl, dataRoot, fakeSite.baseUrl);
+    agent = spawnRealAgent(server.baseUrl, dataRoot, "REAL-HOTFIX-AUTOLOGIN-PC");
     await requireWithin(() => extractLocalUiPort(agent!.stdout) !== null, 10_000, "interface locale jamais demarree");
     const port = extractLocalUiPort(agent.stdout)!;
     const status1 = await localUiStatus(port);
@@ -247,6 +255,11 @@ const main = async (): Promise<void> => {
     const rowText = await rowFor("Bot Hotfix Autologin").innerText();
     assert(!/valider/i.test(rowText) || (await rowFor("Bot Hotfix Autologin").locator("button", { hasText: "Valider" }).count()) === 0, "Aucun bouton 'Valider' necessaire: la connexion automatique a reussi seule (jamais de WAITING_FOR_USER abusif)");
 
+    // ===================== Hotfix 0.1.2: Chrome a reellement quitte about:blank =====================
+    const agentLogSoFar = agent.stdout.join("");
+    assert(agentLogSoFar.includes("Navigation initiale vers l'URL TLS de depart reussie"), "Chrome a reellement quitte about:blank grace a l'URL TLS de depart (startUrl) transmise par le serveur");
+    assert(!agentLogSoFar.includes("Invalid URL"), "Aucune erreur 'Invalid URL' (defaut 0.1.1 corrige): la navigation relative depuis about:blank n'est jamais tentee");
+
     const commandsRes = await requestJson(server.baseUrl, "GET", "/api/agent-commands", managerCookie);
     const startCommandVisible = Array.isArray(commandsRes.body.commands) && commandsRes.body.commands.some((c: any) => c.type === "START_BOT");
     assert(startCommandVisible, "La commande START_BOT est visible via l'API (jamais bloquee par le canal transient)");
@@ -274,9 +287,109 @@ const main = async (): Promise<void> => {
       const { pool } = await import("../src/db.js");
       if (managerLogins.length > 0) await pool.query("DELETE FROM users WHERE login = ANY($1::text[])", [managerLogins]);
       if (agencyNames.length > 0) await pool.query("DELETE FROM agencies WHERE name = ANY($1::text[])", [agencyNames]);
-      await pool.end();
     } catch (error) {
       log("CLEANUP-ERR", `Nettoyage base de donnees incomplet: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+};
+
+// ===================== Scenario 2 (regression 0.1.2): aucune URL TLS de =====================
+// depart configuree cote serveur (TARGET_URL absent) ET aucune extension
+// locale - START_BOT doit etre refuse IMMEDIATEMENT (TLS_START_URL_INVALID),
+// jamais un Chrome ouvert pour rien, et jamais la moindre trace de
+// "Invalid URL" (point 8 du cahier des charges du hotfix 0.1.2: la
+// regression explicite new URL("/fr-fr/login", "about:blank") ne doit jamais
+// s'executer).
+const REGRESSION_SERVER_PORT = 3331;
+
+const openUiSocket = (baseUrl: string, cookie: string): Promise<Socket> => new Promise((resolve, reject) => {
+  const s = ioClient(baseUrl, { autoConnect: false, reconnection: false, extraHeaders: { Cookie: cookie } });
+  const t = setTimeout(() => reject(new Error("timeout ui socket")), 8_000);
+  s.on("connect", () => { clearTimeout(t); resolve(s); });
+  s.connect();
+});
+
+const runNoStartUrlRegressionScenario = async (): Promise<void> => {
+  log("BOOT", "=== Scenario 2 (regression 0.1.2): sans startUrl ni extension, START_BOT refuse immediatement ===");
+
+  let server: ServerHandle | undefined;
+  let agent: RealAgentHandle | undefined;
+  const managerLogins: string[] = [];
+  const agencyNames: string[] = [];
+  const dataRoot = `.test-hotfix-noStartUrl-data-${RUN_SUFFIX}`;
+
+  try {
+    // TARGET_URL explicitement vide: force l'absence de configuration,
+    // independamment de tout TARGET_URL ambiant deja present sur la machine
+    // qui execute ce test (jamais un heritage accidentel de process.env).
+    server = await startServer(REGRESSION_SERVER_PORT, { AGENT_UI_ENABLED: "true", BOT_EXECUTION_MODE: "agent", TARGET_URL: "" });
+    const adminCookie = await loginWithRetry(server.baseUrl, ADMIN_LOGIN, ADMIN_PASSWORD);
+    const agencyName = `Test Hotfix NoStartUrl ${RUN_SUFFIX}`;
+    agencyNames.push(agencyName);
+    const agencyId = (await requestJson(server.baseUrl, "POST", "/api/agencies", adminCookie, { name: agencyName, maxActiveClients: 15 })).body.agency.id;
+    const managerLogin = `test-hotfix-nostarturl-${RUN_SUFFIX}`;
+    managerLogins.push(managerLogin);
+    const userRes = await requestJson(server.baseUrl, "POST", "/api/users", adminCookie, {
+      agencyId, login: managerLogin, name: "NoStartUrl Manager", email: `${managerLogin}@example.test`, role: 1
+    });
+    const managerPassword = userRes.body.temporaryPassword;
+    const managerCookie = await loginWithRetry(server.baseUrl, managerLogin, managerPassword);
+
+    agent = spawnRealAgent(server.baseUrl, dataRoot, "REAL-HOTFIX-NOSTARTURL-PC");
+    await requireWithin(() => extractLocalUiPort(agent!.stdout) !== null, 10_000, "interface locale jamais demarree");
+    const port = extractLocalUiPort(agent.stdout)!;
+    const status1 = await localUiStatus(port);
+    const pairing = await requestJson(server.baseUrl, "POST", "/api/agents/pairing-codes", managerCookie, {});
+    const pairResult = await localUiPost(port, "/local/pair", status1.nonce, { code: pairing.body.pairing.code });
+    assert(pairResult.status === 200 && pairResult.body.ok === true, "(regression) Agent appaire reellement via l'interface locale");
+    await requireWithin(async () => (await localUiStatus(port)).state === "CONNECTED", 10_000, "(regression) agent jamais CONNECTED");
+
+    const uiSocket = await openUiSocket(server.baseUrl, managerCookie);
+    uiSocket.emit("start-bot", { botName: "Bot NoStartUrl", clientRequestId: `nostarturl-${RUN_SUFFIX}` });
+
+    const failedFast = await waitUntil(async () => {
+      const res = await requestJson(server.baseUrl, "GET", "/api/agent-commands?limit=5", managerCookie);
+      const command = res.body?.commands?.find((c: any) => c.botName === "Bot NoStartUrl");
+      return command?.status === "FAILED" && command?.errorCode === "TLS_START_URL_INVALID";
+    }, 15_000);
+    assert(failedFast, "(regression) START_BOT echoue immediatement avec TLS_START_URL_INVALID (jamais une boucle de plusieurs minutes)");
+
+    const agentLogText = agent.stdout.join("");
+    assert(!agentLogText.includes("demarre (Chrome visible"), "(regression) Chrome n'est jamais ouvert quand aucune URL TLS de depart n'est disponible");
+    assert(!agentLogText.includes("Invalid URL"), "(regression) 'Invalid URL' n'apparait jamais, meme sans configuration TLS (garde defensive de navigateToLogin)");
+
+    uiSocket.disconnect();
+  } finally {
+    await killTree(agent?.child.pid).catch(() => undefined);
+    if (server) await killTree(server.child.pid).catch(() => undefined);
+    try {
+      const { pool } = await import("../src/db.js");
+      if (managerLogins.length > 0) await pool.query("DELETE FROM users WHERE login = ANY($1::text[])", [managerLogins]);
+      if (agencyNames.length > 0) await pool.query("DELETE FROM agencies WHERE name = ANY($1::text[])", [agencyNames]);
+    } catch (error) {
+      log("CLEANUP-ERR", `Nettoyage base de donnees incomplet: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+};
+
+const main = async (): Promise<void> => {
+  log("BOOT", "=== Test REEL cible - Hotfix Agent 0.1.2 (correction 'Invalid URL' depuis about:blank) ===");
+
+  if (process.platform !== "win32") {
+    console.log("Plateforme non-Windows: ce test necessite Windows + Chrome. Ignore, 0 succes / 0 echec.");
+    process.exit(0);
+    return;
+  }
+
+  try {
+    await runPrimaryScenario();
+    await runNoStartUrlRegressionScenario();
+  } finally {
+    try {
+      const { pool } = await import("../src/db.js");
+      await pool.end();
+    } catch (error) {
+      log("CLEANUP-ERR", `Fermeture du pool DB incomplete: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 

@@ -45,7 +45,7 @@ import {
 } from "./userService.js";
 import { notifyUserIfNeeded } from "./notifications.js";
 import { sendAppAlert } from "./appAlertService.js";
-import { loadAgentCommandConfig, loadAgentGatewayConfig, loadAgentReleaseConfig, loadPhase2FeatureFlags } from "./config.js";
+import { loadAgentCommandConfig, loadAgentGatewayConfig, loadAgentReleaseConfig, loadPhase2FeatureFlags, resolveAgentTlsStartUrl } from "./config.js";
 import { getAgentReleaseMetadata, resolveAgentReleaseDownload } from "./agentReleaseService.js";
 import { requirePositiveInt, requireValidPort } from "./envValidation.js";
 import { createPairingCode, listAgentsForAgency, renameAgent, revokeAgent } from "./agentService.js";
@@ -1294,13 +1294,23 @@ io.on("connection", (socket) => {
         // jamais fait confiance tel quel meme si deja normalise ici.
         const monitoringSettings = await getAgencyMonitoringSettings(agencyId);
 
+        // Hotfix 0.1.2 (points 1-3 du cahier des charges): reutilise
+        // TARGET_URL (deja la source de verite du flux legacy_vm existant),
+        // jamais une entree utilisateur - non sensible, donc transmise dans
+        // publicPayload (jamais transientPayload, reserve aux secrets).
+        // null si non configure/invalide: c'est alors l'agent qui decide
+        // (extension locale -> conserve son propre chargement ; sans
+        // extension -> refuse immediatement plutot que de rester bloque sur
+        // about:blank pendant plusieurs minutes, cf. agentBotManager.ts).
+        const tlsStartUrl = resolveAgentTlsStartUrl();
+
         const { command, alreadyExisted } = await dispatchAgentCommand(
           {
             agencyId,
             agentId: selection.agentId,
             botId,
             type: "START_BOT",
-            publicPayload: { botName, category, monitoringSettings },
+            publicPayload: { botName, category, monitoringSettings, startUrl: tlsStartUrl.ok ? tlsStartUrl.url : null },
             createdByUserId: user.id,
             clientRequestId,
             // Hotfix 0.1.1: identifiants TLScontact transmis a l'agent

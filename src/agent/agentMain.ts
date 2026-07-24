@@ -293,7 +293,7 @@ const handleCommand = (
   log: ReturnType<typeof createAgentLogger>
 ): void => {
   if (command.type === "START_BOT") {
-    const payload = command.payload as { botName?: unknown; category?: unknown; monitoringSettings?: unknown } | undefined;
+    const payload = command.payload as { botName?: unknown; category?: unknown; monitoringSettings?: unknown; startUrl?: unknown } | undefined;
     // Hotfix 0.1.1 (section 3): login/password ne proviennent JAMAIS de
     // `command.payload` (persiste en base cote serveur) - uniquement de
     // `command.transientPayload`, transmis sur ce seul socket, jamais ecrit
@@ -307,7 +307,10 @@ const handleCommand = (
       category: typeof payload?.category === "string" ? payload.category : undefined,
       login: typeof transient?.login === "string" ? transient.login : undefined,
       password: typeof transient?.password === "string" ? transient.password : undefined,
-      rawMonitoringSettings: payload?.monitoringSettings
+      rawMonitoringSettings: payload?.monitoringSettings,
+      // Hotfix 0.1.2 (point 3): non sensible - toujours revalide cote agent
+      // avant tout usage (jamais fait confiance tel quel, cf. agentBotManager.ts).
+      startUrl: typeof payload?.startUrl === "string" ? payload.startUrl : undefined
     });
     return;
   }
