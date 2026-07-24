@@ -244,6 +244,8 @@ export const loadAgentSettings = (): AgentRuntimeSettings => {
     offlineEventBufferMax: numberEnv("AGENT_OFFLINE_EVENT_BUFFER_MAX", 500),
     logMaxFileSizeMb: numberEnv("AGENT_LOG_MAX_FILE_SIZE_MB", 5),
     logMaxFiles: numberEnv("AGENT_LOG_MAX_FILES", 5),
-    logLevel: resolveLogLevel()
+    logLevel: resolveLogLevel(),
+    autoNavRetryIntervalMs: numberEnv("AGENT_AUTO_NAV_RETRY_INTERVAL_MS", 10_000),
+    autoNavLongWaitMs: numberEnv("AGENT_AUTO_NAV_LONG_WAIT_MS", 5 * 60 * 1000)
   };
 };

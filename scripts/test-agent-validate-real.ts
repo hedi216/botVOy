@@ -168,7 +168,14 @@ const spawnRealAgent = (baseUrl: string, code: string, credPath: string, dataRoo
       AGENT_DATA_DIR: dataRoot,
       AGENT_COMPUTER_NAME: computerName,
       AGENT_TARGET_MODE: "fixture",
-      AGENT_FIXTURE_URL: "about:blank"
+      AGENT_FIXTURE_URL: "about:blank",
+      // Hotfix 0.1.1: cible about:blank fondamentalement inaccessible - la
+      // cascade de connexion automatique ne peut jamais reussir. On accelere
+      // son delai d'attente long pour que ce test rapide atteigne
+      // WAITING_FOR_USER sans attendre inutilement (comportement metier
+      // inchange, seule la duree d'attente est reduite pour ce test).
+      AGENT_AUTO_NAV_RETRY_INTERVAL_MS: "500",
+      AGENT_AUTO_NAV_LONG_WAIT_MS: "500"
     },
     stdio: ["ignore", "pipe", "pipe"],
     shell: process.platform === "win32"
@@ -251,7 +258,7 @@ const main = async (): Promise<void> => {
       // --- 1) START_BOT reel jusqu'a WAITING_FOR_USER ---
       log("TEST", "Emission reelle de START_BOT...");
       await startBotViaUi(page, "Bot Validate Real");
-      const reachedWaiting = await waitUntil(async () => (await stopButtonFor(page, "Bot Validate Real").count()) === 1, 20_000);
+      const reachedWaiting = await waitUntil(async () => (await stopButtonFor(page, "Bot Validate Real").count()) === 1, 240_000);
       if (!reachedWaiting) throw new Error("TimeoutError: le bot n'a jamais atteint WAITING_FOR_USER (bouton Arreter jamais apparu).");
       assert(true, "START_BOT reel: Chrome ouvert, WAITING_FOR_USER atteint");
 
@@ -337,7 +344,7 @@ const main = async (): Promise<void> => {
 
       log("TEST", "Emission reelle de START_BOT (scenario PAGE_NOT_READY, Chrome reste sur about:blank)...");
       await startBotViaUi(page2, "Bot Page Not Ready Real");
-      const reachedWaiting2 = await waitUntil(async () => (await stopButtonFor(page2, "Bot Page Not Ready Real").count()) === 1, 20_000);
+      const reachedWaiting2 = await waitUntil(async () => (await stopButtonFor(page2, "Bot Page Not Ready Real").count()) === 1, 240_000);
       if (!reachedWaiting2) throw new Error("TimeoutError: le second bot n'a jamais atteint WAITING_FOR_USER.");
       assert(true, "Second bot reel: WAITING_FOR_USER atteint (Chrome reste sur about:blank, jamais navigue)");
 

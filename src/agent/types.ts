@@ -41,6 +41,13 @@ export type AgentRuntimeSettings = {
   logMaxFileSizeMb: number;
   logMaxFiles: number;
   logLevel: AgentLogLevelSetting;
+  // Hotfix 0.1.1: cadence de la cascade de connexion automatique
+  // (AgentBotManager.runAutoNavigation) - valeurs de production calquees sur
+  // sessionManager.ts (SILENT_RECOVERY_*), configurables uniquement pour
+  // accelerer les tests automatises cibles (jamais utilise pour changer le
+  // comportement reel en production sans decision explicite).
+  autoNavRetryIntervalMs: number;
+  autoNavLongWaitMs: number;
 };
 
 export type AgentLogLevelSetting = "debug" | "info" | "warn" | "error";
@@ -152,6 +159,11 @@ export type AgentCommandEnvelope = {
   createdAt: string;
   expiresAt: string | null;
   payload: unknown;
+  // Hotfix 0.1.1: jamais persiste cote serveur (voir DispatchAgentCommandParams
+  // dans agentCommandService.ts) - reserve aux secrets qui ne doivent
+  // transiter qu'en memoire (ex. identifiants TLScontact pour START_BOT).
+  // Jamais logue tel quel, jamais ecrit sur disque, jamais renvoye au serveur.
+  transientPayload?: unknown;
 };
 
 // -------- Lot 2: cycle de vie reel Chrome/Playwright --------
@@ -211,6 +223,13 @@ export type AgentBotHandle = {
   startedAt: string;
   lastActivityAt: string;
   lastError: string | null;
+  // Hotfix 0.1.1: jamais un secret - transmis a startMonitoring()/aux logs
+  // publics comme avant (deja des champs publics ailleurs, ex. BOT_STATUS).
+  // Jamais login/password ici: ceux-ci ne vivent que dans la portee locale de
+  // startBot()/attemptAutoNavigation(), jamais stockes sur ce handle
+  // long-lived (section 3 du hotfix: duree de vie minimale en memoire).
+  botName?: string;
+  category?: string;
   // Lot 3: vrai seulement une fois VALIDATE_BOT reussi et la boucle
   // effectivement demarree (Lot 4).
   monitoringPrepared: boolean;

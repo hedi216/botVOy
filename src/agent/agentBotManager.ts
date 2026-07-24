@@ -1,3 +1,4 @@
+import { clickBookNewAppointment, clickSeConnecter, clickSelectTravelGroup, fillLoginForm } from "../shared/loginFlow.js";
 import { closeBrowserWithTimeout, killChromeProcess, launchChromeForBot } from "./agentBrowserManager.js";
 import { loadExtensionConfig, validateExtensions } from "./agentExtensionConfig.js";
 import { getConfigDir } from "./agentStorage.js";
@@ -15,10 +16,30 @@ import { AgentBotHandle, AgentRuntimeSettings, RuntimeStatusBotSnapshot } from "
 // charges Lot 4): l'arret du navigateur ne doit jamais dependre de la boucle.
 const MONITORING_STOP_TIMEOUT_MS = 8_000;
 
+// Hotfix 0.1.1: cadence de reprise automatique du parcours TLS apres
+// lancement de Chrome, calquee sur le flux legacy_vm deja valide
+// (src/sessionManager.ts: SILENT_RECOVERY_*) - 3 tentatives rapprochees,
+// une attente longue, une tentative finale, puis escalade reelle vers
+// WAITING_FOR_USER (jamais avant: section 5 du hotfix). Le nombre de
+// tentatives reste fixe (comportement metier); les delais entre tentatives
+// sont lus depuis AgentRuntimeSettings (this.settings.autoNavRetryIntervalMs/
+// autoNavLongWaitMs, configurables uniquement pour les tests automatises).
+const AUTO_NAV_ATTEMPTS_BEFORE_LONG_WAIT = 3;
+const AUTO_NAV_FINAL_ATTEMPT = 4;
+
 export type StartBotParams = {
   commandId: string;
   botId: string;
   botName?: string;
+  category?: string;
+  // Hotfix 0.1.1 (section 3 du cahier des charges): transitent UNIQUEMENT en
+  // memoire, de la requete socket "start-bot" jusqu'ici (voir
+  // DispatchAgentCommandParams.transientPayload cote serveur) - jamais
+  // persistes, jamais stockes sur AgentBotHandle (duree de vie limitee a
+  // startBot()/runAutoNavigation()), jamais journalises, jamais ecrits sur
+  // disque.
+  login?: string;
+  password?: string;
   // Snapshot brut (non fiable) transmis par le serveur dans
   // START_BOT.publicPayload.monitoringSettings (Lot 4): toujours revalide
   // ici, jamais fait confiance tel quel (section 4).
@@ -85,7 +106,11 @@ export class AgentBotManager {
   }
 
   async startBot(params: StartBotParams): Promise<void> {
-    const { commandId, botId } = params;
+    const { commandId, botId, botName, category } = params;
+    // Jamais assignes a une propriete de classe/handle: portee locale a cet
+    // appel et a runAutoNavigation() uniquement (section 3 du hotfix 0.1.1).
+    const login = params.login;
+    const password = params.password;
     const settingsSnapshot = validateMonitoringSettings(params.rawMonitoringSettings, this.log);
 
     if (this.shuttingDown) {
@@ -123,6 +148,7 @@ export class AgentBotManager {
         throw new AgentCommandError(code, `Extension obligatoire "${missingRequired.id}" ${missingRequired.status === "not_found" ? "introuvable" : "invalide"} (${missingRequired.reason ?? "raison inconnue"}).`);
       }
       const extensionDirs = extensionResults.filter((result) => result.status === "ok").map((result) => result.localPath);
+      const hasLocalExtension = extensionDirs.length > 0;
 
       lease = acquireProfileLock(this.settings, botId);
       this.leases.set(botId, lease);
@@ -138,25 +164,41 @@ export class AgentBotManager {
         page: chrome.page,
         profilePath: lease.profilePath,
         debugPort: chrome.debugPort,
-        currentStatus: "WAITING_FOR_USER",
+        currentStatus: "STARTING",
         startedAt: new Date().toISOString(),
         lastActivityAt: new Date().toISOString(),
         lastError: null,
         monitoringPrepared: false,
         settingsSnapshot,
-        monitoringRuntime: null
+        monitoringRuntime: null,
+        botName,
+        category
       };
       this.bots.set(botId, handle);
       this.wireUnexpectedClosure(handle);
 
-      this.reporter.botStatus(botId, commandId, "WAITING_FOR_USER");
+      // Hotfix 0.1.1 (section 2/4/5): la commande START_BOT est completee des
+      // que Chrome est reellement lance - jamais retardee jusqu'a la fin de
+      // la cascade d'auto-navigation ci-dessous, qui peut prendre plusieurs
+      // minutes (captcha, file d'attente Cloudflare) et depasserait tres
+      // largement le TTL de la commande. Le statut reel du bot (WAITING_FOR_
+      // USER seulement si une intervention humaine est reellement necessaire,
+      // ou MONITORING des que la page de rendez-vous est atteinte) est relaye
+      // ensuite via BOT_STATUS, un canal deja independant du cycle de vie de
+      // cette commande (meme principe que wireUnexpectedClosure ci-dessous).
+      this.reporter.botStatus(botId, commandId, "STARTING");
       this.reporter.completed(commandId, {
         botId,
-        status: "WAITING_FOR_USER",
+        status: "STARTING",
         started: true,
         computerName: this.settings.computerName
       });
-      this.log("success", `Bot ${botId} demarre (Chrome visible, profil verrouille).`);
+      this.log("success", `Bot ${botId} demarre (Chrome visible, profil verrouille). Connexion automatique en cours...`);
+
+      void this.runAutoNavigation(handle, hasLocalExtension, login, password).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.log("error", `Bot ${botId}: demarrage automatique interrompu de maniere inattendue (${message}).`);
+      });
     } catch (error) {
       lease?.release();
       this.leases.delete(botId);
@@ -283,26 +325,12 @@ export class AgentBotManager {
       }
 
       handle.page = selection.page;
-      handle.monitoringPrepared = true;
-      handle.currentStatus = "MONITORING";
-      handle.lastActivityAt = new Date().toISOString();
 
       // Section 2 du cahier des charges Lot 4: AbortController + snapshot
       // deja valides (a l'ouverture du bot) -> demarrage reel de la boucle
       // -> BOT_STATUS MONITORING -> COMMAND_COMPLETED, dans cet ordre.
-      handle.monitoringRuntime = startMonitoring({
-        botId,
-        page: selection.page,
-        context: handle.context,
-        settings: handle.settingsSnapshot,
-        targetUrl: this.settings.targetUrl,
-        commandId,
-        reporter: this.reporter,
-        log: this.log,
-        isBotStillRegistered: () => this.bots.has(botId)
-      });
+      this.beginMonitoring(handle, commandId);
 
-      this.reporter.botStatus(botId, commandId, "MONITORING");
       this.reporter.completed(commandId, { botId, status: "MONITORING", validated: true });
       this.log("success", `Bot ${botId} valide: page reconnue (${maskUrlForLog(selection.page.url())}), surveillance demarree.`);
     } catch (error) {
@@ -313,6 +341,187 @@ export class AgentBotManager {
     } finally {
       this.validating.delete(botId);
     }
+  }
+
+  // Demarre reellement la boucle de surveillance pour un bot dont la page de
+  // rendez-vous vient d'etre reconnue - factorise entre VALIDATE_BOT (Lot 3,
+  // declenchement manuel) et runAutoNavigation ci-dessous (hotfix 0.1.1,
+  // declenchement automatique des que le parcours aboutit seul). Ne complete
+  // JAMAIS de commande elle-meme: chaque appelant garde la responsabilite de
+  // son propre COMMAND_COMPLETED (ou aucun, si aucune commande n'est en
+  // attente a ce moment-la).
+  private beginMonitoring(handle: AgentBotHandle, commandId: string): void {
+    const { botId } = handle;
+    handle.monitoringPrepared = true;
+    handle.currentStatus = "MONITORING";
+    handle.lastActivityAt = new Date().toISOString();
+
+    handle.monitoringRuntime = startMonitoring({
+      botId,
+      botName: handle.botName,
+      category: handle.category,
+      page: handle.page,
+      context: handle.context,
+      settings: handle.settingsSnapshot,
+      targetUrl: this.settings.targetUrl,
+      commandId,
+      reporter: this.reporter,
+      log: this.log,
+      isBotStillRegistered: () => this.bots.has(botId)
+    });
+
+    this.reporter.botStatus(botId, commandId, "MONITORING");
+  }
+
+  // Hotfix 0.1.1 (defaut confirme: START_BOT ouvrait Chrome puis passait
+  // immediatement a WAITING_FOR_USER sans jamais tenter la connexion/le
+  // parcours automatique). Reprend la logique deja eprouvee de
+  // src/sessionManager.ts (legacy_vm: attemptAutoLogin/waitForAppointmentPage/
+  // retryNavigationSilently), adaptee a l'agent :
+  // - jamais de blocage initial demandant a l'utilisateur d'ouvrir TLS
+  //   manuellement (section 5 du hotfix) ;
+  // - avec extension locale configuree : ne touche jamais au formulaire de
+  //   connexion (l'extension gere son propre parcours), se contente
+  //   d'attendre que la page de rendez-vous apparaisse ;
+  // - sans extension : rejoue le meme enchainement que l'ancien flux
+  //   (clickSeConnecter -> fillLoginForm -> clickSelectTravelGroup ->
+  //   clickBookNewAppointment), chaque fonction etant deja concue pour ne
+  //   rien faire silencieusement si l'etape ne s'applique pas (section 4) ;
+  // - WAITING_FOR_USER n'est envoye QUE si la page de rendez-vous reste
+  //   introuvable apres toutes les tentatives (captcha/controle humain/etape
+  //   non automatisable), jamais avant (section 5).
+  // login/password ne sont jamais stockes au-dela de la portee de cette
+  // methode (section 3): jamais assignes a `handle`, jamais journalises.
+  private async runAutoNavigation(
+    handle: AgentBotHandle,
+    hasLocalExtension: boolean,
+    login: string | undefined,
+    password: string | undefined
+  ): Promise<void> {
+    const { botId } = handle;
+    const stillRunning = (): boolean => this.bots.has(botId) && !this.stopping.has(botId);
+    const navLog = (level: Parameters<AgentLogFn>[0], message: string): void =>
+      this.log(level, `[Connexion auto ${botId}] ${message}`);
+
+    const isAtAppointmentPage = async (): Promise<boolean> => {
+      if (!stillRunning() || !handle.browser.isConnected()) {
+        return false;
+      }
+      const selection = await findAppointmentPage(handle.context.pages(), this.settings.targetMode).catch(() => null);
+      if (selection?.ok) {
+        handle.page = selection.page;
+        return true;
+      }
+      return false;
+    };
+
+    // Une action (soumission du formulaire, clic "Selectionner"/"Prendre un
+    // rendez-vous") declenche une navigation ASYNCHRONE : verifier
+    // isAtAppointmentPage() immediatement apres l'action, sans attendre,
+    // observe presque toujours l'ancienne page et declenche une nouvelle
+    // tentative inutile (defaut reel constate lors de la validation de ce
+    // hotfix). On attend donc, borne dans le temps, que la navigation se
+    // termine avant de conclure que l'etape n'a rien change.
+    const AUTO_NAV_STEP_SETTLE_MS = 8_000;
+    const waitForAppointmentPageOrTimeout = async (timeoutMs: number): Promise<boolean> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (await isAtAppointmentPage()) {
+          return true;
+        }
+        if (!stillRunning() || handle.page?.isClosed()) {
+          return false;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      return isAtAppointmentPage();
+    };
+
+    const attemptOnce = async (): Promise<boolean> => {
+      if (!stillRunning() || !handle.browser.isConnected() || !handle.page || handle.page.isClosed()) {
+        return false;
+      }
+      if (await isAtAppointmentPage()) {
+        return true;
+      }
+
+      // Extension locale configuree: jamais de remplissage de formulaire
+      // injecte par l'agent (risque d'interference avec ce que l'extension
+      // fait elle-meme) - seule l'attente/reprise du contexte est reeditee.
+      if (hasLocalExtension) {
+        return false;
+      }
+
+      const page = handle.page;
+      await clickSeConnecter(page, navLog).catch(() => false);
+      if (page.isClosed() || !stillRunning()) {
+        return false;
+      }
+
+      if (login && password) {
+        await fillLoginForm(page, login, password, navLog).catch(() => false);
+      }
+      if (page.isClosed() || !stillRunning()) {
+        return false;
+      }
+      if (await waitForAppointmentPageOrTimeout(AUTO_NAV_STEP_SETTLE_MS)) {
+        return true;
+      }
+
+      await clickSelectTravelGroup(page, navLog).catch(() => false);
+      if (page.isClosed() || !stillRunning()) {
+        return false;
+      }
+      if (await waitForAppointmentPageOrTimeout(AUTO_NAV_STEP_SETTLE_MS)) {
+        return true;
+      }
+
+      await clickBookNewAppointment(page, navLog).catch(() => false);
+      if (page.isClosed() || !stillRunning()) {
+        return false;
+      }
+      return waitForAppointmentPageOrTimeout(AUTO_NAV_STEP_SETTLE_MS);
+    };
+
+    for (let attempt = 1; attempt <= AUTO_NAV_FINAL_ATTEMPT; attempt += 1) {
+      if (!stillRunning()) {
+        return;
+      }
+
+      if (attempt === AUTO_NAV_FINAL_ATTEMPT) {
+        const longWaitMs = this.settings.autoNavLongWaitMs;
+        navLog("warn", `${AUTO_NAV_ATTEMPTS_BEFORE_LONG_WAIT} tentatives sans page de rendez-vous. Attente de ${Math.round(longWaitMs / 60_000)} minutes avant la tentative finale.`);
+        await new Promise((resolve) => setTimeout(resolve, longWaitMs));
+        if (!stillRunning()) {
+          return;
+        }
+      }
+
+      if (await attemptOnce()) {
+        this.beginMonitoring(handle, handle.startCommandId);
+        this.log("success", `Bot ${botId}: page de rendez-vous atteinte automatiquement, surveillance demarree.`);
+        return;
+      }
+
+      if (attempt < AUTO_NAV_ATTEMPTS_BEFORE_LONG_WAIT) {
+        await new Promise((resolve) => setTimeout(resolve, this.settings.autoNavRetryIntervalMs));
+        if (!stillRunning()) {
+          return;
+        }
+      }
+    }
+
+    if (!stillRunning()) {
+      return;
+    }
+
+    // Seul point ou WAITING_FOR_USER est envoye pour ce bot (section 5 du
+    // hotfix): la connexion/le parcours automatique n'a pas abouti apres
+    // toutes les tentatives - une intervention humaine reelle (captcha,
+    // controle, etape non automatisable) est necessaire.
+    navLog("warn", `page de rendez-vous introuvable apres ${AUTO_NAV_FINAL_ATTEMPT} tentatives automatiques. Intervention humaine requise.`);
+    handle.currentStatus = "WAITING_FOR_USER";
+    this.reporter.botStatus(botId, handle.startCommandId, "WAITING_FOR_USER");
   }
 
   // Detecte une fermeture non sollicitee (Chrome ferme manuellement par

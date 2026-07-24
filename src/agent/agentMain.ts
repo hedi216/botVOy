@@ -293,10 +293,20 @@ const handleCommand = (
   log: ReturnType<typeof createAgentLogger>
 ): void => {
   if (command.type === "START_BOT") {
-    const payload = command.payload as { monitoringSettings?: unknown } | undefined;
+    const payload = command.payload as { botName?: unknown; category?: unknown; monitoringSettings?: unknown } | undefined;
+    // Hotfix 0.1.1 (section 3): login/password ne proviennent JAMAIS de
+    // `command.payload` (persiste en base cote serveur) - uniquement de
+    // `command.transientPayload`, transmis sur ce seul socket, jamais ecrit
+    // en base (voir DispatchAgentCommandParams.transientPayload). Jamais
+    // journalise ici, jamais stocke au-dela de cet appel.
+    const transient = command.transientPayload as { login?: unknown; password?: unknown } | undefined;
     void botManager.startBot({
       commandId: command.commandId,
       botId: command.botId,
+      botName: typeof payload?.botName === "string" ? payload.botName : undefined,
+      category: typeof payload?.category === "string" ? payload.category : undefined,
+      login: typeof transient?.login === "string" ? transient.login : undefined,
+      password: typeof transient?.password === "string" ? transient.password : undefined,
       rawMonitoringSettings: payload?.monitoringSettings
     });
     return;

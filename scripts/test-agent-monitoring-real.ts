@@ -170,7 +170,14 @@ const spawnRealAgent = (baseUrl: string, code: string, credPath: string, dataRoo
       AGENT_COMPUTER_NAME: computerName,
       AGENT_TARGET_MODE: "fixture",
       AGENT_FIXTURE_URL: "about:blank",
-      AGENT_MAX_ACTIVE_BOTS: String(maxActiveBots)
+      AGENT_MAX_ACTIVE_BOTS: String(maxActiveBots),
+      // Hotfix 0.1.1: cible about:blank fondamentalement inaccessible - la
+      // cascade de connexion automatique ne peut jamais reussir. On accelere
+      // son delai d'attente long pour que ce test rapide atteigne
+      // WAITING_FOR_USER sans attendre inutilement (comportement metier
+      // inchange, seule la duree d'attente est reduite pour ce test).
+      AGENT_AUTO_NAV_RETRY_INTERVAL_MS: "500",
+      AGENT_AUTO_NAV_LONG_WAIT_MS: "500"
     },
     stdio: ["ignore", "pipe", "pipe"],
     shell: process.platform === "win32"
@@ -306,7 +313,7 @@ const main = async (): Promise<void> => {
     try {
       log("SCENARIO-A", "=== Aucun creneau: plusieurs cycles reels ===");
       await startBotViaUi(page, "Bot Monitoring NoSlots");
-      const reachedWaiting = await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring NoSlots").count()) === 1, 20_000);
+      const reachedWaiting = await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring NoSlots").count()) === 1, 240_000);
       if (!reachedWaiting) throw new Error("TimeoutError: le bot n'a jamais atteint WAITING_FOR_USER.");
 
       const ports = await waitUntil(() => extractAllDebugPorts(realAgent!.stdout).length >= 1, 5_000)
@@ -348,7 +355,7 @@ const main = async (): Promise<void> => {
       log("SCENARIO-B", "=== Creneau disponible: SLOT_DETECTED, Chrome reste ouvert ===");
       const portsBefore = extractAllDebugPorts(realAgent.stdout).length;
       await startBotViaUi(page, "Bot Monitoring Slot");
-      const reachedWaiting = await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring Slot").count()) === 1, 20_000);
+      const reachedWaiting = await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring Slot").count()) === 1, 240_000);
       if (!reachedWaiting) throw new Error("TimeoutError: le bot n'a jamais atteint WAITING_FOR_USER.");
 
       const gotPort = await waitUntil(() => extractAllDebugPorts(realAgent!.stdout).length > portsBefore, 5_000);
@@ -387,7 +394,7 @@ const main = async (): Promise<void> => {
       log("SCENARIO-C", "=== Rate limit reel: RATE_LIMITED puis reprise MONITORING ===");
       const portsBefore = extractAllDebugPorts(realAgent.stdout).length;
       await startBotViaUi(page, "Bot Monitoring RateLimit");
-      const reachedWaiting = await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring RateLimit").count()) === 1, 20_000);
+      const reachedWaiting = await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring RateLimit").count()) === 1, 240_000);
       if (!reachedWaiting) throw new Error("TimeoutError: le bot n'a jamais atteint WAITING_FOR_USER.");
 
       const gotPort = await waitUntil(() => extractAllDebugPorts(realAgent!.stdout).length > portsBefore, 5_000);
@@ -434,7 +441,7 @@ const main = async (): Promise<void> => {
       try {
         const portsBefore = extractAllDebugPorts(realAgent.stdout).length;
         await startBotViaUi(page, "Bot Monitoring Refresh");
-        const reachedWaiting = await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring Refresh").count()) === 1, 20_000);
+        const reachedWaiting = await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring Refresh").count()) === 1, 240_000);
         if (!reachedWaiting) throw new Error("TimeoutError: le bot n'a jamais atteint WAITING_FOR_USER.");
 
         const gotPort = await waitUntil(() => extractAllDebugPorts(realAgent!.stdout).length > portsBefore, 5_000);
@@ -477,7 +484,7 @@ const main = async (): Promise<void> => {
     try {
       log("SCENARIO-E", "=== Isolation de deux bots: arret du premier sans impact sur le second ===");
       await startBotViaUi(page, "Bot Monitoring E1");
-      await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring E1").count()) === 1, 20_000);
+      await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring E1").count()) === 1, 240_000);
       const portsAfterE1 = extractAllDebugPorts(realAgent.stdout).length;
       const debugPortE1 = extractAllDebugPorts(realAgent.stdout)[portsAfterE1 - 1];
       await navigateRealAgentBrowserTo(debugPortE1, fixtureUrl("scenario=no-slots"));
@@ -486,7 +493,7 @@ const main = async (): Promise<void> => {
       await waitUntil(async () => (await rowFor(page, "Bot Monitoring E1").innerText()).toLowerCase().includes("surveillance active"), 15_000);
 
       await startBotViaUi(page, "Bot Monitoring E2");
-      await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring E2").count()) === 1, 20_000);
+      await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring E2").count()) === 1, 240_000);
       const portsAfterE2 = extractAllDebugPorts(realAgent.stdout).length;
       const debugPortE2 = extractAllDebugPorts(realAgent.stdout)[portsAfterE2 - 1];
       await navigateRealAgentBrowserTo(debugPortE2, fixtureUrl("scenario=no-slots"));
@@ -521,7 +528,7 @@ const main = async (): Promise<void> => {
       log("SCENARIO-F", "=== Fermeture manuelle de Chrome pendant MONITORING ===");
       const portsBeforeF = extractAllDebugPorts(realAgent.stdout).length;
       await startBotViaUi(page, "Bot Monitoring ManualClose");
-      await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring ManualClose").count()) === 1, 20_000);
+      await waitUntil(async () => (await stopButtonFor(page, "Bot Monitoring ManualClose").count()) === 1, 240_000);
       const gotPortF = await waitUntil(() => extractAllDebugPorts(realAgent!.stdout).length > portsBeforeF, 5_000);
       if (!gotPortF) throw new Error("TimeoutError: port de debogage Chrome introuvable (bot F).");
       const debugPortF = extractAllDebugPorts(realAgent.stdout)[portsBeforeF];

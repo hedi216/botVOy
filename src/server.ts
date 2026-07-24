@@ -1300,11 +1300,14 @@ io.on("connection", (socket) => {
             agentId: selection.agentId,
             botId,
             type: "START_BOT",
-            // Solution A (section 5 Phase 3): aucun identifiant TLScontact tant
-            // que le moteur reel n'existe pas cote agent (Phase 4).
             publicPayload: { botName, category, monitoringSettings },
             createdByUserId: user.id,
-            clientRequestId
+            clientRequestId,
+            // Hotfix 0.1.1: identifiants TLScontact transmis a l'agent
+            // UNIQUEMENT via ce canal transient (jamais persiste, voir
+            // agentCommandService.ts) - jamais dans publicPayload, jamais
+            // dans public_payload/public_result en base, jamais logue.
+            transientPayload: (login || password) ? { login, password } : undefined
           },
           {
             config: agentCommandConfig,

@@ -521,6 +521,13 @@ export type DispatchAgentCommandParams = {
   publicPayload: unknown;
   createdByUserId: number;
   clientRequestId?: string | null;
+  // Hotfix 0.1.1: transite UNIQUEMENT sur ce socket, jamais persiste (jamais
+  // passe a createPendingCommand/INSERT INTO agent_commands ci-dessous, jamais
+  // inclus dans deps.onChange/toPublicAgentCommand). Reserve aux secrets qui
+  // ne doivent survivre qu'en memoire le temps du dispatch (ex. identifiants
+  // TLScontact pour START_BOT) - jamais un champ non sensible, qui doit
+  // toujours passer par publicPayload comme avant.
+  transientPayload?: Record<string, unknown>;
 };
 
 // Point d'entree unique pour emettre une commande vers un agent: valide,
@@ -531,7 +538,11 @@ export const dispatchAgentCommand = async (
   params: DispatchAgentCommandParams,
   deps: DispatchDeps
 ): Promise<{ command: DbAgentCommand; alreadyExisted: boolean }> => {
-  const { command, alreadyExisted } = await createPendingCommand({ ...params, ttlMs: deps.config.ttlMs });
+  // transientPayload est retire explicitement AVANT tout appel a
+  // createPendingCommand: jamais spread dans l'objet persiste, meme par
+  // accident lors d'une future modification de ce fichier.
+  const { transientPayload, ...persistableParams } = params;
+  const { command, alreadyExisted } = await createPendingCommand({ ...persistableParams, ttlMs: deps.config.ttlMs });
   deps.onChange(command);
 
   if (alreadyExisted) {
@@ -569,7 +580,11 @@ export const dispatchAgentCommand = async (
     botId: sent.bot_id,
     createdAt: sent.created_at,
     expiresAt: sent.expires_at,
-    payload: sent.public_payload
+    payload: sent.public_payload,
+    // Jamais issu de `sent` (donc jamais de la DB): uniquement la valeur
+    // en memoire fournie a cet appel, transmise telle quelle sur ce seul
+    // socket - voir le commentaire sur DispatchAgentCommandParams.
+    transientPayload: transientPayload ?? null
   });
 
   return { command: sent, alreadyExisted };

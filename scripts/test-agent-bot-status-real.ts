@@ -190,7 +190,15 @@ const main = async (): Promise<void> => {
         AGENT_DATA_DIR: dataRoot,
         AGENT_COMPUTER_NAME: "REAL-BOTSTATUS-PC",
         AGENT_TARGET_MODE: "fixture",
-        AGENT_FIXTURE_URL: "about:blank"
+        AGENT_FIXTURE_URL: "about:blank",
+        // Hotfix 0.1.1: la cible (about:blank) est fondamentalement
+        // inaccessible - la cascade de connexion automatique ne peut jamais
+        // reussir. On accelere son delai d'attente long (5 min en
+        // production) pour que ce test rapide atteigne WAITING_FOR_USER
+        // sans attendre inutilement (comportement metier inchange, seule la
+        // duree d'attente est reduite pour ce test).
+        AGENT_AUTO_NAV_RETRY_INTERVAL_MS: "500",
+        AGENT_AUTO_NAV_LONG_WAIT_MS: "500"
       },
       stdio: ["ignore", "pipe", "pipe"],
       shell: process.platform === "win32"
@@ -228,7 +236,15 @@ const main = async (): Promise<void> => {
       const newRoots = rootPids(chromeAfterStart).filter((pid) => !chromeBaseline.includes(pid));
       assert(newRoots.length === 1, `Un seul navigateur reel ouvert par l'agent (trouve: ${newRoots.length})`);
 
-      const hasStop = await waitUntil(async () => (await stopButtonFor(page, "Bot Reel").count()) === 1, 8_000);
+      // Hotfix 0.1.1: WAITING_FOR_USER n'est plus immediat apres l'ouverture de
+      // Chrome - une cascade de connexion automatique (calquee sur
+      // sessionManager.ts: SILENT_RECOVERY_*) est tentee d'abord, avec une
+      // attente longue avant l'escalade finale (jamais d'escalade prematuree
+      // vers une intervention humaine). AGENT_AUTO_NAV_*_MS est reduit
+      // ci-dessus pour ce test (cible about:blank fondamentalement
+      // inaccessible), donc ce delai reste court malgre ce changement de
+      // comportement intentionnel du hotfix.
+      const hasStop = await waitUntil(async () => (await stopButtonFor(page, "Bot Reel").count()) === 1, 240_000);
       if (!hasStop) {
         throw new Error("TimeoutError: le bouton Arreter n'est jamais apparu (botStatus=WAITING_FOR_USER non recu/affiche).");
       }

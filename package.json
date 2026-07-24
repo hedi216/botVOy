@@ -23,6 +23,7 @@
     "test:agent:protocol-auth:real": "tsx scripts/test-agent-protocol-auth-real.ts",
     "test:agent:release:simulated": "tsx scripts/test-agent-release-simulated.ts",
     "test:agent:release:integration": "tsx scripts/test-agent-release-integration.ts",
+    "test:agent:hotfix-autologin:real": "tsx scripts/test-agent-hotfix-autologin-real.ts",
     "test:agent:bot-status:simulated": "tsx scripts/test-agent-bot-status-simulated.ts",
     "test:agent:bot-status:real": "tsx scripts/test-agent-bot-status-real.ts",
     "test:agent:validate:simulated": "tsx scripts/test-agent-validate-simulated.ts",
