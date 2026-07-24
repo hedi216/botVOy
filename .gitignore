@@ -7,3 +7,9 @@ release/
 .chrome-user/
 npm-debug.log*
 .agent-test-credentials.json
+
+# Phase 5 (Lot 4): dossier de releases agent local (jamais suivi par Git -
+# ne devrait normalement jamais se trouver sous le repertoire du projet en
+# production, mais un test/dev local pourrait pointer AGENT_RELEASES_DIR ici).
+.agent-releases*/
+.test-release*/

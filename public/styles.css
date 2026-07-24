@@ -762,6 +762,35 @@ tr.needs-validation {
   text-decoration: underline;
 }
 
+.agent-release-info {
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  margin: 12px 0;
+  padding: 14px 16px;
+}
+
+.agent-release-info p {
+  margin: 4px 0;
+}
+
+.agent-release-hash {
+  display: block;
+  font-size: 12px;
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.agent-setup-steps {
+  margin: 14px 0 4px;
+  padding-left: 20px;
+}
+
+.agent-setup-steps li {
+  margin: 4px 0;
+}
+
 .agent-indicator {
   align-items: center;
   display: flex;

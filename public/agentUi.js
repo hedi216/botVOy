@@ -8,6 +8,10 @@
   const SKIP_KEY = "rendezbot.agentDetectionSkipped";
 
   let clientConfig = null;
+  // Phase 5 (Lot 4): metadonnees de la release agent (version/taille/hash/
+  // URL de telechargement), recuperees depuis le service de release interne
+  // - jamais une URL codee en dur dans ce fichier.
+  let agentRelease = null;
   let subscribed = false;
   // Reinitialise a chaque changement de page (pas persiste): "fermer" le
   // bandeau ne vaut que pour la vue courante, il doit reapparaitre a la
@@ -23,6 +27,11 @@
     setupCopyCode: document.getElementById("agentSetupCopyCode"),
     setupDownload: document.getElementById("agentSetupDownload"),
     setupDownloadNotice: document.getElementById("agentSetupDownloadNotice"),
+    setupReleaseInfo: document.getElementById("agentSetupReleaseInfo"),
+    setupReleaseVersion: document.getElementById("agentSetupReleaseVersion"),
+    setupReleaseChannel: document.getElementById("agentSetupReleaseChannel"),
+    setupReleaseSize: document.getElementById("agentSetupReleaseSize"),
+    setupReleaseSha256: document.getElementById("agentSetupReleaseSha256"),
     setupRedetect: document.getElementById("agentSetupRedetect"),
     setupGenerateCode: document.getElementById("agentSetupGenerateCode"),
     setupGoDashboard: document.getElementById("agentSetupGoDashboard"),
@@ -118,6 +127,25 @@
     return clientConfig;
   };
 
+  const formatApproxSize = (sizeBytes) => {
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+      return "-";
+    }
+    return `${Math.round(sizeBytes / (1024 * 1024))} Mo`;
+  };
+
+  // Ne bloque jamais l'ecran d'accueil si le service de release est
+  // indisponible/en erreur - se degrade toujours vers "aucune release
+  // disponible", jamais une fausse URL ni une exception non geree.
+  const fetchAgentRelease = async () => {
+    try {
+      agentRelease = await APP.requestJson("/api/agent/releases/latest");
+    } catch {
+      agentRelease = { available: false };
+    }
+    return agentRelease;
+  };
+
   // ---- Routage: /agent et /agent/setup sont les deux seules pages a avoir une
   // vraie URL navigable. Le reste de l'application (dashboard, bot, logs...)
   // continue de fonctionner exactement comme avant, sans URL dediee. ----
@@ -147,7 +175,6 @@
     } catch {
       clientConfig = { agentUiEnabled: false, agentDownloadUrl: "", botExecutionMode: "legacy_vm" };
     }
-
     if (agentEls.navAgent) {
       agentEls.navAgent.hidden = !clientConfig.agentUiEnabled;
     }
@@ -156,6 +183,8 @@
       await APP.showPage("dashboard");
       return;
     }
+
+    await fetchAgentRelease();
 
     if (!subscribed) {
       subscribed = true;
@@ -227,9 +256,21 @@
     agentEls.setupGoDashboard.hidden = globalStatus !== CTX.STATUS.CONNECTED;
     agentEls.setupGenerateCode.hidden = !isManager();
 
-    const downloadAvailable = Boolean(clientConfig?.agentDownloadUrl);
+    const downloadAvailable = Boolean(agentRelease?.available && agentRelease.downloadUrl);
     agentEls.setupDownload.disabled = !downloadAvailable;
     agentEls.setupDownloadNotice.hidden = downloadAvailable;
+    // Le detail (version/taille/hash) ne s'affiche que si une release
+    // interne a reellement ete verifiee par le serveur - un override
+    // administratif pur (AGENT_DOWNLOAD_URL sans release interne) active le
+    // bouton mais n'affiche jamais de metadonnees de fichier non verifiees.
+    const hasVerifiedDetails = downloadAvailable && Boolean(agentRelease.sha256);
+    agentEls.setupReleaseInfo.hidden = !hasVerifiedDetails;
+    if (hasVerifiedDetails) {
+      agentEls.setupReleaseVersion.textContent = agentRelease.version;
+      agentEls.setupReleaseChannel.textContent = agentRelease.channel;
+      agentEls.setupReleaseSize.textContent = formatApproxSize(agentRelease.sizeBytes);
+      agentEls.setupReleaseSha256.textContent = agentRelease.sha256;
+    }
   };
 
   // ---- Code d'appairage (partage entre /agent/setup et /agent) ----
@@ -294,8 +335,8 @@
   });
 
   const handleDownloadClick = () => {
-    if (clientConfig?.agentDownloadUrl) {
-      window.location.href = clientConfig.agentDownloadUrl;
+    if (agentRelease?.available && agentRelease.downloadUrl) {
+      window.location.href = agentRelease.downloadUrl;
     }
   };
   agentEls.setupDownload.addEventListener("click", handleDownloadClick);
@@ -396,7 +437,7 @@
 
     const { agents, error } = CTX.getState();
     agentEls.agentPageGenerateCode.hidden = !isManager();
-    const downloadAvailable = Boolean(clientConfig?.agentDownloadUrl);
+    const downloadAvailable = Boolean(agentRelease?.available && agentRelease.downloadUrl);
     agentEls.agentPageDownload.disabled = !downloadAvailable;
 
     agentEls.agentTableBody.replaceChildren();

@@ -21,6 +21,8 @@
     "test:agent:packaging-lot3:simulated": "tsx scripts/test-agent-packaging-lot3-simulated.ts",
     "test:agent:packaging-lot3:real": "tsx scripts/test-agent-packaging-lot3-real.ts",
     "test:agent:protocol-auth:real": "tsx scripts/test-agent-protocol-auth-real.ts",
+    "test:agent:release:simulated": "tsx scripts/test-agent-release-simulated.ts",
+    "test:agent:release:integration": "tsx scripts/test-agent-release-integration.ts",
     "test:agent:bot-status:simulated": "tsx scripts/test-agent-bot-status-simulated.ts",
     "test:agent:bot-status:real": "tsx scripts/test-agent-bot-status-real.ts",
     "test:agent:validate:simulated": "tsx scripts/test-agent-validate-simulated.ts",

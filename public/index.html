@@ -366,12 +366,32 @@
 
               <p id="agentSetupDownloadNotice" class="quiet" hidden>L'installateur RendezBot Agent n'est pas encore disponible.</p>
 
+              <div id="agentSetupReleaseInfo" class="agent-release-info" hidden>
+                <p class="quiet">Version disponible : <strong id="agentSetupReleaseVersion">-</strong> (<span id="agentSetupReleaseChannel"></span>)</p>
+                <p class="quiet">Taille approximative : <span id="agentSetupReleaseSize">-</span></p>
+                <p class="quiet">Systeme requis : Windows 10/11 x64, Google Chrome installe.</p>
+                <p class="quiet"><strong>Installateur non signe</strong> - Windows SmartScreen peut afficher un avertissement au premier lancement. Ne desactivez jamais la protection Windows pour le contourner.</p>
+                <details>
+                  <summary class="quiet">Verifier le hash SHA-256</summary>
+                  <code id="agentSetupReleaseSha256" class="agent-release-hash">-</code>
+                </details>
+              </div>
+
               <div class="button-row">
                 <button id="agentSetupDownload" class="primary" type="button">Telecharger RendezBot Agent</button>
                 <button id="agentSetupRedetect" class="outline" type="button">Detecter a nouveau</button>
                 <button id="agentSetupGenerateCode" class="outline agent-manager-only" type="button" hidden>Generer un code d'appairage</button>
                 <button id="agentSetupGoDashboard" class="outline" type="button" hidden>Acceder au tableau de bord</button>
               </div>
+
+              <ol class="agent-setup-steps quiet">
+                <li>Telecharger l'installateur ci-dessus.</li>
+                <li>Installer (aucun droit administrateur requis).</li>
+                <li>Lancer RendezBot Agent.</li>
+                <li>Generer un code d'appairage depuis cette page.</li>
+                <li>Saisir le code dans la fenetre de l'agent.</li>
+                <li>Attendre le statut "Connecte".</li>
+              </ol>
 
               <a id="agentSetupSkip" class="agent-skip-link" href="#">Ignorer la detection</a>
             </section>

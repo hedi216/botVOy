@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cookieParser from "cookie-parser";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { Server, Socket } from "socket.io";
@@ -45,7 +45,8 @@ import {
 } from "./userService.js";
 import { notifyUserIfNeeded } from "./notifications.js";
 import { sendAppAlert } from "./appAlertService.js";
-import { loadAgentCommandConfig, loadAgentGatewayConfig, loadPhase2FeatureFlags } from "./config.js";
+import { loadAgentCommandConfig, loadAgentGatewayConfig, loadAgentReleaseConfig, loadPhase2FeatureFlags } from "./config.js";
+import { getAgentReleaseMetadata, resolveAgentReleaseDownload } from "./agentReleaseService.js";
 import { requirePositiveInt, requireValidPort } from "./envValidation.js";
 import { createPairingCode, listAgentsForAgency, renameAgent, revokeAgent } from "./agentService.js";
 import {
@@ -93,6 +94,7 @@ const maxClients = requirePositiveInt("MAX_CLIENTS_PER_VM", process.env.MAX_CLIE
 const agentGatewayConfig = loadAgentGatewayConfig();
 const featureFlags = loadPhase2FeatureFlags();
 const agentCommandConfig = loadAgentCommandConfig();
+const agentReleaseConfig = loadAgentReleaseConfig();
 const sessions = new Map<string, BotSession>();
 const sessionOwners = new Map<string, SessionOwner>();
 const socketUsers = new Map<string, DbUser>();
@@ -148,6 +150,71 @@ app.get("/api/client-config", requireAuth, (_req, res) => {
     agentDownloadUrl: featureFlags.agentDownloadUrl,
     botExecutionMode: featureFlags.botExecutionMode
   });
+});
+
+// Phase 5 (Lot 4, section 4): renvoie la release explicitement configuree
+// (jamais une selection arbitraire du contenu du dossier de releases) -
+// available:false si l'artefact est absent/invalide, jamais une exception.
+app.get("/api/agent/releases/latest", requireAuth, async (_req, res) => {
+  try {
+    const metadata = await getAgentReleaseMetadata(agentReleaseConfig);
+    res.json(metadata);
+  } catch (error) {
+    logger.error(`Erreur interne /api/agent/releases/latest: ${error instanceof Error ? error.message : String(error)}`);
+    res.json({ available: false });
+  }
+});
+
+const RELEASE_VERSION_PARAM_PATTERN = /^\d+\.\d+\.\d+$/;
+
+// Section 5: version validee strictement, aucun nom de fichier fourni par
+// l'utilisateur, streaming (jamais un chargement complet en memoire), aucune
+// information sensible (chemin disque) dans une reponse ou un log destine au
+// client.
+app.get("/api/agent/releases/:version/download", requireAuth, async (req, res) => {
+  // Express 5 type req.params[key] en string | string[] (path-to-regexp
+  // generique) - notre route n'a qu'un seul segment simple, jamais un
+  // tableau en pratique, mais on refuse explicitement ce cas plutot que de
+  // forcer un cast non sur.
+  const requestedVersion = req.params.version;
+  if (typeof requestedVersion !== "string" || !RELEASE_VERSION_PARAM_PATTERN.test(requestedVersion)) {
+    res.status(400).json({ error: "Version invalide." });
+    return;
+  }
+
+  let target;
+  try {
+    target = await resolveAgentReleaseDownload(agentReleaseConfig, requestedVersion);
+  } catch (error) {
+    logger.error(`Erreur interne telechargement de release: ${error instanceof Error ? error.message : String(error)}`);
+    res.status(500).json({ error: "Erreur interne." });
+    return;
+  }
+
+  if (!target) {
+    res.status(404).json({ error: "Release indisponible." });
+    return;
+  }
+
+  res.setHeader("Content-Type", "application/octet-stream");
+  res.setHeader("Content-Disposition", `attachment; filename="${target.fileName}"`);
+  res.setHeader("Content-Length", String(target.sizeBytes));
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Cache-Control", "no-store");
+
+  const stream = createReadStream(target.filePath);
+  stream.on("error", (error) => {
+    logger.error(`Erreur de streaming pendant le telechargement d'une release: ${error.message}`);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Erreur interne." });
+    } else {
+      res.destroy();
+    }
+  });
+  req.on("close", () => {
+    stream.destroy();
+  });
+  stream.pipe(res);
 });
 
 app.post("/api/profile/password", requireAuth, async (req: AuthenticatedRequest, res) => {

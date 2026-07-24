@@ -114,6 +114,72 @@ export const loadPhase2FeatureFlags = (): Phase2FeatureFlags => ({
   botExecutionMode: process.env.BOT_EXECUTION_MODE?.trim() === "agent" ? "agent" : "legacy_vm"
 });
 
+// Phase 5 (Lot 4, section 10): enum simple - jamais un systeme de canaux
+// complexe tant qu'une simple valeur suffit. "candidate" = ce lot (livraison
+// interne, pas encore une release client finale).
+export type AgentReleaseChannel = "candidate" | "stable" | "deprecated" | "blocked";
+const AGENT_RELEASE_CHANNELS: AgentReleaseChannel[] = ["candidate", "stable", "deprecated", "blocked"];
+
+export type AgentReleaseConfig = {
+  // null = release service desactive/non configure (jamais un dossier ou une
+  // version devinee par defaut - une release doit toujours etre activee
+  // EXPLICITEMENT par un operateur, jamais choisie par tri alphabetique du
+  // contenu d'un dossier).
+  releasesDir: string | null;
+  releaseVersion: string | null;
+  channel: AgentReleaseChannel;
+  // Override administratif (section 8): si fourni, remplace entierement le
+  // lien de telechargement genere par le service interne - jamais lu
+  // directement par le frontend, uniquement par le service de release.
+  downloadUrlOverride: string | null;
+};
+
+const RELEASE_VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+// Meme raisonnement que resolveServerUrl cote agent (Phase 5, Lot 3,
+// agentSettings.ts): un override HTTP distant serait un telechargement en
+// clair d'un executable Windows - jamais accepte. Un hote local reste tolere
+// (tests explicites), jamais un defaut implicite.
+const validateDownloadUrlOverride = (raw: string): string => {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`AGENT_DOWNLOAD_URL invalide: "${raw}".`);
+  }
+  const isLoopback = LOOPBACK_HOSTNAMES.has(parsed.hostname.toLowerCase());
+  if (parsed.protocol !== "https:" && !isLoopback) {
+    throw new Error(
+      `AGENT_DOWNLOAD_URL doit utiliser https:// pour un hote distant (obtenu: "${raw}"). Un hote local (test explicite) reste tolere.`
+    );
+  }
+  return raw;
+};
+
+export const loadAgentReleaseConfig = (): AgentReleaseConfig => {
+  const releasesDir = process.env.AGENT_RELEASES_DIR?.trim() || null;
+
+  const releaseVersionRaw = process.env.AGENT_RELEASE_VERSION?.trim() || null;
+  if (releaseVersionRaw && !RELEASE_VERSION_PATTERN.test(releaseVersionRaw)) {
+    throw new Error(`AGENT_RELEASE_VERSION invalide: "${releaseVersionRaw}" (format attendu: X.Y.Z).`);
+  }
+
+  const channelRaw = process.env.AGENT_RELEASE_CHANNEL?.trim() || "candidate";
+  if (!AGENT_RELEASE_CHANNELS.includes(channelRaw as AgentReleaseChannel)) {
+    throw new Error(`AGENT_RELEASE_CHANNEL invalide: "${channelRaw}". Valeurs acceptees: ${AGENT_RELEASE_CHANNELS.join(", ")}.`);
+  }
+
+  const downloadUrlOverrideRaw = process.env.AGENT_DOWNLOAD_URL?.trim() || null;
+
+  return {
+    releasesDir,
+    releaseVersion: releaseVersionRaw,
+    channel: channelRaw as AgentReleaseChannel,
+    downloadUrlOverride: downloadUrlOverrideRaw ? validateDownloadUrlOverride(downloadUrlOverrideRaw) : null
+  };
+};
+
 // Lot 6 (section 11): les cas min > max sont deja geres de maniere
 // defensive a l'usage (orchestrator.ts randomBetween() clampe silencieusement),
 // donc jamais bloquant au demarrage - mais une configuration incoherente

@@ -388,7 +388,10 @@ const runSuiteB = async (): Promise<void> => {
   try {
 
   server = spawn(process.platform === "win32" ? "npx.cmd" : "npx", ["tsx", "src/server.ts"], {
-    env: { ...process.env, WEB_PORT: String(port), BOT_EXECUTION_MODE: "agent", AGENT_UI_ENABLED: "true", AGENT_DOWNLOAD_URL: "http://example.test" },
+    // https:// obligatoire pour un hote distant (Phase 5, Lot 4): un placeholder
+    // http:// ferait desormais echouer le demarrage du serveur des la lecture
+    // de la configuration de release (voir loadAgentReleaseConfig()).
+    env: { ...process.env, WEB_PORT: String(port), BOT_EXECUTION_MODE: "agent", AGENT_UI_ENABLED: "true", AGENT_DOWNLOAD_URL: "https://example.test" },
     stdio: ["ignore", "pipe", "pipe"],
     shell: process.platform === "win32"
   });
