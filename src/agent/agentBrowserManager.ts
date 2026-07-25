@@ -74,6 +74,15 @@ export const launchChromeForBot = async (
       "--no-default-browser-check",
       "--disable-default-apps",
       "--disable-search-engine-choice-screen",
+      // Correctif final avant release (diagnostic profils persistants):
+      // complement des Preferences ecrites par applyPrivacyPreferences
+      // (agentProfileManager.ts) - jamais un contournement Cloudflare/
+      // fingerprint, uniquement la desactivation de la sauvegarde locale
+      // d'identifiants (autofill de formulaires, communication serveur
+      // d'autofill, bulle "Enregistrer le mot de passe ?"). Ne touche jamais
+      // aux cookies/local storage/IndexedDB.
+      "--disable-features=AutofillServerCommunication",
+      "--disable-save-password-bubble",
       ...extensionArgs,
       "--new-window",
       initialUrl
@@ -155,6 +164,18 @@ export const launchChromeForBot = async (
 // lance directement par Playwright). On borne donc toujours cet appel dans
 // le temps: la fermeture reelle du process (killChromeProcess, garantie et
 // rapide) ne doit jamais dependre de la reussite de ce close() cote client.
+//
+// Correctif final avant release (diagnostic profils persistants): plusieurs
+// tentatives d'obtenir une fermeture "propre" avant l'arret force (attendre
+// plus longtemps browser.close(), un taskkill sans /F) n'ont fait strictement
+// AUCUNE difference observable - browser.close() ne se termine jamais
+// proprement sur ce type de connexion, et un taskkill sans /F ne fait
+// jamais quitter Chrome (application multi-process). La persistance des
+// cookies entre deux lancements sur un MEME profil a neanmoins ete verifiee
+// fonctionnellement (un second Chrome sur le meme profil renvoie bien le
+// cookie du premier, cf. scripts/test-agent-cloudflare-diagnostic-real.ts) -
+// Chrome gere donc deja cela correctement en interne, quelle que soit la
+// methode d'arret. Aucune modification retenue ici: comportement inchange.
 export const closeBrowserWithTimeout = async (browser: Browser, timeoutMs = 3_000): Promise<void> => {
   await Promise.race([
     browser.close().catch(() => undefined),

@@ -2,8 +2,8 @@ import { clickBookNewAppointment, clickSeConnecter, clickSelectTravelGroup, fill
 import { closeBrowserWithTimeout, killChromeProcess, launchChromeForBot } from "./agentBrowserManager.js";
 import { loadExtensionConfig, validateExtensions } from "./agentExtensionConfig.js";
 import { getConfigDir } from "./agentStorage.js";
-import { findAppointmentPage, maskUrlForLog } from "./agentPageDetector.js";
-import { acquireProfileLock, ProfileLease } from "./agentProfileManager.js";
+import { findAppointmentPage, isCloudflareBlockedPage, maskUrlForLog } from "./agentPageDetector.js";
+import { acquirePooledProfileLock, ProfileLease } from "./agentProfileManager.js";
 import { AgentCommandError, toAgentCommandError } from "./agentErrors.js";
 import { AgentEventReporter } from "./agentEventReporter.js";
 import { AgentLogFn } from "./agentLocalLogger.js";
@@ -91,12 +91,12 @@ export class AgentBotManager {
   private readonly leases = new Map<string, ProfileLease>();
   private readonly stopping = new Set<string>();
   // Reserve un botId des la validation initiale, de facon synchrone, avant
-  // tout point d'attente (acquireProfileLock/launchChromeForBot sont ensuite
-  // asynchrones): sans cela, deux START_BOT quasi simultanes pour le meme
-  // botId (redelivraison socket, bug serveur) passeraient tous les deux le
-  // controle "this.bots.has(botId)" avant que le premier n'ait eu le temps
-  // d'inserer son handle, et lanceraient chacun un vrai Chrome sur le meme
-  // profil.
+  // tout point d'attente (acquirePooledProfileLock/launchChromeForBot sont
+  // ensuite asynchrones): sans cela, deux START_BOT quasi simultanes pour le
+  // meme botId (redelivraison socket, bug serveur) passeraient tous les deux
+  // le controle "this.bots.has(botId)" avant que le premier n'ait eu le
+  // temps d'inserer son handle, et lanceraient chacun un vrai Chrome sur le
+  // meme profil.
   private readonly starting = new Set<string>();
   // Deduplique VALIDATE_BOT en cours (section 1: "une commande VALIDATE_BOT
   // equivalente est deja en cours" -> VALIDATION_ALREADY_RUNNING), meme
@@ -194,7 +194,10 @@ export class AgentBotManager {
         );
       }
 
-      lease = acquireProfileLock(this.settings, botId);
+      // Diagnostic Cloudflare (profils): pool local persistant (profile-01,
+      // profile-02, ...) plutot qu'un profil jetable par botId - cf.
+      // agentProfileManager.ts pour le detail du defaut identifie et corrige.
+      lease = acquirePooledProfileLock(this.settings);
       this.leases.set(botId, lease);
 
       const chrome = await launchChromeForBot(lease.profilePath, this.settings.targetUrl, extensionDirs);
@@ -499,6 +502,19 @@ export class AgentBotManager {
       return isAtAppointmentPage();
     };
 
+    // Diagnostic Cloudflare (sequence de navigation): l'ancien flux
+    // (sessionManager.ts, resumeIfRecognizedState) ne relance JAMAIS une
+    // action sur une page dans un etat ambigu/bloque - il attend, sans rien
+    // forcer. La cascade ci-dessous relancait au contraire clickSeConnecter/
+    // fillLoginForm inconditionnellement a chaque tentative, y compris sur
+    // une page de blocage Cloudflare deja affichee (une deuxieme navigation/
+    // soumission automatique en quelques secondes, jamais vue par l'ancien
+    // flux). Ces deux drapeaux corrigent precisement cela: jamais deux
+    // soumissions sur la meme page/etat, et arret definitif (WAITING_FOR_USER,
+    // jamais de nouvel essai) des qu'un blocage Cloudflare est constate.
+    let blockedByCloudflare = false;
+    let lastSubmittedPageUrl: string | null = null;
+
     const attemptOnce = async (): Promise<boolean> => {
       if (!stillRunning() || !handle.browser.isConnected() || !handle.page || handle.page.isClosed()) {
         return false;
@@ -515,6 +531,28 @@ export class AgentBotManager {
       }
 
       const page = handle.page;
+
+      if (await isCloudflareBlockedPage(page).catch(() => false)) {
+        navLog("warn", "Page de blocage Cloudflare detectee. Aucune nouvelle tentative automatique ne sera effectuee.");
+        blockedByCloudflare = true;
+        return false;
+      }
+
+      // Une seule soumission par page/etat: si la page actuelle est
+      // exactement celle laissee par la soumission precedente (aucun
+      // changement depuis), ne resoumet jamais en aveugle une seconde fois -
+      // attend simplement un changement eventuel (rechargement manuel,
+      // redirection differee...) plutot que de multiplier les soumissions.
+      // Compare l'URL AVANT toute action de cette tentative a l'URL
+      // CONSTATEE APRES la derniere soumission (jamais l'URL d'avant cette
+      // derniere soumission, qui differerait toujours d'une navigation -
+      // piege constate empiriquement lors de la validation de ce correctif).
+      const urlBeforeThisAttempt = page.url();
+      if (lastSubmittedPageUrl !== null && urlBeforeThisAttempt === lastSubmittedPageUrl) {
+        navLog("info", "Formulaire deja soumis sur cette page sans changement detecte depuis: nouvelle soumission ignoree.");
+        return false;
+      }
+
       await clickSeConnecter(page, navLog).catch(() => false);
       if (page.isClosed() || !stillRunning()) {
         return false;
@@ -522,6 +560,7 @@ export class AgentBotManager {
 
       if (login && password) {
         await fillLoginForm(page, login, password, navLog).catch(() => false);
+        lastSubmittedPageUrl = page.url();
       }
       if (page.isClosed() || !stillRunning()) {
         return false;
@@ -565,6 +604,13 @@ export class AgentBotManager {
         return;
       }
 
+      // Diagnostic Cloudflare: un blocage constate arrete definitivement les
+      // tentatives automatiques - jamais de longue attente puis une tentative
+      // finale qui ne ferait que re-soumettre sur la meme page bloquee.
+      if (blockedByCloudflare) {
+        break;
+      }
+
       if (attempt < AUTO_NAV_ATTEMPTS_BEFORE_LONG_WAIT) {
         await new Promise((resolve) => setTimeout(resolve, this.settings.autoNavRetryIntervalMs));
         if (!stillRunning()) {
@@ -578,10 +624,13 @@ export class AgentBotManager {
     }
 
     // Seul point ou WAITING_FOR_USER est envoye pour ce bot (section 5 du
-    // hotfix): la connexion/le parcours automatique n'a pas abouti apres
-    // toutes les tentatives - une intervention humaine reelle (captcha,
-    // controle, etape non automatisable) est necessaire.
-    navLog("warn", `page de rendez-vous introuvable apres ${AUTO_NAV_FINAL_ATTEMPT} tentatives automatiques. Intervention humaine requise.`);
+    // hotfix 0.1.1): la connexion/le parcours automatique n'a pas abouti -
+    // soit apres toutes les tentatives, soit immediatement des la detection
+    // d'un blocage Cloudflare (jamais de nouvel essai dans ce cas) - une
+    // intervention humaine reelle est necessaire.
+    navLog("warn", blockedByCloudflare
+      ? "Blocage Cloudflare constate: passage en attente d'une intervention humaine, sans nouvel essai automatique."
+      : `page de rendez-vous introuvable apres ${AUTO_NAV_FINAL_ATTEMPT} tentatives automatiques. Intervention humaine requise.`);
     handle.currentStatus = "WAITING_FOR_USER";
     this.reporter.botStatus(botId, handle.startCommandId, "WAITING_FOR_USER");
   }

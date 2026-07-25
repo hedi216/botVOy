@@ -96,3 +96,34 @@ export const findAppointmentPage = async (
 // empiriquement (boucle a vitesse CPU tant que le marqueur reste present).
 export const findReadyAppointmentPage = async (pages: Page[]): Promise<PageSelectionResult> =>
   selectWithChecker(pages, isAppointmentPageReady);
+
+// -------- Diagnostic Cloudflare: detection PASSIVE d'un blocage (jamais une
+// tentative de contournement - aucune modification d'empreinte, user-agent,
+// navigator.webdriver, Canvas/WebGL: uniquement une lecture du contenu deja
+// affiche par la page). Distincte de la "file d'attente virtuelle"
+// Cloudflare (isInCloudflareQueue dans src/shared/loginFlow.ts, qui s'ecoule
+// seule): ceci est un blocage qui ne se resout jamais tout seul - jamais de
+// nouvelle tentative automatique une fois constate. --------
+
+const CLOUDFLARE_BLOCK_TITLE_PATTERN = /attention required/i;
+const CLOUDFLARE_BLOCK_TEXT_PATTERN = /sorry, you have been blocked/i;
+const CLOUDFLARE_BLOCK_PATH_PATTERN = /\/cdn-cgi\//i;
+
+export const isCloudflareBlockedPage = async (page: Page): Promise<boolean> => {
+  if (page.isClosed()) {
+    return false;
+  }
+  try {
+    if (CLOUDFLARE_BLOCK_PATH_PATTERN.test(page.url())) {
+      return true;
+    }
+    const title = await page.title().catch(() => "");
+    if (CLOUDFLARE_BLOCK_TITLE_PATTERN.test(title)) {
+      return true;
+    }
+    const bodyText = await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
+    return CLOUDFLARE_BLOCK_TEXT_PATTERN.test(bodyText);
+  } catch {
+    return false;
+  }
+};
