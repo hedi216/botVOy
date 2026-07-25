@@ -18,6 +18,7 @@ import { Browser, Page, chromium } from "playwright";
 import { Socket, io as ioClient } from "socket.io-client";
 import { pool } from "../src/db.js";
 import { validateMonitoringSettings, DEFAULT_AGENT_MONITORING_SETTINGS } from "../src/agent/agentMonitoringSettings.js";
+import { redactForLog } from "../src/agent/agentLocalLogger.js";
 import { SlotAlertDeduplicator } from "../src/agent/agentSlotDedup.js";
 import { waitForScanTurn, releaseScanTurn } from "../src/shared/orchestrator.js";
 
@@ -141,12 +142,47 @@ const cleanupTestData = async (): Promise<void> => {
 
 type FakeAgentHandle = { agentId: number; token: string; socket: Socket };
 
+// CORRECTIF HARNAIS DE TEST (0.1.6): l'ancien pairFakeAgent lisait
+// pairing.body.pairing.code sans jamais verifier le statut HTTP ni la forme
+// de la reponse - un echec cote serveur (meme transitoire) faisait echouer
+// avec "Cannot read properties of undefined (reading 'code')" au lieu de
+// revele la vraie cause HTTP. Retries bornes UNIQUEMENT sur les codes
+// transitoires (429/5xx): jamais sur 400/401/403/404, qui sont des refus
+// definitifs (rejouer ne changerait rien).
+const PAIRING_RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
+const PAIRING_RETRY_DELAYS_MS = [500, 1_000];
+
+const requestPairingCodeWithRetry = async (baseUrl: string, managerCookie: string): Promise<{ status: number; body: any }> => {
+  let lastResult: { status: number; body: any } = { status: 0, body: null };
+  for (let attempt = 0; attempt <= PAIRING_RETRY_DELAYS_MS.length; attempt += 1) {
+    lastResult = await requestJson(baseUrl, "POST", "/api/agents/pairing-codes", managerCookie, {});
+    if (!PAIRING_RETRYABLE_STATUS_CODES.has(lastResult.status)) {
+      return lastResult;
+    }
+    if (attempt < PAIRING_RETRY_DELAYS_MS.length) {
+      const delayMs = PAIRING_RETRY_DELAYS_MS[attempt];
+      log("PAIRING_RETRY", `POST /api/agents/pairing-codes -> ${lastResult.status}: nouvelle tentative dans ${delayMs}ms.`);
+      await sleep(delayMs);
+    }
+  }
+  return lastResult;
+};
+
 const pairFakeAgent = async (baseUrl: string, managerCookie: string, computerName: string): Promise<FakeAgentHandle> => {
-  const pairing = await requestJson(baseUrl, "POST", "/api/agents/pairing-codes", managerCookie, {});
+  const pairing = await requestPairingCodeWithRetry(baseUrl, managerCookie);
+  const pairingCode = pairing.body?.pairing?.code;
+  if (pairing.status !== 200 || typeof pairingCode !== "string" || !pairingCode.trim()) {
+    throw new Error(
+      "pairFakeAgent: impossible d'obtenir un code d'appairage valide.\n"
+      + `  URL de base: ${baseUrl}\n`
+      + `  Statut HTTP: ${pairing.status}\n`
+      + `  Corps de reponse (assaini): ${JSON.stringify(redactForLog(pairing.body))}`
+    );
+  }
   return new Promise((resolve, reject) => {
     const socket = ioClient(`${baseUrl}/agent`, {
       autoConnect: false, reconnection: false, forceNew: true,
-      auth: { mode: "pair", pairingCode: pairing.body.pairing.code, computerName, version: "1.0.0", protocolVersion: 1 }
+      auth: { mode: "pair", pairingCode, computerName, version: "1.0.0", protocolVersion: 1 }
     });
     const t = setTimeout(() => { socket.disconnect(); reject(new Error("Timeout agent fantome.")); }, 8_000);
     socket.on("connect_error", (e: Error) => { clearTimeout(t); reject(e); });
