@@ -135,7 +135,13 @@ const main = async (): Promise<void> => {
     uiState = "NOT_PAIRED";
     isPaired = false;
     acceptingCommands = false;
-    await botManager.shutdownAll().catch((error) =>
+    // BUG CIBLE 0.1.5: jamais shutdownAll() ici - AGENT_REVOKED/INVALID_TOKEN
+    // sont un reset d'IDENTITE (l'utilisateur peut reappairer cet agent juste
+    // apres, dans ce MEME processus), pas un arret du process. shutdownAll()
+    // aurait fige durablement AgentBotManager en mode "arret", faisant
+    // refuser tout START_BOT ulterieur avec AGENT_SHUTTING_DOWN meme apres un
+    // reappairage reussi.
+    await botManager.stopAllBotsForIdentityReset().catch((error) =>
       log("error", `Erreur pendant l'arret des bots (${reason}): ${error instanceof Error ? error.message : String(error)}`));
     await credentialStore.clear().catch((error) =>
       log("error", `Erreur pendant l'effacement des identifiants (${reason}): ${error instanceof Error ? error.message : String(error)}`));
@@ -221,7 +227,10 @@ const main = async (): Promise<void> => {
     openConfigFolder: () => openFolderInExplorer(paths.configDir),
     unpair: async () => {
       acceptingCommands = false;
-      await botManager.shutdownAll().catch((error) =>
+      // BUG CIBLE 0.1.5: meme raisonnement que applyPermanentFailurePolicy -
+      // une dissociation locale est suivie d'un reappairage possible dans le
+      // meme processus, jamais un arret definitif.
+      await botManager.stopAllBotsForIdentityReset().catch((error) =>
         log("error", `Erreur pendant l'arret des bots (dissociation): ${error instanceof Error ? error.message : String(error)}`));
       client.stop();
       await credentialStore.clear().catch((error) =>

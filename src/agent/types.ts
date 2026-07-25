@@ -194,6 +194,11 @@ export const AGENT_COMMAND_ERROR_CODES = [
   "PROFILE_CREATE_FAILED",
   "BOT_ALREADY_RUNNING",
   "AGENT_CAPACITY_REACHED",
+  // BUG CIBLE 0.1.5: distinct de AGENT_CAPACITY_REACHED - jamais utilise
+  // lorsque activeCount<maxActiveBots (cf. AgentBotManager.startBot()),
+  // uniquement lorsque this.shuttingDown est vrai (arret definitif du
+  // process en cours, cf. AgentBotManager.shutdownAll()).
+  "AGENT_SHUTTING_DOWN",
   "BOT_NOT_FOUND",
   "ENGINE_NOT_IMPLEMENTED",
   // Lot 3 (VALIDATE_BOT)

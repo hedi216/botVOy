@@ -621,7 +621,12 @@
     BROWSER_CONNECTION_LOST: "La connexion au navigateur du bot a ete perdue.",
     INVALID_BOT_STATE: "Ce bot n'est pas dans un etat permettant cette action.",
     AGENT_NOT_CONNECTED: "L'agent n'est plus connecte.",
-    VALIDATION_ALREADY_RUNNING: "Une verification de page est deja en cours."
+    VALIDATION_ALREADY_RUNNING: "Une verification de page est deja en cours.",
+    // BUG CIBLE 0.1.5: ces deux codes ne doivent jamais s'afficher pareil -
+    // AGENT_CAPACITY_REACHED (limite reelle atteinte) exige une action
+    // differente de AGENT_SHUTTING_DOWN (relancer l'agent).
+    AGENT_CAPACITY_REACHED: "Limite locale de bots actifs atteinte sur cet agent.",
+    AGENT_SHUTTING_DOWN: "L'agent est en cours d'arret. Relancez RendezBot Agent."
   };
 
   // Une commande VALIDATE_BOT non encore terminee (PENDING/SENT/ACKNOWLEDGED)
@@ -635,8 +640,21 @@
   // page ne doit jamais laisser entendre que Chrome est lance tant que
   // l'agent ne l'a pas confirme via BOT_STATUS.
   const commandStatusMessage = (command) => {
-    if (command.status === "FAILED" && FAILURE_MESSAGE_BY_ERROR_CODE[command.errorCode]) {
-      return FAILURE_MESSAGE_BY_ERROR_CODE[command.errorCode];
+    if (command.status === "FAILED") {
+      if (FAILURE_MESSAGE_BY_ERROR_CODE[command.errorCode]) {
+        return FAILURE_MESSAGE_BY_ERROR_CODE[command.errorCode];
+      }
+      // BUG CIBLE 0.1.5 (point 5): a defaut d'une entree dediee ci-dessus,
+      // afficher le message public deja assaini envoye par l'agent
+      // (AgentBotManager.publicMessageFor - jamais de payload/login/mot de
+      // passe, toujours une phrase fixe par code) plutot que de masquer
+      // silencieusement l'echec derriere le texte generique "Commande
+      // echouee". Si meme ce message est absent, afficher au moins le code
+      // reel pour rester diagnosticable.
+      if (typeof command.message === "string" && command.message.trim()) {
+        return command.message;
+      }
+      return command.errorCode ? `Commande echouee (${command.errorCode})` : "Commande echouee";
     }
     if (isValidateInFlight(command)) {
       return "Verification de la page...";
@@ -652,9 +670,6 @@
         return "Arret en cours (agent)";
       }
       return "Commande recue par l'agent";
-    }
-    if (command.status === "FAILED") {
-      return "Commande echouee";
     }
     if (command.status === "EXPIRED") {
       return "Delai de reponse depasse";

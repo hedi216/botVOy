@@ -142,7 +142,7 @@ export class AgentBotManager {
     const settingsSnapshot = validateMonitoringSettings(params.rawMonitoringSettings, this.log);
 
     if (this.shuttingDown) {
-      this.reporter.failed(commandId, "AGENT_CAPACITY_REACHED", "Agent en cours d'arret: aucune nouvelle commande acceptee.");
+      this.reporter.failed(commandId, "AGENT_SHUTTING_DOWN", "L'agent est en cours d'arret. Relancez RendezBot Agent.");
       return;
     }
 
@@ -729,6 +729,7 @@ export class AgentBotManager {
       PROFILE_CREATE_FAILED: "Impossible de preparer le profil Chrome local.",
       BOT_ALREADY_RUNNING: "Ce bot est deja actif sur cet agent.",
       AGENT_CAPACITY_REACHED: "Limite locale de bots actifs atteinte sur cet agent.",
+      AGENT_SHUTTING_DOWN: "L'agent est en cours d'arret. Relancez RendezBot Agent.",
       BOT_NOT_RUNNING: "Ce bot n'est plus actif sur cet agent.",
       BROWSER_CLOSED: "Le navigateur de ce bot a ete ferme.",
       BROWSER_CONNECTION_LOST: "La connexion au navigateur de ce bot a ete perdue.",
@@ -743,12 +744,13 @@ export class AgentBotManager {
     return messages[error.code] ?? "Erreur interne de l'agent.";
   }
 
-  // Utilise par Ctrl+C (section 12): ferme tous les bots actifs sans
-  // necessiter de commande serveur (aucun commandId disponible dans ce
-  // contexte, donc pas de COMMAND_COMPLETED emis ici, seulement un BOT_STATUS
-  // best-effort pour que l'interface web se mette a jour immediatement).
-  async shutdownAll(): Promise<void> {
-    this.shuttingDown = true;
+  // Ferme reellement tous les bots actifs (navigateur, surveillance, verrou
+  // de profil) - factorise entre stopAllBotsForIdentityReset() (agent
+  // reutilisable ensuite) et shutdownAll() (arret definitif du process).
+  // Ne touche jamais this.shuttingDown ni starting/stopping/validating:
+  // chaque appelant decide seul de ce qui doit rester coherent pour son
+  // propre cas d'usage.
+  private async closeAllBotHandles(): Promise<void> {
     const handles = [...this.bots.values()];
     await Promise.all(handles.map(async (handle) => {
       handle.browser.removeAllListeners("disconnected");
@@ -771,5 +773,41 @@ export class AgentBotManager {
     }));
     this.bots.clear();
     this.leases.clear();
+  }
+
+  // BUG CIBLE 0.1.5 (agent inutilisable apres revocation/reappairage dans le
+  // MEME processus): shutdownAll() positionne this.shuttingDown=true de
+  // facon PERMANENTE (jamais remis a false), alors que la revocation/
+  // dissociation locale sont des resets d'IDENTITE, pas un arret du process
+  // - l'utilisateur peut tout a fait reappairer cet agent juste apres, dans
+  // le meme processus Node (agentMain.ts ne redemarre rien). Avant ce
+  // correctif, ce reappairage laissait AgentBotManager durablement bloque:
+  // tout START_BOT suivant etait refuse avec AGENT_CAPACITY_REACHED alors
+  // que activeCount()=0 et que la limite locale n'etait pas atteinte.
+  // Utilisee par applyPermanentFailurePolicy (AGENT_REVOKED/INVALID_TOKEN/
+  // ...) et par la dissociation locale (agentMain.ts): ferme tout, vide
+  // integralement le registre (y compris starting/stopping/validating, pour
+  // ne laisser aucune reservation fantome), mais laisse le manager
+  // parfaitement reutilisable pour un nouvel appairage a venir.
+  async stopAllBotsForIdentityReset(): Promise<void> {
+    await this.closeAllBotHandles();
+    this.starting.clear();
+    this.stopping.clear();
+    this.validating.clear();
+  }
+
+  // Reserve exclusivement a l'arret DEFINITIF du process agent (SIGINT/
+  // SIGTERM, ou "Quitter" depuis l'UI locale, cf. agentMain.ts): positionne
+  // this.shuttingDown=true de maniere permanente - plus aucun START_BOT ne
+  // sera jamais accepte ensuite par cette instance, ce qui est correct ici
+  // puisque le process se termine juste apres. Ne jamais appeler cette
+  // methode pour un simple reset d'identite (revocation/dissociation suivie
+  // d'un reappairage): utiliser stopAllBotsForIdentityReset() a la place.
+  async shutdownAll(): Promise<void> {
+    this.shuttingDown = true;
+    await this.closeAllBotHandles();
+    this.starting.clear();
+    this.stopping.clear();
+    this.validating.clear();
   }
 }
