@@ -1335,6 +1335,7 @@ io.on("connection", (socket) => {
         // cote (defense en profondeur, cf. agentMonitoringSettings.ts):
         // jamais fait confiance tel quel meme si deja normalise ici.
         const monitoringSettings = await getAgencyMonitoringSettings(agencyId);
+        const extensionLinks = await listExtensionLinks(agencyId, true);
 
         // Hotfix 0.1.2 (points 1-3 du cahier des charges): reutilise
         // TARGET_URL (deja la source de verite du flux legacy_vm existant),
@@ -1359,7 +1360,9 @@ io.on("connection", (socket) => {
             // UNIQUEMENT via ce canal transient (jamais persiste, voir
             // agentCommandService.ts) - jamais dans publicPayload, jamais
             // dans public_payload/public_result en base, jamais logue.
-            transientPayload: (login || password) ? { login, password } : undefined
+            transientPayload: (login || password || extensionLinks.length > 0)
+              ? { login, password, extensionLinks }
+              : undefined
           },
           {
             config: agentCommandConfig,

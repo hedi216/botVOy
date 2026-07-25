@@ -1,7 +1,8 @@
 import { BrowserContext, Page } from "playwright";
+import { clickBookNewAppointment, clickContinueServiceLevel, clickSelectTravelGroup } from "../shared/loginFlow.js";
 import { monitorAppointments } from "../shared/monitor.js";
 import { MonitorEventLevel } from "../shared/types.js";
-import { findReadyAppointmentPage } from "./agentPageDetector.js";
+import { findReadyAppointmentPage, maskUrlForLog } from "./agentPageDetector.js";
 import { AgentMonitoringSettings, toAppConfig } from "./agentMonitoringSettings.js";
 import { SlotAlertDeduplicator } from "./agentSlotDedup.js";
 import { AgentEventReporter } from "./agentEventReporter.js";
@@ -32,6 +33,11 @@ const AGENT_HUMAN_POLL_MS = 15_000;
 // boucle s'arrete elle-meme plutot que de re-attendre indefiniment via
 // pauseForHuman. Remis a zero par le moindre refresh reussi.
 const MAX_CONSECUTIVE_REFRESH_FAILURES = 3;
+const WORKFLOW_RECOVERY_ATTEMPTS_BEFORE_LONG_WAIT = 3;
+const WORKFLOW_RECOVERY_FINAL_ATTEMPT = 4;
+const WORKFLOW_RECOVERY_RETRY_INTERVAL_MS = 10_000;
+const WORKFLOW_RECOVERY_LONG_WAIT_MS = 5 * 60 * 1000;
+const WORKFLOW_STEP_SETTLE_MS = 8_000;
 
 export type MonitoringRuntimeStatus = {
   rateLimited: boolean;
@@ -101,6 +107,109 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
     // non prete) serait annonce "recupere" instantanement, en boucle.
     const selection = await findReadyAppointmentPage(context.pages());
     return selection.ok ? selection.page : null;
+  };
+
+  const pickWorkflowPage = (): Page | null => {
+    const pages = context.pages()
+      .filter((candidate) => {
+        const url = candidate.url();
+        return !candidate.isClosed()
+          && !url.startsWith("devtools://")
+          && !url.startsWith("chrome://")
+          && !url.startsWith("chrome-extension://");
+      });
+    return [...pages].reverse().find((candidate) => /tlscontact|vfsglobal/i.test(candidate.url()))
+      ?? [...pages].reverse().find((candidate) => candidate.url() !== "about:blank")
+      ?? pages[0]
+      ?? null;
+  };
+
+  const isSafeRecoveryUrl = (rawUrl: string): boolean => {
+    try {
+      const parsed = new URL(rawUrl);
+      return parsed.protocol === "https:" || parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+    } catch {
+      return false;
+    }
+  };
+
+  const waitForReadyAppointment = async (timeoutMs: number): Promise<Page | null> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && !signal.aborted) {
+      const ready = await recoverCurrentPage();
+      if (ready) {
+        return ready;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    return recoverCurrentPage();
+  };
+
+  const recoverWorkflowOnce = async (attempt: number, reason?: string): Promise<Page | null> => {
+    const ready = await recoverCurrentPage();
+    if (ready) {
+      return ready;
+    }
+
+    const page = pickWorkflowPage();
+    if (!page || page.isClosed()) {
+      return null;
+    }
+
+    agentLog("info", `Reprise workflow ${attempt}/${WORKFLOW_RECOVERY_FINAL_ATTEMPT}${reason ? " apres page inattendue" : ""}.`);
+
+    if (isSafeRecoveryUrl(targetUrl)) {
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20_000 })
+        .then(() => agentLog("info", `Retour automatique vers l'URL cible (${maskUrlForLog(targetUrl)}).`))
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          agentLog("warn", `Navigation vers l'URL cible impossible: ${message}`);
+        });
+      const afterTarget = await waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+      if (afterTarget) {
+        return afterTarget;
+      }
+    }
+
+    await clickSelectTravelGroup(page, agentLog).catch(() => false);
+    let recovered = await waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+    if (recovered) {
+      return recovered;
+    }
+
+    await clickBookNewAppointment(page, agentLog).catch(() => false);
+    recovered = await waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+    if (recovered) {
+      return recovered;
+    }
+
+    await clickContinueServiceLevel(page, agentLog).catch(() => false);
+    return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+  };
+
+  const recoverWorkflowWithRetries = async (reason?: string): Promise<Page | null> => {
+    for (let attempt = 1; attempt <= WORKFLOW_RECOVERY_FINAL_ATTEMPT; attempt += 1) {
+      if (signal.aborted) {
+        return null;
+      }
+
+      if (attempt === WORKFLOW_RECOVERY_FINAL_ATTEMPT) {
+        agentLog("warn", `${WORKFLOW_RECOVERY_ATTEMPTS_BEFORE_LONG_WAIT} tentatives sans page reconnue. Attente de ${WORKFLOW_RECOVERY_LONG_WAIT_MS / 60_000} minutes avant la tentative finale.`);
+        await new Promise((resolve) => setTimeout(resolve, WORKFLOW_RECOVERY_LONG_WAIT_MS));
+      }
+
+      const recovered = await recoverWorkflowOnce(attempt, reason);
+      if (recovered) {
+        return recovered;
+      }
+
+      if (attempt < WORKFLOW_RECOVERY_ATTEMPTS_BEFORE_LONG_WAIT) {
+        await new Promise((resolve) => setTimeout(resolve, WORKFLOW_RECOVERY_RETRY_INTERVAL_MS));
+      }
+    }
+
+    agentLog("error", `Reprise workflow impossible apres ${WORKFLOW_RECOVERY_FINAL_ATTEMPT} tentatives. Notification et intervention humaine requises.`);
+    return null;
   };
 
   const waitForUser = async (): Promise<void> => {
@@ -182,7 +291,7 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
     log: agentLog,
     waitForUser,
     recoverPage: recoverCurrentPage,
-    recoverWorkflow: recoverCurrentPage,
+    recoverWorkflow: recoverWorkflowWithRetries,
     signal,
     onRateLimited,
     onSlotDetected,

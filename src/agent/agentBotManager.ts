@@ -1,4 +1,4 @@
-import { clickBookNewAppointment, clickSeConnecter, clickSelectTravelGroup, fillLoginForm } from "../shared/loginFlow.js";
+import { clickBookNewAppointment, clickContinueServiceLevel, clickSeConnecter, clickSelectTravelGroup, fillLoginForm } from "../shared/loginFlow.js";
 import { closeBrowserWithTimeout, killChromeProcess, launchChromeForBot } from "./agentBrowserManager.js";
 import { loadExtensionConfig, validateExtensions } from "./agentExtensionConfig.js";
 import { getConfigDir } from "./agentStorage.js";
@@ -9,7 +9,7 @@ import { AgentEventReporter } from "./agentEventReporter.js";
 import { AgentLogFn } from "./agentLocalLogger.js";
 import { validateMonitoringSettings } from "./agentMonitoringSettings.js";
 import { startMonitoring } from "./agentMonitoringRuntime.js";
-import { AgentBotHandle, AgentRuntimeSettings, RuntimeStatusBotSnapshot } from "./types.js";
+import { AgentBotHandle, AgentExtensionInstallLink, AgentRuntimeSettings, RuntimeStatusBotSnapshot } from "./types.js";
 
 // Delai maximum laisse a la boucle de surveillance pour repondre a
 // l'annulation avant de fermer Chrome de force (section 11 du cahier des
@@ -71,6 +71,7 @@ export type StartBotParams = {
   // dans publicPayload, jamais transientPayload) - toujours revalidee ici
   // (isValidAbsoluteStartUrl), jamais fait confiance telle quelle.
   startUrl?: string;
+  extensionLinks?: AgentExtensionInstallLink[];
 };
 
 export type StopBotParams = {
@@ -223,6 +224,7 @@ export class AgentBotManager {
       };
       this.bots.set(botId, handle);
       this.wireUnexpectedClosure(handle);
+      await this.openExtensionLinks(handle, params.extensionLinks ?? []);
 
       // Hotfix 0.1.1 (section 2/4/5): la commande START_BOT est completee des
       // que Chrome est reellement lance - jamais retardee jusqu'a la fin de
@@ -372,6 +374,7 @@ export class AgentBotManager {
       }
 
       handle.page = selection.page;
+      await this.closeExtraPages(selection.page);
 
       // Section 2 du cahier des charges Lot 4: AbortController + snapshot
       // deja valides (a l'ouverture du bot) -> demarrage reel de la boucle
@@ -581,6 +584,14 @@ export class AgentBotManager {
       if (page.isClosed() || !stillRunning()) {
         return false;
       }
+      if (await waitForAppointmentPageOrTimeout(AUTO_NAV_STEP_SETTLE_MS)) {
+        return true;
+      }
+
+      await clickContinueServiceLevel(page, navLog).catch(() => false);
+      if (page.isClosed() || !stillRunning()) {
+        return false;
+      }
       return waitForAppointmentPageOrTimeout(AUTO_NAV_STEP_SETTLE_MS);
     };
 
@@ -599,6 +610,7 @@ export class AgentBotManager {
       }
 
       if (await attemptOnce()) {
+        await this.closeExtraPages(handle.page);
         this.beginMonitoring(handle, handle.startCommandId);
         this.log("success", `Bot ${botId}: page de rendez-vous atteinte automatiquement, surveillance demarree.`);
         return;
@@ -654,6 +666,56 @@ export class AgentBotManager {
 
     handle.browser.on("disconnected", onClosed);
     handle.browserProcess.once("exit", onClosed);
+  }
+
+  private sanitizeInstallLink(link: AgentExtensionInstallLink): string | null {
+    if (!link.installUrl || link.installUrl.length > 2_000) {
+      return null;
+    }
+    try {
+      const parsed = new URL(link.installUrl);
+      return parsed.protocol === "http:" || parsed.protocol === "https:" ? link.installUrl : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async openExtensionLinks(handle: AgentBotHandle, links: AgentExtensionInstallLink[]): Promise<void> {
+    const validLinks = links
+      .map((link) => ({ ...link, installUrl: this.sanitizeInstallLink(link) }))
+      .filter((link): link is AgentExtensionInstallLink => Boolean(link.installUrl));
+
+    if (validLinks.length === 0 || !handle.browser.isConnected()) {
+      return;
+    }
+
+    for (const link of validLinks) {
+      const extensionPage = await handle.context.newPage();
+      extensionPage.setDefaultTimeout(8_000);
+      await extensionPage.goto(link.installUrl, { waitUntil: "domcontentloaded" })
+        .then(() => this.log("info", `Bot ${handle.botId}: lien extension ouvert (${link.name}, ${maskUrlForLog(link.installUrl)}).`))
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          this.log("warn", `Bot ${handle.botId}: ouverture du lien extension "${link.name}" impossible (${message}).`);
+        });
+    }
+
+    await handle.page.bringToFront().catch(() => undefined);
+    this.log("info", `Bot ${handle.botId}: ${validLinks.length} lien(s) d'extension ouvert(s). Installez manuellement si Chrome le demande, puis validez le bot.`);
+  }
+
+  private async closeExtraPages(keepPage: import("playwright").Page): Promise<void> {
+    const pages = keepPage.context().pages();
+    await Promise.all(pages.map(async (candidate) => {
+      if (candidate === keepPage || candidate.isClosed()) {
+        return;
+      }
+      const url = candidate.url();
+      if (url.startsWith("devtools://") || url.startsWith("chrome://") || url.startsWith("chrome-extension://")) {
+        return;
+      }
+      await candidate.close().catch(() => undefined);
+    }));
   }
 
   // Jamais de detail Playwright/Chrome brut transmis au serveur (section 7):

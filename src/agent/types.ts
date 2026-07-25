@@ -166,6 +166,12 @@ export type AgentCommandEnvelope = {
   transientPayload?: unknown;
 };
 
+export type AgentExtensionInstallLink = {
+  id: number;
+  name: string;
+  installUrl: string;
+};
+
 // -------- Lot 2: cycle de vie reel Chrome/Playwright --------
 
 export type AgentBotStatusValue =

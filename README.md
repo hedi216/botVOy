@@ -81,9 +81,9 @@ Evenements notifies : intervention humaine requise, validation/blocage detecte, 
 
 ## Extensions d'enregistrement d'ecran par agence
 
-Chaque agence peut configurer une extension d'enregistrement depuis `Parametres`. Le lien fourni doit etre `http://`/`https://` uniquement (jamais `file:`/`javascript:`/`data:`). L'installation reste manuelle (RendezBot ne contourne pas les protections Chrome Web Store) : voir [agent-operations.md](docs/agent-operations.md) pour la procedure complete et la checklist de validation.
+Chaque agence peut configurer des liens d'extension depuis l'ecran **Extensions**. Les liens fournis doivent etre `http://`/`https://` uniquement (jamais `file:`/`javascript:`/`data:`). Au lancement d'un bot, RendezBot ouvre ces liens dans le Chrome du bot pour que l'utilisateur installe ou verifie manuellement les extensions, puis valide le bot comme d'habitude. RendezBot ne clique jamais sur "Ajouter a Chrome" et ne contourne aucune confirmation Chrome Web Store.
 
-En mode `agent`, les profils Chrome persistants et leur configuration d'extension vivent sur le PC agent (`<AGENT_DATA_DIR>/config/extensions.json`), jamais sur la VM.
+En mode `agent`, les liens d'installation sont transmis au PC agent uniquement en memoire au demarrage du bot. Les extensions deja installees restent conservees dans les profils Chrome persistants de l'agent. La configuration locale `<AGENT_DATA_DIR>/config/extensions.json` reste reservee aux extensions unpacked chargees par dossier local, pas aux liens Chrome Web Store.
 
 ## Workflow de surveillance (moteur partage, identique en legacy_vm et en agent)
 

@@ -31,6 +31,8 @@ Aucune action operateur necessaire au-dela d'un rafraichissement de la page si l
 
 Voir le README (section "Extensions d'enregistrement par agence") pour la procedure complete de preparation d'un profil Chrome avec extension. Cote agent, la configuration se trouve dans `<AGENT_DATA_DIR>/config/extensions.json` (jamais distribuee automatiquement — installation manuelle requise, y compris la confirmation Chrome Web Store).
 
+Note actuelle: les liens ajoutes dans l'ecran web **Extensions** sont transmis uniquement en memoire au demarrage du bot et ouverts dans le Chrome visible du bot. L'utilisateur installe ou verifie l'extension manuellement, puis clique **Valider** dans RendezBot. L'agent ferme alors les onglets web extra et garde la page TLS surveillee. Le fichier `<AGENT_DATA_DIR>/config/extensions.json` reste reserve aux extensions locales unpacked chargees par dossier (`manifest.json`).
+
 ## 6. Logs
 
 - Logs agent : locaux au PC (`AGENT_DATA_DIR`), redaction automatique de tout champ sensible avant ecriture (voir [agent-security.md](agent-security.md)), rotation par taille (`AGENT_LOG_MAX_FILE_SIZE_MB`/`AGENT_LOG_MAX_FILES`).

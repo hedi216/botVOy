@@ -672,10 +672,15 @@ export const resetUserPassword = async (userId: number, requester: DbUser): Prom
     throw new Error("Acces refuse.");
   }
 
+  if (!target.is_active && target.agency_id) {
+    await assertAgencyCapacity(target.agency_id);
+  }
+
   const temporaryPassword = generateTemporaryPassword();
   const result = await pool.query<DbUser>(
     `UPDATE users
      SET password_hash = $2,
+         is_active = TRUE,
          failed_login_attempts = 0,
          password_changed_at = NOW()
      WHERE id = $1

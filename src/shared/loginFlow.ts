@@ -299,6 +299,13 @@ export const clickSelectTravelGroup = async (page: Page, log: LogFn): Promise<bo
 
 const notReservedTextPattern = /non r[ée]serv[ée]/i;
 const bookAppointmentTextPattern = /prendre un nouveau rendez-vous/i;
+const serviceLevelPagePattern = /\/workflow\/service-level/i;
+const serviceLevelTitlePattern = /services additionnels|additional services/i;
+// Libelle strict ("Continuer") d'abord, puis des formulations de poursuite
+// plus larges - jamais un mot qui pourrait designer une action destructive/
+// laterale sur cette page ("Ajouter", "Annuler", "Retour", un nom de service):
+// uniquement des tournures qui font avancer vers la prise de rendez-vous.
+const continueTextPattern = /^(continuer|continue|poursuivre|suivant|next)$|continuer vers|prendre.*(rendez-vous|rdv)|r[ée]server|book.*appointment/i;
 
 // Sur "Recapitulatif de la demande" (/workflow/application-summary), le rendez-vous
 // affiche "Non reserve" tant qu'aucune reservation n'existe : il faut alors cliquer
@@ -325,5 +332,37 @@ export const clickBookNewAppointment = async (page: Page, log: LogFn): Promise<b
   }
 
   log("success", "Rendez-vous non reserve: clic automatique sur 'Prendre un nouveau rendez-vous'.");
+  return true;
+};
+
+// TLScontact insere parfois une etape "Services additionnels" avant la page
+// appointment-booking. Tant qu'aucun service optionnel n'est selectionne par
+// RendezBot, le seul geste metier attendu est de continuer vers l'etape de
+// prise de rendez-vous.
+export const clickContinueServiceLevel = async (page: Page, log: LogFn): Promise<boolean> => {
+  const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
+  if (!serviceLevelPagePattern.test(page.url()) && !serviceLevelTitlePattern.test(bodyText)) {
+    return false;
+  }
+
+  // Priorite au repere structurel deja observe en reel sur cette etape
+  // (id/data-testid, ou lien pointant explicitement vers l'etape suivante du
+  // parcours) : insensible au libelle exact ou a la langue, donc plus fiable
+  // qu'un texte. Confirme via DevTools sur un test reel (cf.
+  // artifacts/logs/agent.log du 2026-07-25) que ce "Continuer" est en realite
+  // un <a href="/workflow/appointment-booking/..."> (role="link"), pas un
+  // <button> - d'ou aussi la recherche sur les deux roles en repli texte.
+  const continueButton = page.locator('#book-appointment-btn:visible, [data-testid="btn-book-appointment"]:visible, a[href*="/workflow/appointment-booking/"]:visible')
+    .or(page.getByRole("button", { name: continueTextPattern }))
+    .or(page.getByRole("link", { name: continueTextPattern }))
+    .or(page.locator("button, a").filter({ hasText: continueTextPattern }))
+    .first();
+
+  if (!(await clickLocatorIfVisible(continueButton, 5_000).catch(() => false))) {
+    log("warn", "Etape services additionnels detectee mais bouton 'Continuer' introuvable.");
+    return false;
+  }
+
+  log("success", "Etape services additionnels detectee: clic automatique sur 'Continuer'.");
   return true;
 };

@@ -10,6 +10,7 @@ import { resolveAgentPaths } from "./agentPaths.js";
 import { loadAgentSettings } from "./agentSettings.js";
 import { AgentSingleInstanceLock, openUrlInDefaultBrowser } from "./agentSingleInstanceLock.js";
 import { AgentCommandEnvelope, AgentLocalUiState, AgentLocalUiStatusPayload } from "./types.js";
+import type { AgentExtensionInstallLink } from "./types.js";
 
 const parseArgs = (): { pairingCode?: string } => {
   const [, , mode, arg] = process.argv;
@@ -299,7 +300,8 @@ const handleCommand = (
     // `command.transientPayload`, transmis sur ce seul socket, jamais ecrit
     // en base (voir DispatchAgentCommandParams.transientPayload). Jamais
     // journalise ici, jamais stocke au-dela de cet appel.
-    const transient = command.transientPayload as { login?: unknown; password?: unknown } | undefined;
+    const transient = command.transientPayload as { login?: unknown; password?: unknown; extensionLinks?: unknown } | undefined;
+    const extensionLinks = parseExtensionLinks(transient?.extensionLinks);
     void botManager.startBot({
       commandId: command.commandId,
       botId: command.botId,
@@ -310,7 +312,8 @@ const handleCommand = (
       rawMonitoringSettings: payload?.monitoringSettings,
       // Hotfix 0.1.2 (point 3): non sensible - toujours revalide cote agent
       // avant tout usage (jamais fait confiance tel quel, cf. agentBotManager.ts).
-      startUrl: typeof payload?.startUrl === "string" ? payload.startUrl : undefined
+      startUrl: typeof payload?.startUrl === "string" ? payload.startUrl : undefined,
+      extensionLinks
     });
     return;
   }
@@ -334,6 +337,28 @@ const handleCommand = (
     : `Type de commande inconnu de cet agent: ${command.type}.`;
   reporter.failed(command.commandId, "ENGINE_NOT_IMPLEMENTED", message);
   log("warn", `Commande ${command.type} (${command.commandId}) refusee: ${message}`);
+};
+
+const parseExtensionLinks = (raw: unknown): AgentExtensionInstallLink[] => {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  const links: AgentExtensionInstallLink[] = [];
+  for (const item of raw.slice(0, 20)) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const entry = item as Record<string, unknown>;
+    const id = Number(entry.id);
+    const name = typeof entry.name === "string" ? entry.name.trim().slice(0, 160) : "Extension";
+    const installUrl = typeof entry.installUrl === "string" ? entry.installUrl.trim() : "";
+    if (!Number.isFinite(id) || !installUrl) {
+      continue;
+    }
+    links.push({ id, name: name || "Extension", installUrl });
+  }
+  return links;
 };
 
 main().catch((error) => {

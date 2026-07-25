@@ -7,7 +7,7 @@ import { Browser, Page } from "playwright";
 import { BrowserProfileLease, pinInstalledExtensions } from "./browserProfileService.js";
 import { launchBrowser } from "./shared/browser.js";
 import { loadConfig } from "./config.js";
-import { clickBookNewAppointment, clickSeConnecter, clickSelectTravelGroup, fillLoginForm } from "./shared/loginFlow.js";
+import { clickBookNewAppointment, clickContinueServiceLevel, clickSeConnecter, clickSelectTravelGroup, fillLoginForm } from "./shared/loginFlow.js";
 import { logger } from "./logger.js";
 import { monitorAppointments, waitForUserToStart } from "./shared/monitor.js";
 import { takeTimestampedScreenshot } from "./shared/screenshot.js";
@@ -51,6 +51,7 @@ const appointmentPagePattern = /\/workflow\/appointment-booking\//i;
 const authPagePattern = /i2-auth\.visas-fr\.tlscontact\.com/i;
 const travelGroupsPagePattern = /\/fr-fr\/travel-groups/i;
 const applicationSummaryPagePattern = /\/workflow\/application-summary/i;
+const serviceLevelPagePattern = /\/workflow\/service-level/i;
 const HUMAN_VALIDATION_TIMEOUT_MS = 2 * 60 * 1000;
 // Le bot retente seul la suite du parcours avant de solliciter l'humain:
 // 3 tentatives courtes, attente de 5 minutes, puis une 4e tentative finale.
@@ -517,7 +518,7 @@ export class BotSession {
     // "quitter travel-groups" s'arrete au premier saut ; on attend plutot d'atteindre
     // une des pages qu'on sait gerer, avec une marge large pour tenir la chaine entiere.
     if (selected) {
-      await this.waitForAnyUrl([applicationSummaryPagePattern, appointmentPagePattern], 40_000);
+      await this.waitForAnyUrl([applicationSummaryPagePattern, serviceLevelPagePattern, appointmentPagePattern], 40_000);
     }
 
     if (this.page.isClosed() || appointmentPagePattern.test(this.page.url())) {
@@ -531,7 +532,18 @@ export class BotSession {
     const booking = await this.tryBookAppointment();
 
     if (booking) {
-      await this.waitForUrlAway(applicationSummaryPagePattern, 15_000);
+      await this.waitForAnyUrl([serviceLevelPagePattern, appointmentPagePattern], 15_000);
+    }
+
+    if (this.page.isClosed() || appointmentPagePattern.test(this.page.url())) {
+      return;
+    }
+
+    if (serviceLevelPagePattern.test(this.page.url())) {
+      const continued = await this.tryContinueServiceLevel();
+      if (continued) {
+        await this.waitForUrlAway(serviceLevelPagePattern, 15_000);
+      }
     }
   }
 
@@ -574,6 +586,19 @@ export class BotSession {
       });
   }
 
+  private async tryContinueServiceLevel(): Promise<boolean> {
+    if (!this.page || this.page.isClosed()) {
+      return false;
+    }
+
+    return clickContinueServiceLevel(this.page, (level, message) => this.log(level, message))
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.log("warn", `Clic automatique sur 'Continuer' impossible: ${message}`);
+        return false;
+      });
+  }
+
   // Contrairement au premier bloc de attemptAutoLogin (qui force une navigation vers
   // /fr-fr/login via clickSeConnecter), cette methode ne reagit qu'a des etats DEJA
   // reconnus sans jamais rien forcer: si la page est dans un etat ambigu (captcha,
@@ -601,6 +626,11 @@ export class BotSession {
 
     if (applicationSummaryPagePattern.test(url)) {
       await this.tryBookAppointment();
+      return true;
+    }
+
+    if (serviceLevelPagePattern.test(url)) {
+      await this.tryContinueServiceLevel();
       return true;
     }
 
