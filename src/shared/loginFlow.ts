@@ -299,13 +299,52 @@ export const clickSelectTravelGroup = async (page: Page, log: LogFn): Promise<bo
 
 const notReservedTextPattern = /non r[ée]serv[ée]/i;
 const bookAppointmentTextPattern = /prendre un nouveau rendez-vous/i;
-const serviceLevelPagePattern = /\/workflow\/service-level/i;
+
+// Patterns d'etat du parcours TLS, partages entre legacy_vm (sessionManager.ts,
+// usage local prive non modifie ici) et l'agent (agentBotManager.ts): permet a
+// l'agent de piloter sa reprise automatique par l'etat REEL de la page courante,
+// comme resumeIfRecognizedState() cote legacy_vm, au lieu d'une sequence figee
+// qui rejouerait des actions non pertinentes (ex. retenter clickSeConnecter/
+// fillLoginForm depuis une page deja avancee dans le parcours). Correctif
+// cible du blocage observe en reel sur /workflow/service-level malgre un lien
+// "Continuer" deja trouvable: la cause n'etait pas un selecteur manquant mais
+// une tentative suivante qui repartait en aveugle vers /fr-fr/login.
+export const authPagePattern = /i2-auth\.visas-fr\.tlscontact\.com/i;
+export const travelGroupsPagePattern = /\/fr-fr\/travel-groups/i;
+export const applicationSummaryPagePattern = /\/workflow\/application-summary/i;
+export const serviceLevelPagePattern = /\/workflow\/service-level/i;
+export const appointmentBookingPathPattern = /\/workflow\/appointment-booking\//i;
 const serviceLevelTitlePattern = /services additionnels|additional services/i;
-// Libelle strict ("Continuer") d'abord, puis des formulations de poursuite
-// plus larges - jamais un mot qui pourrait designer une action destructive/
-// laterale sur cette page ("Ajouter", "Annuler", "Retour", un nom de service):
-// uniquement des tournures qui font avancer vers la prise de rendez-vous.
-const continueTextPattern = /^(continuer|continue|poursuivre|suivant|next)$|continuer vers|prendre.*(rendez-vous|rdv)|r[ée]server|book.*appointment/i;
+
+export const isServiceLevelPage = async (page: Page): Promise<boolean> => {
+  if (page.isClosed()) {
+    return false;
+  }
+  if (serviceLevelPagePattern.test(page.url())) {
+    return true;
+  }
+  const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
+  return serviceLevelTitlePattern.test(bodyText);
+};
+
+// authPagePattern seul ne suffit pas a reconnaitre "une page d'authentification":
+// il ne matche QUE le vrai hostname Keycloak de production
+// (i2-auth.visas-fr.tlscontact.com), jamais une page de connexion equivalente
+// servie ailleurs (fixture locale de test, environnement de recette...).
+// Detection de contenu en repli: presence d'un champ mot de passe visible,
+// exactement le meme signal que fillLoginForm() utilise deja pour remplir le
+// formulaire - garantit que les deux fonctions s'accordent sur ce qu'est
+// "une page d'authentification".
+export const hasVisibleLoginForm = async (page: Page): Promise<boolean> => {
+  if (page.isClosed()) {
+    return false;
+  }
+  const passwordField = page.locator('#password:visible, input[type="password"]:visible').first();
+  return passwordField.isVisible().catch(() => false);
+};
+
+export const isAuthPage = async (page: Page): Promise<boolean> =>
+  authPagePattern.test(page.url()) || (await hasVisibleLoginForm(page));
 
 // Sur "Recapitulatif de la demande" (/workflow/application-summary), le rendez-vous
 // affiche "Non reserve" tant qu'aucune reservation n'existe : il faut alors cliquer
@@ -335,34 +374,246 @@ export const clickBookNewAppointment = async (page: Page, log: LogFn): Promise<b
   return true;
 };
 
+const continueLinkNamePattern = /^continuer$/i;
+
+// Ordre de recherche strict (jamais un bouton generique, jamais "n'importe
+// quel element contenant Continuer" sans validation du href): du plus
+// specifique (id+href) au plus generique (role+libelle). Chaque candidat est
+// ensuite revalide explicitement contre /workflow/appointment-booking/ avant
+// tout clic (cf. performClickContinueServiceLevel), y compris le repli par role.
+const CONTINUE_LINK_SELECTORS = [
+  'a#book-appointment-btn[href*="/workflow/appointment-booking/"]',
+  'a[data-testid="btn-book-appointment"][href*="/workflow/appointment-booking/"]',
+  'a[href*="/workflow/appointment-booking/"]'
+];
+
+type ContinueLinkTarget = { locator: Locator; matchedSelector: string; candidateCount: number };
+
+const resolveContinueLinkTarget = async (page: Page): Promise<ContinueLinkTarget | null> => {
+  for (const selector of CONTINUE_LINK_SELECTORS) {
+    const locator = page.locator(selector);
+    const count = await locator.count().catch(() => 0);
+    if (count > 0) {
+      return { locator: locator.first(), matchedSelector: selector, candidateCount: count };
+    }
+  }
+  const roleLocator = page.getByRole("link", { name: continueLinkNamePattern });
+  const roleCount = await roleLocator.count().catch(() => 0);
+  if (roleCount > 0) {
+    return { locator: roleLocator.first(), matchedSelector: "role=link[name=Continuer] (repli)", candidateCount: roleCount };
+  }
+  return null;
+};
+
+const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 500;
+
+// Journalisation diagnostique jamais sensible: jamais login/mot de passe/
+// cookies/token/query string/DOM complet. Une erreur Playwright brute peut
+// occasionnellement citer un court fragment de balisage (ex. l'element qui
+// intercepte le clic) - on tronque et on masque par prudence supplementaire
+// tout motif ressemblant a un identifiant/secret.
+const sanitizeDiagnosticMessage = (raw: string): string => {
+  const truncated = raw.length > MAX_DIAGNOSTIC_MESSAGE_LENGTH
+    ? `${raw.slice(0, MAX_DIAGNOSTIC_MESSAGE_LENGTH)}...(tronque)`
+    : raw;
+  return truncated
+    .replace(/password=[^&\s"']+/gi, "password=[redacted]")
+    .replace(/token=[^&\s"']+/gi, "token=[redacted]")
+    .replace(/authorization\s*:\s*\S+/gi, "authorization: [redacted]")
+    .replace(/cookie\s*:\s*[^\n]+/gi, "cookie: [redacted]");
+};
+
+const describeUnknownError = (error: unknown): { className: string; message: string } => ({
+  className: error instanceof Error ? error.constructor.name : typeof error,
+  message: sanitizeDiagnosticMessage(error instanceof Error ? error.message : String(error))
+});
+
+const hrefPathnameOf = (rawHref: string | null, baseUrl: string): string => {
+  if (!rawHref) {
+    return "(absent)";
+  }
+  try {
+    return new URL(rawHref, baseUrl).pathname;
+  } catch {
+    return "(invalide)";
+  }
+};
+
+const resolveAbsoluteHref = (rawHref: string | null, baseUrl: string): URL | null => {
+  if (!rawHref) {
+    return null;
+  }
+  try {
+    return new URL(rawHref, baseUrl);
+  } catch {
+    return null;
+  }
+};
+
+// Validation stricte partagee par le controle pre-clic ET le repli par
+// navigation (jamais deux logiques divergentes): protocole http(s), MEME
+// origine que la page courante, et chemin contenant exactement
+// /workflow/appointment-booking/. Exportee pour etre testee directement
+// (refus d'une origine externe, refus d'un chemin incorrect) sans avoir a
+// declencher tout le cycle clic-echoue-puis-repli.
+export const isAllowedAppointmentBookingRedirect = (absoluteTarget: URL, currentPageUrl: string): boolean => {
+  const protocolOk = absoluteTarget.protocol === "http:" || absoluteTarget.protocol === "https:";
+  let sameOrigin = false;
+  try {
+    sameOrigin = new URL(currentPageUrl).origin === absoluteTarget.origin;
+  } catch {
+    sameOrigin = false;
+  }
+  const pathnameOk = appointmentBookingPathPattern.test(absoluteTarget.pathname);
+  return protocolOk && sameOrigin && pathnameOk;
+};
+
+// Repli de derniere instance UNIQUEMENT si l'element exact a deja ete trouve
+// ET son href deja strictement valide (avant cet appel) mais que le clic
+// Playwright lui-meme a echoue (overlay, barre sticky en mouvement, element
+// detache pendant un rerender...): jamais utilise pour ignorer un paiement,
+// un CAPTCHA, Cloudflare, ou pour selectionner/confirmer quoi que ce soit -
+// la cible est TOUJOURS exactement celle du href deja affiche a l'utilisateur,
+// revalidee ici une seconde fois avant de naviguer.
+const attemptControlledHrefFallback = async (
+  page: Page,
+  absoluteTarget: URL,
+  currentPageUrl: string,
+  log: LogFn
+): Promise<boolean> => {
+  if (!isAllowedAppointmentBookingRedirect(absoluteTarget, currentPageUrl)) {
+    log("warn", "Repli par navigation controlee refuse: cible non conforme (origine/protocole/chemin invalide).");
+    return false;
+  }
+
+  try {
+    await page.goto(absoluteTarget.toString(), { waitUntil: "domcontentloaded", timeout: 20_000 });
+    log("warn", "Repli par navigation controlee utilise (le clic Playwright avait echoue mais la cible etait strictement validee: meme origine, http(s), /workflow/appointment-booking/).");
+    return true;
+  } catch (error) {
+    const { className, message } = describeUnknownError(error);
+    log("warn", `Repli par navigation controlee egalement en echec (${className}): ${message}`);
+    return false;
+  }
+};
+
+// Deduplication: une meme Page ne doit jamais subir deux tentatives
+// concurrentes de clic "Continuer" (ex. VALIDATE_BOT manuel declenche pendant
+// qu'une reprise automatique est deja en cours sur la meme page) - la seconde
+// attend et reutilise le resultat de la premiere plutot que de cliquer une
+// seconde fois.
+const serviceLevelTransitionInFlight = new WeakMap<Page, Promise<boolean>>();
+
 // TLScontact insere parfois une etape "Services additionnels" avant la page
 // appointment-booking. Tant qu'aucun service optionnel n'est selectionne par
 // RendezBot, le seul geste metier attendu est de continuer vers l'etape de
 // prise de rendez-vous.
-export const clickContinueServiceLevel = async (page: Page, log: LogFn): Promise<boolean> => {
-  const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
-  if (!serviceLevelPagePattern.test(page.url()) && !serviceLevelTitlePattern.test(bodyText)) {
+//
+// HOTFIX CIBLE (service-level bloque malgre un lien "Continuer" deja valide
+// et deja trouvable en reel): l'ancienne version avalait toute erreur du clic
+// dans un .catch(() => false), masquant la vraie cause (timeout, element
+// intercepte, non actionnable, navigation en cours...) derriere le seul
+// message "bouton introuvable" - alors que l'element etait present. Cette
+// version conserve et journalise l'erreur reelle (sans donnee sensible),
+// verifie l'actionnabilite avant de cliquer (trial click), ne considere le
+// clic reussi qu'apres confirmation de la navigation vers appointment-booking,
+// et ne se rabat sur une navigation directe que si la cible a ete strictement
+// validee (meme origine, http(s), chemin exact).
+const performClickContinueServiceLevel = async (page: Page, log: LogFn): Promise<boolean> => {
+  if (!(await isServiceLevelPage(page))) {
     return false;
   }
 
-  // Priorite au repere structurel deja observe en reel sur cette etape
-  // (id/data-testid, ou lien pointant explicitement vers l'etape suivante du
-  // parcours) : insensible au libelle exact ou a la langue, donc plus fiable
-  // qu'un texte. Confirme via DevTools sur un test reel (cf.
-  // artifacts/logs/agent.log du 2026-07-25) que ce "Continuer" est en realite
-  // un <a href="/workflow/appointment-booking/..."> (role="link"), pas un
-  // <button> - d'ou aussi la recherche sur les deux roles en repli texte.
-  const continueButton = page.locator('#book-appointment-btn:visible, [data-testid="btn-book-appointment"]:visible, a[href*="/workflow/appointment-booking/"]:visible')
-    .or(page.getByRole("button", { name: continueTextPattern }))
-    .or(page.getByRole("link", { name: continueTextPattern }))
-    .or(page.locator("button, a").filter({ hasText: continueTextPattern }))
-    .first();
-
-  if (!(await clickLocatorIfVisible(continueButton, 5_000).catch(() => false))) {
-    log("warn", "Etape services additionnels detectee mais bouton 'Continuer' introuvable.");
+  const target = await resolveContinueLinkTarget(page);
+  if (!target) {
+    log("warn", "Etape services additionnels detectee mais aucun lien 'Continuer' valide (vers /workflow/appointment-booking/) n'a ete trouve.");
     return false;
   }
 
-  log("success", "Etape services additionnels detectee: clic automatique sur 'Continuer'.");
+  const currentPageUrl = page.url();
+  const rawHref = await target.locator.getAttribute("href").catch(() => null);
+  const absoluteTarget = resolveAbsoluteHref(rawHref, currentPageUrl);
+  if (!absoluteTarget || !isAllowedAppointmentBookingRedirect(absoluteTarget, currentPageUrl)) {
+    log(
+      "warn",
+      `Lien 'Continuer' trouve (${target.matchedSelector}) mais sa cible n'est pas strictement validee `
+      + `(meme origine http(s) + /workflow/appointment-booking/ attendus; pathname obtenu: ${hrefPathnameOf(rawHref, currentPageUrl)}): clic refuse.`
+    );
+    return false;
+  }
+
+  // Diagnostic avant clic (jamais de donnee sensible: ni login/mot de passe,
+  // ni cookies/token, ni query string, ni DOM complet - uniquement des
+  // attributs structurels publics de l'element candidat).
+  const [tagName, id, dataTestId, visible, enabled, boundingBox] = await Promise.all([
+    target.locator.evaluate((el) => el.tagName).catch(() => "?"),
+    target.locator.getAttribute("id").catch(() => null),
+    target.locator.getAttribute("data-testid").catch(() => null),
+    target.locator.isVisible().catch(() => false),
+    target.locator.isEnabled().catch(() => false),
+    target.locator.boundingBox().catch(() => null)
+  ]);
+  log(
+    "info",
+    `Etape services additionnels: candidat 'Continuer' trouve via ${target.matchedSelector} `
+    + `(candidats=${target.candidateCount}, tag=${tagName}, id=${id ?? "(absent)"}, `
+    + `data-testid=${dataTestId ?? "(absent)"}, visible=${visible}, enabled=${enabled}, `
+    + `href-pathname=${absoluteTarget.pathname}, bbox=${boundingBox ? "oui" : "absente"}).`
+  );
+
+  let clickOutcome: { ok: true } | { ok: false; className: string; message: string };
+  try {
+    await target.locator.waitFor({ state: "visible", timeout: 5_000 });
+    await target.locator.scrollIntoViewIfNeeded({ timeout: 5_000 });
+    if (!(await target.locator.isVisible()) || !(await target.locator.isEnabled())) {
+      throw new Error("Element non actionnable (visible/enabled=false apres attente).");
+    }
+    // Trial: detecte une erreur d'actionnabilite (overlay, interception par
+    // la barre sticky, element instable) SANS declencher la navigation,
+    // avant le vrai clic - jamais avale silencieusement.
+    await target.locator.click({ trial: true, timeout: 5_000 });
+    await target.locator.click({ timeout: 5_000 });
+    clickOutcome = { ok: true };
+  } catch (error) {
+    clickOutcome = { ok: false, ...describeUnknownError(error) };
+  }
+
+  if (!clickOutcome.ok) {
+    log("warn", `Clic Playwright sur 'Continuer' (services additionnels) echoue (${clickOutcome.className}): ${clickOutcome.message}.`);
+    const fallbackOk = await attemptControlledHrefFallback(page, absoluteTarget, currentPageUrl, log);
+    if (!fallbackOk) {
+      return false;
+    }
+  } else {
+    // Le clic n'ayant pas leve d'exception, on attend encore la confirmation
+    // reelle de la navigation - jamais un succes suppose du seul fait que
+    // click() n'a pas jete d'erreur (point explicitement corrige ici).
+    await page.waitForURL(appointmentBookingPathPattern, { timeout: 20_000 }).catch(() => undefined);
+  }
+
+  if (!appointmentBookingPathPattern.test(page.url())) {
+    log("warn", "Clic/navigation 'Continuer' effectue mais la page appointment-booking n'a jamais ete atteinte.");
+    return false;
+  }
+
+  log("success", "Etape services additionnels: 'Continuer' confirme, page appointment-booking atteinte.");
   return true;
+};
+
+export const clickContinueServiceLevel = async (page: Page, log: LogFn): Promise<boolean> => {
+  const inFlight = serviceLevelTransitionInFlight.get(page);
+  if (inFlight) {
+    log("info", "Transition 'Continuer' (services additionnels) deja en cours pour cette page: attente du resultat en cours plutot qu'un second clic.");
+    return inFlight;
+  }
+
+  const attempt = performClickContinueServiceLevel(page, log);
+  serviceLevelTransitionInFlight.set(page, attempt);
+  try {
+    return await attempt;
+  } finally {
+    if (serviceLevelTransitionInFlight.get(page) === attempt) {
+      serviceLevelTransitionInFlight.delete(page);
+    }
+  }
 };

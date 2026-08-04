@@ -24,6 +24,7 @@
     "test:agent:release:simulated": "tsx scripts/test-agent-release-simulated.ts",
     "test:agent:release:integration": "tsx scripts/test-agent-release-integration.ts",
     "test:agent:hotfix-autologin:real": "tsx scripts/test-agent-hotfix-autologin-real.ts",
+    "test:agent:service-level-hotfix:real": "tsx scripts/test-agent-service-level-hotfix-real.ts",
     "test:agent:cloudflare-diagnostic:real": "tsx scripts/test-agent-cloudflare-diagnostic-real.ts",
     "test:agent:profile-pool:simulated": "tsx scripts/test-agent-profile-pool-simulated.ts",
     "test:agent:delete-history:simulated": "tsx scripts/test-agent-delete-history-simulated.ts",

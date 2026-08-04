@@ -1,4 +1,14 @@
-import { clickBookNewAppointment, clickContinueServiceLevel, clickSeConnecter, clickSelectTravelGroup, fillLoginForm } from "../shared/loginFlow.js";
+import {
+  applicationSummaryPagePattern,
+  clickBookNewAppointment,
+  clickContinueServiceLevel,
+  clickSeConnecter,
+  clickSelectTravelGroup,
+  fillLoginForm,
+  isAuthPage,
+  isServiceLevelPage,
+  travelGroupsPagePattern
+} from "../shared/loginFlow.js";
 import { closeBrowserWithTimeout, killChromeProcess, launchChromeForBot } from "./agentBrowserManager.js";
 import { loadExtensionConfig, validateExtensions } from "./agentExtensionConfig.js";
 import { getConfigDir } from "./agentStorage.js";
@@ -508,91 +518,168 @@ export class AgentBotManager {
     // Diagnostic Cloudflare (sequence de navigation): l'ancien flux
     // (sessionManager.ts, resumeIfRecognizedState) ne relance JAMAIS une
     // action sur une page dans un etat ambigu/bloque - il attend, sans rien
-    // forcer. La cascade ci-dessous relancait au contraire clickSeConnecter/
-    // fillLoginForm inconditionnellement a chaque tentative, y compris sur
-    // une page de blocage Cloudflare deja affichee (une deuxieme navigation/
-    // soumission automatique en quelques secondes, jamais vue par l'ancien
-    // flux). Ces deux drapeaux corrigent precisement cela: jamais deux
-    // soumissions sur la meme page/etat, et arret definitif (WAITING_FOR_USER,
-    // jamais de nouvel essai) des qu'un blocage Cloudflare est constate.
+    // forcer. Un blocage Cloudflare constate arrete definitivement les
+    // tentatives automatiques (jamais de nouvelle soumission sur la meme
+    // page bloquee, jamais de retour au login, jamais d'attente longue puis
+    // tentative finale qui ne ferait que re-soumettre sur la meme page).
     let blockedByCloudflare = false;
     let lastSubmittedPageUrl: string | null = null;
 
-    const attemptOnce = async (): Promise<boolean> => {
-      if (!stillRunning() || !handle.browser.isConnected() || !handle.page || handle.page.isClosed()) {
-        return false;
-      }
-      if (await isAtAppointmentPage()) {
-        return true;
+    // HOTFIX CIBLE (service-level bloque malgre un lien "Continuer" valide et
+    // deja trouvable en reel): l'ancienne cascade rejouait INCONDITIONNELLEMENT
+    // clickSeConnecter -> fillLoginForm -> clickSelectTravelGroup ->
+    // clickBookNewAppointment -> clickContinueServiceLevel a CHAQUE tentative,
+    // meme depuis une page deja avancee dans le parcours (ex. deja sur
+    // service-level): une tentative relancait alors une navigation vers
+    // /fr-fr/login avant meme d'essayer de cliquer "Continuer", perdant l'etat
+    // deja atteint (confirme en reel: artifacts/logs/agent.log du 2026-07-25,
+    // "Navigation directe vers /fr-fr/login impossible" suivi d'un nouvel echec
+    // identique sur service-level). dispatchOnState() remplace cette sequence
+    // figee par un pilotage par etat courant, calque sur
+    // resumeIfRecognizedState() (sessionManager.ts): une seule action, celle
+    // pertinente pour la page REELLEMENT affichee.
+    //
+    // Etats geres :
+    //   B. service-level        -> clickContinueServiceLevel (uniquement)
+    //   C. travel-groups        -> clickSelectTravelGroup (uniquement)
+    //   D. application-summary  -> clickBookNewAppointment (uniquement)
+    //   E. page d'authentification (i2-auth) -> fillLoginForm (uniquement)
+    //   F. page d'accueil/TARGET_URL: UNIQUEMENT la premiere etape non
+    //      reconnue de CETTE tentative -> clickSeConnecter (jamais une
+    //      deuxieme fois dans la meme tentative: c'est precisement le defaut
+    //      corrige ici)
+    //   H. etat inconnu (toute etape suivante non reconnue dans la meme
+    //      tentative) -> aucune action forcee, attente breve puis reevaluation.
+    // Cloudflare (G) et la page de rendez-vous (A) restent geres en dehors de
+    // dispatchOnState (respectivement isCloudflareBlockedPage ci-dessous et
+    // isAtAppointmentPage ci-dessus/dans la boucle de pas).
+    type StateDispatchOutcome = "confirmed" | "attempted" | "none";
+
+    const dispatchOnState = async (
+      page: import("playwright").Page,
+      initialLoginState: { attempted: boolean }
+    ): Promise<StateDispatchOutcome> => {
+      const url = page.url();
+
+      if (await isServiceLevelPage(page)) {
+        const advanced = await clickContinueServiceLevel(page, navLog).catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          navLog("warn", `Erreur inattendue (non geree par clickContinueServiceLevel) lors du clic 'Continuer': ${message}`);
+          return false;
+        });
+        return advanced ? "confirmed" : "attempted";
       }
 
-      // Extension locale configuree: jamais de remplissage de formulaire
-      // injecte par l'agent (risque d'interference avec ce que l'extension
-      // fait elle-meme) - seule l'attente/reprise du contexte est reeditee.
-      if (hasLocalExtension) {
-        return false;
+      if (applicationSummaryPagePattern.test(url)) {
+        await clickBookNewAppointment(page, navLog).catch(() => false);
+        return "attempted";
       }
 
-      const page = handle.page;
-
-      if (await isCloudflareBlockedPage(page).catch(() => false)) {
-        navLog("warn", "Page de blocage Cloudflare detectee. Aucune nouvelle tentative automatique ne sera effectuee.");
-        blockedByCloudflare = true;
-        return false;
+      if (travelGroupsPagePattern.test(url)) {
+        await clickSelectTravelGroup(page, navLog).catch(() => false);
+        return "attempted";
       }
 
-      // Une seule soumission par page/etat: si la page actuelle est
-      // exactement celle laissee par la soumission precedente (aucun
-      // changement depuis), ne resoumet jamais en aveugle une seconde fois -
-      // attend simplement un changement eventuel (rechargement manuel,
-      // redirection differee...) plutot que de multiplier les soumissions.
-      // Compare l'URL AVANT toute action de cette tentative a l'URL
-      // CONSTATEE APRES la derniere soumission (jamais l'URL d'avant cette
-      // derniere soumission, qui differerait toujours d'une navigation -
-      // piege constate empiriquement lors de la validation de ce correctif).
-      const urlBeforeThisAttempt = page.url();
-      if (lastSubmittedPageUrl !== null && urlBeforeThisAttempt === lastSubmittedPageUrl) {
-        navLog("info", "Formulaire deja soumis sur cette page sans changement detecte depuis: nouvelle soumission ignoree.");
-        return false;
-      }
-
-      await clickSeConnecter(page, navLog).catch(() => false);
-      if (page.isClosed() || !stillRunning()) {
-        return false;
-      }
-
-      if (login && password) {
+      if (await isAuthPage(page)) {
+        if (!(login && password)) {
+          return "none";
+        }
+        // Une seule soumission par page/etat: si la page actuelle est
+        // exactement celle laissee par la soumission precedente (aucun
+        // changement depuis), ne resoumet jamais en aveugle une seconde fois.
+        if (lastSubmittedPageUrl !== null && url === lastSubmittedPageUrl) {
+          navLog("info", "Formulaire deja soumis sur cette page sans changement detecte depuis: nouvelle soumission ignoree.");
+          return "none";
+        }
         await fillLoginForm(page, login, password, navLog).catch(() => false);
         lastSubmittedPageUrl = page.url();
-      }
-      if (page.isClosed() || !stillRunning()) {
-        return false;
-      }
-      if (await waitForAppointmentPageOrTimeout(AUTO_NAV_STEP_SETTLE_MS)) {
-        return true;
+        return "attempted";
       }
 
-      await clickSelectTravelGroup(page, navLog).catch(() => false);
-      if (page.isClosed() || !stillRunning()) {
-        return false;
-      }
-      if (await waitForAppointmentPageOrTimeout(AUTO_NAV_STEP_SETTLE_MS)) {
-        return true;
+      if (!initialLoginState.attempted) {
+        initialLoginState.attempted = true;
+        await clickSeConnecter(page, navLog).catch(() => false);
+        return "attempted";
       }
 
-      await clickBookNewAppointment(page, navLog).catch(() => false);
+      // Etat H: aucune des etapes reconnues (B-E) ni la premiere tentative de
+      // connexion (F) ne s'applique. Jamais de navigation forcee vers le
+      // login ici (c'est precisement le defaut corrige par ce hotfix): on
+      // attend brievement une eventuelle navigation SPA deja en cours, puis
+      // on reevalue une seule fois avant d'abandonner cette tentative.
+      navLog("warn", `Etat de page non reconnu (${maskUrlForLog(url)}). Attente breve puis reevaluation avant abandon de cette tentative.`);
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
       if (page.isClosed() || !stillRunning()) {
-        return false;
+        return "none";
       }
-      if (await waitForAppointmentPageOrTimeout(AUTO_NAV_STEP_SETTLE_MS)) {
-        return true;
+      return page.url() === url ? "none" : "attempted";
+    };
+
+    // Borne haute de defense (jamais atteinte en pratique: le parcours
+    // complet home->auth->travel-groups->application-summary/service-level->
+    // appointment-booking tient en 4-5 pas) - un etat H repete abandonne des
+    // le 2e pas de toute facon (initialLoginState.attempted deja vrai).
+    const MAX_STATE_STEPS_PER_ATTEMPT = 8;
+
+    const attemptOnce = async (): Promise<boolean> => {
+      const initialLoginState = { attempted: false };
+      // Garde-fou anti-repetition: si une action a deja ete tentee sur cette
+      // EXACTE url (le clic/remplissage a echoue sans faire bouger la page),
+      // rejouer la meme action sur la meme page n'aidera jamais - on arrete
+      // cette tentative plutot que de marteler jusqu'a MAX_STATE_STEPS_PER_ATTEMPT
+      // fois la meme action (defaut constate en reel: jusqu'a 13 clics
+      // "Continuer" rapproches sur une page de service-level bloquee avant
+      // qu'un crash Chrome ne survienne - jamais acceptable, y compris pour
+      // la simple charge que cela represente sur le vrai site).
+      let lastDispatchedUrl: string | null = null;
+
+      for (let step = 0; step < MAX_STATE_STEPS_PER_ATTEMPT; step += 1) {
+        if (!stillRunning() || !handle.browser.isConnected() || !handle.page || handle.page.isClosed()) {
+          return false;
+        }
+        if (await isAtAppointmentPage()) {
+          return true;
+        }
+
+        // Extension locale configuree: jamais de remplissage de formulaire
+        // injecte par l'agent (risque d'interference avec ce que l'extension
+        // fait elle-meme) - seule l'attente/reprise du contexte est reeditee.
+        if (hasLocalExtension) {
+          return false;
+        }
+
+        const page = handle.page;
+
+        if (await isCloudflareBlockedPage(page).catch(() => false)) {
+          navLog("warn", "Page de blocage Cloudflare detectee. Aucune nouvelle tentative automatique ne sera effectuee.");
+          blockedByCloudflare = true;
+          return false;
+        }
+
+        const urlBeforeStep = page.url();
+        if (lastDispatchedUrl !== null && urlBeforeStep === lastDispatchedUrl) {
+          navLog("warn", `Etat inchange apres la derniere action sur cette page (${maskUrlForLog(urlBeforeStep)}): abandon de cette tentative plutot que de repeter la meme action.`);
+          return false;
+        }
+
+        const outcome = await dispatchOnState(page, initialLoginState);
+        if (outcome === "confirmed") {
+          return true;
+        }
+        if (outcome === "none") {
+          return false;
+        }
+        lastDispatchedUrl = urlBeforeStep;
+
+        if (page.isClosed() || !stillRunning()) {
+          return false;
+        }
+        if (await waitForAppointmentPageOrTimeout(AUTO_NAV_STEP_SETTLE_MS)) {
+          return true;
+        }
       }
 
-      await clickContinueServiceLevel(page, navLog).catch(() => false);
-      if (page.isClosed() || !stillRunning()) {
-        return false;
-      }
-      return waitForAppointmentPageOrTimeout(AUTO_NAV_STEP_SETTLE_MS);
+      return false;
     };
 
     for (let attempt = 1; attempt <= AUTO_NAV_FINAL_ATTEMPT; attempt += 1) {
