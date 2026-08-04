@@ -9,6 +9,7 @@ type LogFn = (level: MonitorEventLevel, message: string) => void;
 const loginLinkSelector = 'a[href="/fr-fr/login"]:visible';
 const dropdownToggleSelector = '[aria-label="Dropdown selector"] [role="listitem"]';
 const directLoginTextPattern = /^se connecter$/i;
+export const loginPathPattern = /\/fr-fr\/login/i;
 
 // locator.isVisible({timeout}) n'attend pas reellement (l'option timeout y est
 // ignoree par Playwright) : on utilise waitFor(), qui poll pour de vrai, avant de
@@ -46,10 +47,47 @@ const isSafeNavigationBase = (rawUrl: string): boolean => {
   }
 };
 
+// HOTFIX CIBLE 0.1.9 (agent bloque sur la page d'accueil malgre un lien 'Se
+// connecter' reel et cliquable, confirme par DevTools): cette fonction
+// declarait un succes des que page.goto() ne levait aucune exception, sans
+// jamais verifier que la navigation avait REELLEMENT atteint /fr-fr/login (ou
+// une etape d'authentification reconnue). Or une navigation directe (goto,
+// sans evenement de clic reel ni Referer de page) peut tres bien "reussir"
+// techniquement (aucune erreur Playwright, domcontentloaded declenche) tout
+// en etant silencieusement renvoyee vers la page d'origine par le site
+// (redirection cote serveur/anti-bot, garde SPA) - Playwright suit cette
+// redirection sans jamais la signaler comme une erreur. Le defaut constate en
+// reel correspond exactement a ce cas: clickSeConnecter() se croyait deja
+// reussi via ce seul chemin et n'essayait donc jamais le clic direct sur le
+// vrai lien (pourtant present et fonctionnel d'apres DevTools). On verifie
+// desormais l'etat REELLEMENT atteint apres le goto, avec une courte
+// attente (la page peut avoir besoin d'un instant pour s'hydrater/rediriger),
+// avant de declarer un succes - sinon on se rabat sur les chemins de clic
+// direct ci-dessous, qui simulent un vrai geste utilisateur.
+const CONFIRM_LOGIN_REACHED_TIMEOUT_MS = 4_000;
+const hasReachedLoginOrAuth = async (page: Page): Promise<boolean> => {
+  const deadline = Date.now() + CONFIRM_LOGIN_REACHED_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (page.isClosed()) {
+      return false;
+    }
+    const url = page.url();
+    if (loginPathPattern.test(url) || authPagePattern.test(url)) {
+      return true;
+    }
+    if (await hasVisibleLoginForm(page)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return false;
+};
+
 // Le lien "Se connecter" pointe toujours vers /fr-fr/login, que ce soit en fenetre
 // large (visible directement) ou etroite (derriere un menu compte qui, en pratique,
 // se referme parfois avant qu'on ait pu cliquer dedans). Naviguer directement vers
-// cette URL connue evite toute dependance a ce menu deroulant peu fiable.
+// cette URL connue evite toute dependance a ce menu deroulant peu fiable - mais
+// seulement si elle atteint reellement sa cible (cf. hasReachedLoginOrAuth ci-dessus).
 const navigateToLogin = async (page: Page, log: LogFn): Promise<boolean> => {
   const currentUrl = page.url();
   if (!isSafeNavigationBase(currentUrl)) {
@@ -57,16 +95,26 @@ const navigateToLogin = async (page: Page, log: LogFn): Promise<boolean> => {
     return false;
   }
 
+  const target = new URL("/fr-fr/login", currentUrl).toString();
   try {
-    const target = new URL("/fr-fr/login", currentUrl).toString();
     await page.goto(target, { waitUntil: "domcontentloaded", timeout: 8_000 });
-    log("success", `Navigation directe vers ${target}.`);
-    return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     log("warn", `Navigation directe vers /fr-fr/login impossible: ${message}`);
     return false;
   }
+
+  if (await hasReachedLoginOrAuth(page)) {
+    log("success", `Navigation directe vers ${target}.`);
+    return true;
+  }
+
+  log(
+    "warn",
+    `Navigation directe vers /fr-fr/login sans effet reel (URL obtenue: ${page.url()}). `
+    + "Repli sur le clic direct du lien 'Se connecter'."
+  );
+  return false;
 };
 
 export const clickSeConnecter = async (page: Page, log: LogFn): Promise<boolean> => {

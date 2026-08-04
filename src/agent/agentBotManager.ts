@@ -7,6 +7,7 @@ import {
   fillLoginForm,
   isAuthPage,
   isServiceLevelPage,
+  loginPathPattern,
   travelGroupsPagePattern
 } from "../shared/loginFlow.js";
 import { closeBrowserWithTimeout, killChromeProcess, launchChromeForBot } from "./agentBrowserManager.js";
@@ -557,6 +558,86 @@ export class AgentBotManager {
     // isAtAppointmentPage ci-dessus/dans la boucle de pas).
     type StateDispatchOutcome = "confirmed" | "attempted" | "none";
 
+    // HOTFIX CIBLE 0.1.9 (agent bloque sur la page d'accueil malgre un lien
+    // 'Se connecter' reel, confirme par DevTools): avant la toute premiere
+    // action d'une tentative, journalise l'etat REEL du contexte Chrome
+    // pilote - jamais de donnee sensible (cookies/login/mot de passe), une
+    // URL toujours masquee via maskUrlForLog. Objectif: confirmer que
+    // Playwright pilote bien l'onglet visible affichant la page TLS attendue,
+    // et non un autre onglet (profil persistant reutilise, restauration de
+    // session Chrome apres un arret force taskkill /F).
+    const logDrivenPageDiagnostics = async (): Promise<void> => {
+      if (!handle.browser.isConnected()) {
+        return;
+      }
+      const pages = handle.context.pages();
+      navLog(
+        "info",
+        `Diagnostic pages pilotees avant premiere action: handle.page=${maskUrlForLog(handle.page.url())}, `
+        + `total onglets=${pages.length}.`
+      );
+      for (let index = 0; index < pages.length; index += 1) {
+        const candidate = pages[index];
+        const closed = candidate.isClosed();
+        const visibilityState = closed
+          ? "(fermee)"
+          : await candidate.evaluate(() => document.visibilityState).catch(() => "(indetermine)");
+        navLog(
+          "info",
+          `  onglet[${index}] url=${closed ? "(fermee)" : maskUrlForLog(candidate.url())} `
+          + `isClosed=${closed} estHandlePage=${candidate === handle.page} visibilityState=${visibilityState}.`
+        );
+      }
+    };
+
+    // Attente explicite, apres un clic 'Se connecter' reellement execute, de
+    // l'une des etapes TLS reconnues - jamais uniquement appointment-booking
+    // (defaut corrige: home->auth est deja une progression reelle, pas
+    // seulement l'arrivee finale sur la page de rendez-vous).
+    const RECOGNIZED_STATE_WAIT_MS = 12_000;
+    const detectRecognizedState = async (page: import("playwright").Page): Promise<string | null> => {
+      if (page.isClosed()) {
+        return null;
+      }
+      const url = page.url();
+      if (loginPathPattern.test(url)) {
+        return "login";
+      }
+      if (travelGroupsPagePattern.test(url)) {
+        return "travel-groups";
+      }
+      if (applicationSummaryPagePattern.test(url)) {
+        return "application-summary";
+      }
+      if (await isServiceLevelPage(page).catch(() => false)) {
+        return "service-level";
+      }
+      if (await isAtAppointmentPage()) {
+        return "appointment-booking";
+      }
+      if (await isAuthPage(page).catch(() => false)) {
+        return "auth";
+      }
+      if (await isCloudflareBlockedPage(page).catch(() => false)) {
+        return "cloudflare";
+      }
+      return null;
+    };
+    const waitForRecognizedStateOrTimeout = async (page: import("playwright").Page, timeoutMs: number): Promise<string | null> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const state = await detectRecognizedState(page);
+        if (state) {
+          return state;
+        }
+        if (page.isClosed() || !stillRunning()) {
+          return null;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+      return detectRecognizedState(page);
+    };
+
     const dispatchOnState = async (
       page: import("playwright").Page,
       initialLoginState: { attempted: boolean }
@@ -600,7 +681,47 @@ export class AgentBotManager {
 
       if (!initialLoginState.attempted) {
         initialLoginState.attempted = true;
-        await clickSeConnecter(page, navLog).catch(() => false);
+        const urlBeforeClick = page.url();
+        // HOTFIX CIBLE 0.1.9: le resultat de clickSeConnecter() etait avale
+        // (.catch(() => false) puis totalement ignore) - un clic/une
+        // navigation qui echouait reellement (site injoignable, element non
+        // actionnable, mauvaise page ciblee...) etait tout de meme rapporte
+        // comme "attempted" au meme titre qu'un succes. Le garde-fou
+        // lastDispatchedUrl (ci-dessous, dans attemptOnce) constatait alors
+        // que l'URL n'avait pas change et abandonnait la tentative SANS
+        // jamais journaliser la vraie cause - defaut confirme en reel
+        // (agent bloque sur la page d'accueil malgre un lien reel et
+        // cliquable d'apres DevTools).
+        const connected = await clickSeConnecter(page, navLog).catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          navLog("warn", `Erreur inattendue (non geree par clickSeConnecter) lors du clic 'Se connecter': ${message}`);
+          return false;
+        });
+        if (!connected) {
+          navLog(
+            "warn",
+            `clickSeConnecter() a echoue reellement (connected=false, URL avant=${maskUrlForLog(urlBeforeClick)}, `
+            + `URL apres=${maskUrlForLog(page.url())}): aucune action n'a fait progresser cette page. `
+            + "Abandon de cette tentative (reprise controlee a la tentative suivante) plutot que de pretendre un succes."
+          );
+          return "none";
+        }
+        navLog(
+          "info",
+          `clickSeConnecter() execute avec succes (connected=true, URL avant=${maskUrlForLog(urlBeforeClick)}, `
+          + `URL immediatement apres=${maskUrlForLog(page.url())}). Attente d'une etape TLS reconnue `
+          + "(login/auth/travel-groups/service-level/application-summary/appointment-booking), pas uniquement appointment-booking."
+        );
+        const reachedState = await waitForRecognizedStateOrTimeout(page, RECOGNIZED_STATE_WAIT_MS);
+        if (reachedState) {
+          navLog("success", `Progression confirmee apres clickSeConnecter(): etape '${reachedState}' atteinte (URL=${maskUrlForLog(page.url())}).`);
+        } else {
+          navLog(
+            "warn",
+            `clickSeConnecter() execute (connected=true) mais aucune etape TLS reconnue atteinte apres `
+            + `${Math.round(RECOGNIZED_STATE_WAIT_MS / 1000)}s (URL actuelle=${maskUrlForLog(page.url())}).`
+          );
+        }
         return "attempted";
       }
 
@@ -656,6 +777,10 @@ export class AgentBotManager {
           navLog("warn", "Page de blocage Cloudflare detectee. Aucune nouvelle tentative automatique ne sera effectuee.");
           blockedByCloudflare = true;
           return false;
+        }
+
+        if (step === 0) {
+          await logDrivenPageDiagnostics();
         }
 
         const urlBeforeStep = page.url();
