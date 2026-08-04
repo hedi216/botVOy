@@ -220,7 +220,12 @@ export const AGENT_COMMAND_ERROR_CODES = [
   // ne prend le relais - jamais de tentative de navigation relative depuis
   // about:blank (cf. src/shared/loginFlow.ts), jamais de boucle silencieuse
   // de plusieurs minutes sur une configuration structurellement impossible.
-  "TLS_START_URL_INVALID"
+  "TLS_START_URL_INVALID",
+  // Hotfix critique (isolation des profils par compte TLS): un profil deja
+  // attribue a ce compte (cf. agentProfileManager.ts:
+  // acquireProfileLockForAccount) est actuellement verrouille par un autre
+  // bot de CE MEME compte - jamais un second Chrome sur le meme profil.
+  "TLS_ACCOUNT_ALREADY_RUNNING"
 ] as const;
 
 export type AgentCommandErrorCode = typeof AGENT_COMMAND_ERROR_CODES[number];

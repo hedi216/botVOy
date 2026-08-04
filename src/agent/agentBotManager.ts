@@ -13,7 +13,7 @@ import { closeBrowserWithTimeout, killChromeProcess, launchChromeForBot } from "
 import { loadExtensionConfig, validateExtensions } from "./agentExtensionConfig.js";
 import { getConfigDir } from "./agentStorage.js";
 import { findAppointmentPage, isCloudflareBlockedPage, maskUrlForLog } from "./agentPageDetector.js";
-import { acquirePooledProfileLock, ProfileLease } from "./agentProfileManager.js";
+import { acquireProfileLockForAccount, ProfileLease } from "./agentProfileManager.js";
 import { AgentCommandError, toAgentCommandError } from "./agentErrors.js";
 import { AgentEventReporter } from "./agentEventReporter.js";
 import { AgentLogFn } from "./agentLocalLogger.js";
@@ -207,8 +207,10 @@ export class AgentBotManager {
 
       // Diagnostic Cloudflare (profils): pool local persistant (profile-01,
       // profile-02, ...) plutot qu'un profil jetable par botId - cf.
-      // agentProfileManager.ts pour le detail du defaut identifie et corrige.
-      lease = acquirePooledProfileLock(this.settings);
+      // agentProfileManager.ts. Hotfix critique (isolation par compte TLS):
+      // affinite stable au compte (params.login) plutot que "premier slot
+      // libre" - jamais deux comptes TLS differents sur le meme profil.
+      lease = await acquireProfileLockForAccount(this.settings, login, this.log);
       this.leases.set(botId, lease);
 
       const chrome = await launchChromeForBot(lease.profilePath, this.settings.targetUrl, extensionDirs);
@@ -826,7 +828,8 @@ export class AgentBotManager {
       REFRESH_FAILED: "Le rafraichissement de la page a echoue de maniere repetee.",
       EXTENSION_NOT_FOUND: "Une extension Chrome obligatoire est introuvable sur cet ordinateur.",
       EXTENSION_INVALID: "Une extension Chrome obligatoire est invalide sur cet ordinateur.",
-      TLS_START_URL_INVALID: "Aucune URL TLS de depart n'est configuree cote serveur (TARGET_URL) et aucune extension locale ne prend le relais."
+      TLS_START_URL_INVALID: "Aucune URL TLS de depart n'est configuree cote serveur (TARGET_URL) et aucune extension locale ne prend le relais.",
+      TLS_ACCOUNT_ALREADY_RUNNING: "Un bot de ce compte TLS est deja actif sur cet agent."
     };
     return messages[error.code] ?? "Erreur interne de l'agent.";
   }
