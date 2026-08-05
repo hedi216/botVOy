@@ -97,7 +97,21 @@ const requireWithin = async (predicate: () => Promise<boolean> | boolean, timeou
 
 // ===================== Faux site TLS local (jamais TLScontact reel) =====================
 // Reprend EXACTEMENT le balisage confirme par DevTools en reel (cf. ticket).
+// HOTFIX CIBLE 0.2.0 (deuxieme defaut trouve en reel via ce meme scenario):
+// reproduit le header/nav PERSISTANT reel de TLScontact (visible sur la
+// capture d'ecran fournie), qui contient litteralement le libelle "Services
+// additionnels" en tant qu'item de menu - sur TOUTES les pages du site, y
+// compris la page d'accueil elle-meme. isServiceLevelPage() (repli par
+// contenu) testait alors TOUT <body> et confondait ce nav avec une vraie
+// etape "services additionnels", empechant clickSeConnecter d'etre jamais
+// tente (defaut confirme en reel: bot bloque, Chrome ne bouge plus).
 const HOME_HTML_WITH_REAL_LINK = `<!DOCTYPE html><html><body>
+<nav>
+  <a href="/">Accueil</a>
+  <a href="/fr-fr/demarches">Demarches a suivre</a>
+  <a href="/fr-fr/services-additionnels">Services additionnels</a>
+  <a href="/fr-fr/faq">FAQ</a>
+</nav>
 <a href="/fr-fr/login">
     <div id="login">SE CONNECTER</div>
 </a>
@@ -366,6 +380,17 @@ const runScenarioA = async (): Promise<void> => {
     // ----- Test 1: home atteinte -----
     assert(agentLogText.includes("Diagnostic pages pilotees avant premiere action"), "1) Diagnostic de la page pilotee journalise avant la premiere action (home atteinte, contexte inspecte)");
 
+    // ----- Test 1bis (regression, defaut trouve en reel apres deploiement du
+    // premier correctif): le nav persistant de la page d'accueil contient
+    // litteralement "Services additionnels" (menu du vrai site) - isServiceLevelPage()
+    // ne doit JAMAIS confondre ce nav avec une vraie etape service-level, sous
+    // peine de ne jamais atteindre la branche clickSeConnecter (defaut confirme
+    // en reel via les logs de production: bot bloque des la page d'accueil). -----
+    assert(
+      !agentLogText.includes("Etape services additionnels detectee"),
+      "1bis) Le nav de la page d'accueil ('Services additionnels') n'est jamais confondu avec une vraie etape service-level"
+    );
+
     // ----- Test 2/3: clickSeConnecter reellement execute, resultat pas avale -----
     assert(
       agentLogText.includes("Navigation directe vers /fr-fr/login sans effet reel"),
@@ -470,20 +495,21 @@ const runScenarioB = async (): Promise<void> => {
   }
 };
 
-// ===================== Test 8 (statique, une seule fois): aucune modification service-level =====================
-// "Service-level" au sens strict du hotfix precedent (clickContinueServiceLevel/
-// isServiceLevelPage, jamais clickSeConnecter/navigateToLogin - la modification
-// de ce hotfix-ci porte volontairement sur la fonction VOISINE dans le meme
-// fichier, jamais sur cette logique-la) n'est jamais touchee par ce hotfix.
-const checkServiceLevelUnaffected = (): void => {
-  // Verification statique du diff REEL de ce hotfix sur src/shared/loginFlow.ts
-  // (seul fichier service-level touche, uniquement dans le voisinage
-  // navigateToLogin/clickSeConnecter): jamais la logique service-level
-  // (clickContinueServiceLevel/isServiceLevelPage, hotfix precedent) modifiee
-  // par ce correctif-ci - meme si ce fichier porte deja d'autres hunks
-  // legitimes d'un hotfix precedent de cette meme session (jamais commits,
-  // conformement a la consigne "ne committe rien" appliquee a tous les
-  // hotfix successifs).
+// ===================== Test 8 (statique, une seule fois): perimetre service-level =====================
+// "Service-level" au sens strict du hotfix precedent, c'est le CLIC/la
+// NAVIGATION vers appointment-booking une fois l'etape reconnue
+// (clickContinueServiceLevel/performClickContinueServiceLevel/
+// resolveContinueLinkTarget): cette logique-la reste intacte.
+//
+// isServiceLevelPage() elle-meme EST deliberement modifiee par ce hotfix-ci
+// (0.2.0): son repli par contenu confondait le nav PERSISTANT du vrai site
+// (libelle de menu "Services additionnels", present sur la page d'accueil
+// elle-meme - defaut confirme en reel via les logs de production) avec une
+// vraie etape service-level, empechant clickSeConnecter d'etre jamais tente.
+// Seule la SOURCE du texte analyse change (nav/header/footer exclus); le
+// motif de detection et le comportement sur une vraie page service-level
+// restent inchanges (cf. test:agent:service-level-hotfix:real, non affecte).
+const checkServiceLevelClickLogicUnaffected = (): void => {
   let diff = "";
   try {
     diff = execSync("git diff --unified=0 -- src/shared/loginFlow.ts", { encoding: "utf8" });
@@ -491,8 +517,11 @@ const checkServiceLevelUnaffected = (): void => {
     log("GIT-DIFF-ERR", `git diff indisponible: ${error instanceof Error ? error.message : String(error)}`);
   }
   const changedLines = diff.split("\n").filter((line) => line.startsWith("+") || line.startsWith("-")).join("\n");
-  const touchesServiceLevel = /performClickContinueServiceLevel|clickContinueServiceLevel|isServiceLevelPage|resolveContinueLinkTarget/.test(changedLines);
-  assert(!touchesServiceLevel, "8) La logique service-level (clickContinueServiceLevel/isServiceLevelPage, hotfix precedent) n'est pas modifiee par ce hotfix");
+  const touchesServiceLevelClickLogic = /performClickContinueServiceLevel|clickContinueServiceLevel|resolveContinueLinkTarget/.test(changedLines);
+  assert(
+    !touchesServiceLevelClickLogic,
+    "8) La logique de clic/navigation service-level (clickContinueServiceLevel/performClickContinueServiceLevel/resolveContinueLinkTarget, hotfix precedent) n'est pas modifiee par ce hotfix (isServiceLevelPage() est deliberement corrigee, cf. commentaire)"
+  );
 };
 
 const main = async (): Promise<void> => {
@@ -505,7 +534,7 @@ const main = async (): Promise<void> => {
   }
 
   try {
-    checkServiceLevelUnaffected();
+    checkServiceLevelClickLogicUnaffected();
     await runScenarioA();
     await runScenarioB();
   } finally {

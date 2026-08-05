@@ -364,6 +364,23 @@ export const serviceLevelPagePattern = /\/workflow\/service-level/i;
 export const appointmentBookingPathPattern = /\/workflow\/appointment-booking\//i;
 const serviceLevelTitlePattern = /services additionnels|additional services/i;
 
+// HOTFIX CIBLE 0.2.0 (bot bloque des la page d'accueil, jamais clickSeConnecter
+// tente): le repli par contenu ci-dessous testait TOUT le texte de <body>,
+// nav/header/footer compris - or "Services additionnels" est aussi le libelle
+// d'un lien de menu PERSISTANT sur (au moins) la page d'accueil TLScontact
+// reelle (confirme en reel via les logs de production: dispatchOnState()
+// detectait "service-level" alors que l'URL etait toujours la page d'accueil,
+// tentait le clic 'Continuer' associe (qui echouait normalement, aucun lien
+// correspondant n'existant sur cette page), puis abandonnait la tentative SANS
+// jamais atteindre la branche clickSeConnecter - le vrai defaut). Le contenu
+// du nav/header/footer (menu persistant sur tout le site) est donc exclu
+// avant de tester le motif, ne laissant que le contenu propre a la page.
+const bodyTextExcludingChrome = (page: Page): Promise<string> => page.evaluate(() => {
+  const clone = document.body.cloneNode(true) as HTMLElement;
+  clone.querySelectorAll("nav, header, footer").forEach((el) => el.remove());
+  return clone.textContent ?? "";
+}).catch(() => "");
+
 export const isServiceLevelPage = async (page: Page): Promise<boolean> => {
   if (page.isClosed()) {
     return false;
@@ -371,7 +388,7 @@ export const isServiceLevelPage = async (page: Page): Promise<boolean> => {
   if (serviceLevelPagePattern.test(page.url())) {
     return true;
   }
-  const bodyText = await page.locator("body").innerText({ timeout: 3_000 }).catch(() => "");
+  const bodyText = await bodyTextExcludingChrome(page);
   return serviceLevelTitlePattern.test(bodyText);
 };
 
