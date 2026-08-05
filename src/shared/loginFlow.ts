@@ -320,24 +320,114 @@ export const fillLoginForm = async (page: Page, login: string, password: string,
 
 const selectTravelGroupTextPattern = /^s[ée]lectionner$/i;
 
+// HOTFIX CIBLE 0.2.1 (bot bloque sur /fr-fr/travel-groups malgre un bouton
+// 'Selectionner' visible d'apres l'utilisateur): l'ancienne version ne
+// cherchait QUE role=button[name=Selectionner] et retournait false sans
+// jamais journaliser ce qu'elle avait effectivement trouve sur la page -
+// impossible de distinguer "aucun candidat" de "candidat present mais role
+// non reconnu" (ex. un <a> stylise en bouton plutot qu'un <button> reel).
+// Recherche desormais, dans cet ordre strict (le plus specifique/fiable
+// d'abord), et journalise le compte de CHAQUE strategie: jamais seulement
+// celle qui a fini par matcher. Correspondance texte TOUJOURS exacte
+// (selectTravelGroupTextPattern est ancre ^...$): ne clique jamais un
+// element parce qu'il contient partiellement "Selectionner", et ne peut donc
+// jamais confondre avec "Creer une nouvelle demande"/modifier/supprimer/une
+// autre demande - aucune exclusion additionnelle n'est necessaire, l'ancrage
+// du motif suffit deja a lui seul.
+const findExactTextMatches = async (locator: Locator, pattern: RegExp): Promise<Locator[]> => {
+  const count = await locator.count().catch(() => 0);
+  const matches: Locator[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const item = locator.nth(index);
+    const text = (await item.innerText({ timeout: 1_000 }).catch(() => "")).trim();
+    if (pattern.test(text)) {
+      matches.push(item);
+    }
+  }
+  return matches;
+};
+
+type TravelGroupCandidateSet = { label: string; matches: Locator[] };
+
+const collectTravelGroupCandidateSets = async (page: Page): Promise<TravelGroupCandidateSet[]> => {
+  const roleButtonLocator = page.getByRole("button", { name: selectTravelGroupTextPattern });
+  const roleLinkLocator = page.getByRole("link", { name: selectTravelGroupTextPattern });
+  const [roleButtonMatches, roleLinkMatches, buttonMatches, linkMatches, roleAttrMatches] = await Promise.all([
+    roleButtonLocator.all().catch(() => []),
+    roleLinkLocator.all().catch(() => []),
+    findExactTextMatches(page.locator("button:visible"), selectTravelGroupTextPattern),
+    findExactTextMatches(page.locator("a:visible"), selectTravelGroupTextPattern),
+    findExactTextMatches(page.locator('[role="button"]:visible'), selectTravelGroupTextPattern)
+  ]);
+  return [
+    { label: "role=button[name=Selectionner]", matches: roleButtonMatches },
+    { label: "role=link[name=Selectionner]", matches: roleLinkMatches },
+    { label: "button:visible (texte exact)", matches: buttonMatches },
+    { label: "a:visible (texte exact)", matches: linkMatches },
+    { label: "[role=\"button\"]:visible (texte exact)", matches: roleAttrMatches }
+  ];
+};
+
 // Apres connexion, TLScontact affiche parfois "Gestionnaire des demandes"
 // (/fr-fr/travel-groups) avant la page de rendez-vous : il faut cliquer
 // "Selectionner" sur la demande pour continuer. S'il y en a plusieurs, on prend
-// la premiere et on le signale (pas de logique de tri par categorie ici).
+// la premiere et on le signale (pas de logique de tri par categorie ici). Ne
+// declare un succes qu'apres un clic REELLEMENT execute (trial puis clic
+// reel, jamais d'exception avalee) - la confirmation de progression reelle
+// (sortie de travel-groups) est verifiee par l'appelant (agentBotManager.ts).
 export const clickSelectTravelGroup = async (page: Page, log: LogFn): Promise<boolean> => {
-  const buttons = page.getByRole("button", { name: selectTravelGroupTextPattern });
-  const count = await buttons.count().catch(() => 0);
+  const candidateSets = await collectTravelGroupCandidateSets(page);
+  log(
+    "info",
+    `Etape travel-groups: candidats 'Selectionner' par strategie (${candidateSets.map((set) => `${set.label}=${set.matches.length}`).join(", ")}).`
+  );
 
-  if (count === 0) {
+  const firstNonEmpty = candidateSets.find((set) => set.matches.length > 0);
+  if (!firstNonEmpty) {
+    log("warn", "Aucune demande 'Selectionner' trouvee sur 'Gestionnaire des demandes' (toutes strategies a 0 candidat).");
     return false;
   }
 
-  if (count > 1) {
-    log("warn", `${count} demandes trouvees sur 'Gestionnaire des demandes'. Selection de la premiere.`);
+  if (firstNonEmpty.matches.length > 1) {
+    log("warn", `${firstNonEmpty.matches.length} demandes trouvees sur 'Gestionnaire des demandes' (strategie ${firstNonEmpty.label}). Selection de la premiere.`);
   }
 
-  if (!(await clickLocatorIfVisible(buttons.first(), 5_000).catch(() => false))) {
-    log("warn", "Bouton 'Selectionner' trouve mais non cliquable.");
+  const target = firstNonEmpty.matches[0];
+  const [tagName, role, id, dataTestId, hrefAttr, accessibleTextRaw] = await Promise.all([
+    target.evaluate((el) => el.tagName).catch(() => "?"),
+    target.getAttribute("role").catch(() => null),
+    target.getAttribute("id").catch(() => null),
+    target.getAttribute("data-testid").catch(() => null),
+    target.getAttribute("href").catch(() => null),
+    target.innerText({ timeout: 1_000 }).catch(() => "")
+  ]);
+  const visible = await target.isVisible().catch(() => false);
+  const enabled = await target.isEnabled().catch(() => false);
+  log(
+    "info",
+    `Etape travel-groups: candidat retenu via ${firstNonEmpty.label} (tag=${tagName}, role=${role ?? "(absent)"}, `
+    + `id=${id ?? "(absent)"}, data-testid=${dataTestId ?? "(absent)"}, visible=${visible}, enabled=${enabled}, `
+    + `href-pathname=${hrefPathnameOf(hrefAttr, page.url())}, texte=${sanitizeDiagnosticMessage(accessibleTextRaw.trim())}).`
+  );
+
+  let clickOutcome: { ok: true } | { ok: false; className: string; message: string };
+  try {
+    await target.waitFor({ state: "visible", timeout: 5_000 });
+    await target.scrollIntoViewIfNeeded({ timeout: 5_000 });
+    if (!(await target.isVisible()) || !(await target.isEnabled())) {
+      throw new Error("Element non actionnable (visible/enabled=false apres attente).");
+    }
+    // Trial d'abord (detecte une erreur d'actionnabilite sans declencher la
+    // navigation), meme principe deja etabli pour le clic 'Continuer' voisin.
+    await target.click({ trial: true, timeout: 5_000 });
+    await target.click({ timeout: 5_000 });
+    clickOutcome = { ok: true };
+  } catch (error) {
+    clickOutcome = { ok: false, ...describeUnknownError(error) };
+  }
+
+  if (!clickOutcome.ok) {
+    log("warn", `Clic Playwright sur 'Selectionner' echoue (${clickOutcome.className}): ${clickOutcome.message}.`);
     return false;
   }
 
@@ -362,34 +452,67 @@ export const travelGroupsPagePattern = /\/fr-fr\/travel-groups/i;
 export const applicationSummaryPagePattern = /\/workflow\/application-summary/i;
 export const serviceLevelPagePattern = /\/workflow\/service-level/i;
 export const appointmentBookingPathPattern = /\/workflow\/appointment-booking\//i;
-const serviceLevelTitlePattern = /services additionnels|additional services/i;
+// Page d'accueil TLS reelle: /fr-fr/country/<pays>/vac/<code> (cf. capture
+// d'ecran/logs reels: .../fr-fr/country/tn/vac/tnTUN2fr).
+const homeCountryPagePattern = /\/country\/[^/]+\/vac\//i;
 
-// HOTFIX CIBLE 0.2.0 (bot bloque des la page d'accueil, jamais clickSeConnecter
-// tente): le repli par contenu ci-dessous testait TOUT le texte de <body>,
-// nav/header/footer compris - or "Services additionnels" est aussi le libelle
-// d'un lien de menu PERSISTANT sur (au moins) la page d'accueil TLScontact
-// reelle (confirme en reel via les logs de production: dispatchOnState()
-// detectait "service-level" alors que l'URL etait toujours la page d'accueil,
-// tentait le clic 'Continuer' associe (qui echouait normalement, aucun lien
-// correspondant n'existant sur cette page), puis abandonnait la tentative SANS
-// jamais atteindre la branche clickSeConnecter - le vrai defaut). Le contenu
-// du nav/header/footer (menu persistant sur tout le site) est donc exclu
-// avant de tester le motif, ne laissant que le contenu propre a la page.
-const bodyTextExcludingChrome = (page: Page): Promise<string> => page.evaluate(() => {
-  const clone = document.body.cloneNode(true) as HTMLElement;
-  clone.querySelectorAll("nav, header, footer").forEach((el) => el.remove());
-  return clone.textContent ?? "";
-}).catch(() => "");
+// HOTFIX CIBLE 0.2.1 (cause racine - bot bloque a la fois sur la page
+// d'accueil ET sur /fr-fr/travel-groups, deux fois de suite en reel):
+// isServiceLevelPage() se fiait a un texte GENERIQUE ("services additionnels"
+// n'importe ou dans <body>) - or ce libelle apparait aussi bien dans le nav
+// persistant (corrige au hotfix 0.2.0) que dans le contenu propre d'autres
+// pages reelles (confirme en reel via les logs: le motif matchait alors que
+// l'URL etait deja /fr-fr/travel-groups). DECISION: le CHEMIN URL est
+// desormais la preuve principale et quasi-exclusive; un simple texte de page
+// ne suffit plus JAMAIS a lui seul. Le repli structurel eventuel n'accepte
+// qu'un marqueur DOM fort et specifique (lien reel vers l'etape suivante
+// connue, avec id/data-testid exacts) - jamais du texte libre - et est
+// explicitement refuse sur toute URL DEJA reconnue comme un autre etat
+// (jamais false-positive croise entre etats, quel que soit leur contenu).
+const STRICT_APPOINTMENT_BOOKING_LINK_SELECTORS = [
+  'a#book-appointment-btn[href*="/workflow/appointment-booking/"]',
+  'a[data-testid="btn-book-appointment"][href*="/workflow/appointment-booking/"]'
+];
+
+// URLs deja reconnues comme un AUTRE etat du parcours: le repli structurel
+// (moins fiable que le chemin URL) n'a jamais le droit de les reclasser en
+// service-level, meme si leur contenu mentionne "services additionnels"
+// ailleurs sur la page (defaut reel corrige ici).
+const isKnownNonServiceLevelUrl = (url: string): boolean =>
+  travelGroupsPagePattern.test(url)
+  || loginPathPattern.test(url)
+  || authPagePattern.test(url)
+  || applicationSummaryPagePattern.test(url)
+  || appointmentBookingPathPattern.test(url)
+  || homeCountryPagePattern.test(url);
 
 export const isServiceLevelPage = async (page: Page): Promise<boolean> => {
   if (page.isClosed()) {
     return false;
   }
-  if (serviceLevelPagePattern.test(page.url())) {
+  const url = page.url();
+
+  // Preuve principale: le chemin URL exact de l'etape service-level.
+  if (serviceLevelPagePattern.test(url)) {
     return true;
   }
-  const bodyText = await bodyTextExcludingChrome(page);
-  return serviceLevelTitlePattern.test(bodyText);
+
+  // Repli structurel refuse explicitement sur toute URL deja reconnue comme
+  // un autre etat du parcours - jamais de reclassement croise.
+  if (isKnownNonServiceLevelUrl(url)) {
+    return false;
+  }
+
+  // Repli structurel (URL inconnue uniquement): un lien REEL et VISIBLE vers
+  // l'etape suivante connue (appointment-booking), avec un marqueur DOM fort
+  // (id ou data-testid exact) - jamais un simple mot dans le texte de la page.
+  for (const selector of STRICT_APPOINTMENT_BOOKING_LINK_SELECTORS) {
+    const visible = await page.locator(selector).first().isVisible().catch(() => false);
+    if (visible) {
+      return true;
+    }
+  }
+  return false;
 };
 
 // authPagePattern seul ne suffit pas a reconnaitre "une page d'authentification":

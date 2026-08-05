@@ -638,28 +638,103 @@ export class AgentBotManager {
       return detectRecognizedState(page);
     };
 
+    // HOTFIX CIBLE 0.2.1 (bot bloque sur /fr-fr/travel-groups malgre un bouton
+    // 'Selectionner' visible): attente explicite, apres un clic 'Selectionner'
+    // reellement execute, d'une VRAIE progression - jamais uniquement le fait
+    // que click() n'a pas leve d'exception. Cible les 3 destinations valides
+    // depuis travel-groups (jamais travel-groups elle-meme, qui matcherait
+    // trivialement sans aucune progression reelle si reutilisee telle quelle).
+    const TRAVEL_GROUPS_PROGRESS_WAIT_MS = 18_000;
+    const detectTravelGroupsProgress = async (page: import("playwright").Page): Promise<string | null> => {
+      if (page.isClosed()) {
+        return null;
+      }
+      const url = page.url();
+      if (applicationSummaryPagePattern.test(url)) {
+        return "application-summary";
+      }
+      if (await isServiceLevelPage(page).catch(() => false)) {
+        return "service-level";
+      }
+      if (await isAtAppointmentPage()) {
+        return "appointment-booking";
+      }
+      return null;
+    };
+    const waitForTravelGroupsProgressOrTimeout = async (page: import("playwright").Page, timeoutMs: number): Promise<string | null> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const state = await detectTravelGroupsProgress(page);
+        if (state) {
+          return state;
+        }
+        if (page.isClosed() || !stillRunning()) {
+          return null;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+      return detectTravelGroupsProgress(page);
+    };
+
     const dispatchOnState = async (
       page: import("playwright").Page,
       initialLoginState: { attempted: boolean }
     ): Promise<StateDispatchOutcome> => {
       const url = page.url();
 
-      if (await isServiceLevelPage(page)) {
-        const advanced = await clickContinueServiceLevel(page, navLog).catch((error) => {
+      // HOTFIX CIBLE 0.2.1 (cause racine): priorite STRICTE aux etats
+      // identifies par leur URL EXACTE, avant tout detecteur de contenu -
+      // service-level (dont le repli structurel reste possible sur une URL
+      // INCONNUE, cf. isServiceLevelPage) ne doit jamais intercepter une URL
+      // deja reconnue comme un autre etat (defaut reel confirme deux fois:
+      // page d'accueil ET /fr-fr/travel-groups classees a tort en
+      // service-level par un texte present ailleurs sur ces pages). Ordre:
+      // appointment-booking (deja gere hors de dispatchOnState, cf.
+      // isAtAppointmentPage) -> travel-groups -> application-summary ->
+      // login/auth -> service-level (URL exacte OU repli structurel strict)
+      // -> page d'accueil (clickSeConnecter, jamais avant les etats ci-dessus).
+      if (travelGroupsPagePattern.test(url)) {
+        const urlBeforeSelect = page.url();
+        // HOTFIX CIBLE 0.2.1: meme defaut que le hotfix precedent (clickSeConnecter)
+        // - le resultat de clickSelectTravelGroup() etait avale puis ignore, un
+        // clic/une action qui echouait reellement etait tout de meme rapportee
+        // comme "attempted", et le garde-fou lastDispatchedUrl abandonnait la
+        // tentative sans jamais journaliser la vraie cause (defaut confirme en
+        // reel: bot bloque sur /fr-fr/travel-groups malgre un bouton 'Selectionner'
+        // visible d'apres l'utilisateur).
+        const selected = await clickSelectTravelGroup(page, navLog).catch((error) => {
           const message = error instanceof Error ? error.message : String(error);
-          navLog("warn", `Erreur inattendue (non geree par clickContinueServiceLevel) lors du clic 'Continuer': ${message}`);
+          navLog("warn", `Erreur inattendue (non geree par clickSelectTravelGroup) lors du clic 'Selectionner': ${message}`);
           return false;
         });
-        return advanced ? "confirmed" : "attempted";
+        if (!selected) {
+          navLog(
+            "warn",
+            `clickSelectTravelGroup() a echoue reellement (selected=false, URL=${maskUrlForLog(urlBeforeSelect)}): `
+            + "aucune action n'a fait progresser cette page. Abandon de cette tentative (reprise controlee a la tentative suivante) plutot que de pretendre un succes."
+          );
+          return "none";
+        }
+        navLog(
+          "info",
+          `clickSelectTravelGroup() execute avec succes (selected=true, URL=${maskUrlForLog(urlBeforeSelect)}). `
+          + "Attente d'une progression reelle (application-summary/service-level/appointment-booking), pas uniquement l'absence d'exception."
+        );
+        const reachedState = await waitForTravelGroupsProgressOrTimeout(page, TRAVEL_GROUPS_PROGRESS_WAIT_MS);
+        if (reachedState) {
+          navLog("success", `Progression confirmee apres clickSelectTravelGroup(): etape '${reachedState}' atteinte (URL=${maskUrlForLog(page.url())}).`);
+        } else {
+          navLog(
+            "warn",
+            `clickSelectTravelGroup() execute (selected=true) mais aucune progression reelle detectee apres `
+            + `${Math.round(TRAVEL_GROUPS_PROGRESS_WAIT_MS / 1000)}s (URL actuelle=${maskUrlForLog(page.url())}): clic execute mais navigation absente.`
+          );
+        }
+        return "attempted";
       }
 
       if (applicationSummaryPagePattern.test(url)) {
         await clickBookNewAppointment(page, navLog).catch(() => false);
-        return "attempted";
-      }
-
-      if (travelGroupsPagePattern.test(url)) {
-        await clickSelectTravelGroup(page, navLog).catch(() => false);
         return "attempted";
       }
 
@@ -677,6 +752,15 @@ export class AgentBotManager {
         await fillLoginForm(page, login, password, navLog).catch(() => false);
         lastSubmittedPageUrl = page.url();
         return "attempted";
+      }
+
+      if (await isServiceLevelPage(page)) {
+        const advanced = await clickContinueServiceLevel(page, navLog).catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          navLog("warn", `Erreur inattendue (non geree par clickContinueServiceLevel) lors du clic 'Continuer': ${message}`);
+          return false;
+        });
+        return advanced ? "confirmed" : "attempted";
       }
 
       if (!initialLoginState.attempted) {

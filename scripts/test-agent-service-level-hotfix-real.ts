@@ -27,7 +27,7 @@ import path from "node:path";
 import { Browser, Page, chromium } from "playwright";
 import { AgentBotManager } from "../src/agent/agentBotManager.js";
 import { AgentEventReporter } from "../src/agent/agentEventReporter.js";
-import { clickContinueServiceLevel, isAllowedAppointmentBookingRedirect } from "../src/shared/loginFlow.js";
+import { clickContinueServiceLevel, isAllowedAppointmentBookingRedirect, isServiceLevelPage } from "../src/shared/loginFlow.js";
 import { AgentLogLevel } from "../src/agent/agentLocalLogger.js";
 import { AgentRuntimeSettings } from "../src/agent/types.js";
 
@@ -94,15 +94,43 @@ const serviceLevelHtml = (variant: ServiceLevelVariant): string => {
 
 const LOGIN_HTML = `<!DOCTYPE html><html><body><h1>Faux login (ne devrait jamais etre atteint depuis ce test)</h1></body></html>`;
 
+// HOTFIX CIBLE 0.2.1 (cause racine isServiceLevelPage): "Services additionnels"
+// est deliberement present ICI (hors de tout nav/header/footer, dans le
+// contenu propre de la page - piege realiste, cf. defaut confirme en reel ou
+// ce texte apparaissait ailleurs que dans le menu) pour prouver que le chemin
+// URL /fr-fr/travel-groups l'emporte desormais TOUJOURS: isServiceLevelPage()
+// doit retourner false ici, quel que soit ce texte, et seule
+// clickSelectTravelGroup() (jamais clickContinueServiceLevel) doit agir.
 const TRAVEL_GROUPS_HTML = (next: "service-level" | "application-summary"): string => `<!DOCTYPE html><html><body>
 <h1>Gestionnaire des demandes</h1>
+<p>Liste des demandes</p>
+<p>Services additionnels</p>
 <button type="button" onclick="location.href='/workflow/${next}'">Selectionner</button>
 </body></html>`;
 
+// Meme piege deliberement present ici (cf. commentaire ci-dessus): le chemin
+// URL /workflow/application-summary doit l'emporter, jamais ce texte.
 const APPLICATION_SUMMARY_HTML = `<!DOCTYPE html><html><body>
 <h1>Recapitulatif de la demande</h1>
 <p>Non reserve</p>
+<p>Services additionnels</p>
 <button id="btn-confirm-appointment" type="button" onclick="location.href='/workflow/service-level'">Prendre un nouveau rendez-vous</button>
+</body></html>`;
+
+// ===================== Fixtures dediees a la classification isServiceLevelPage (tests A-E) =====================
+
+// Test D: page d'accueil reelle (/fr-fr/country/<pays>/vac/<code>, cf. logs
+// de production) avec le meme piege textuel.
+const HOME_COUNTRY_HTML = `<!DOCTYPE html><html><body>
+<h1>Bienvenue au centre de visas</h1>
+<p>Services additionnels</p>
+</body></html>`;
+
+// Test B: URL totalement INCONNUE (aucun des etats nommes) mais exposant le
+// marqueur DOM fort exact attendu par le repli structurel.
+const UNKNOWN_URL_WITH_STRONG_ANCHOR_HTML = `<!DOCTYPE html><html><body>
+<h1>Etape non nommee du parcours (URL inconnue)</h1>
+<a id="book-appointment-btn" data-testid="btn-book-appointment" href="/workflow/appointment-booking/tnTUN2fr/99999999">Continuer</a>
 </body></html>`;
 
 // Playwright isVisible() exige une boite englobante non vide (piege deja
@@ -128,6 +156,8 @@ const startFixtureSite = (): Promise<FixtureSite> => new Promise((resolve, rejec
       return;
     }
     if (url.startsWith("/workflow/application-summary")) { res.end(APPLICATION_SUMMARY_HTML); return; }
+    if (url.startsWith("/fr-fr/country/")) { res.end(HOME_COUNTRY_HTML); return; }
+    if (url.startsWith("/some/unknown/page")) { res.end(UNKNOWN_URL_WITH_STRONG_ANCHOR_HTML); return; }
     if (url.startsWith("/workflow/service-level")) {
       const variant: ServiceLevelVariant = url.includes("variant=overlay") ? "overlay"
         : url.includes("variant=bad-href-external") ? "bad-href-external"
@@ -365,6 +395,20 @@ const runPartB = async (fixture: FixtureSite): Promise<void> => {
         `${label}) La page appointment-booking est bien atteinte via une vraie navigation`
       );
 
+      // HOTFIX CIBLE 0.2.1 (point 5 - priorite des etats): TRAVEL_GROUPS_HTML
+      // contient deliberement le texte "Services additionnels" (piege
+      // realiste). isServiceLevelPage() ne doit JAMAIS l'intercepter tant que
+      // l'URL est /fr-fr/travel-groups - seule clickSelectTravelGroup() doit
+      // agir sur cette etape, jamais clickContinueServiceLevel().
+      assert(
+        !capture.entries.some((e) => e.message.includes("Etape services additionnels detectee mais aucun lien 'Continuer'")),
+        `${label}) L'etape travel-groups n'est jamais interceptee par le detecteur de contenu service-level (texte 'Services additionnels' present sur la page, URL prioritaire)`
+      );
+      assert(
+        capture.entries.some((e) => e.message.includes("Etape travel-groups: candidats 'Selectionner' par strategie")),
+        `${label}) clickSelectTravelGroup() est bien appelee sur /fr-fr/travel-groups (branche correcte du dispatcher)`
+      );
+
       // Le monitoring ne doit demarrer qu'apres appointment-booking: au moment
       // ou MONITORING apparait, aucune requete ulterieure vers travel-groups/
       // application-summary/service-level ne doit avoir eu lieu (la sequence
@@ -400,6 +444,66 @@ const runPartB = async (fixture: FixtureSite): Promise<void> => {
   }
 };
 
+// ===================== PARTIE C: classification isServiceLevelPage() (tests A-E) =====================
+// HOTFIX CIBLE 0.2.1 (cause racine): le chemin URL est desormais la preuve
+// PRINCIPALE, le repli structurel n'accepte plus qu'un marqueur DOM fort
+// (jamais du texte libre), et ce repli est explicitement refuse sur toute URL
+// deja reconnue comme un autre etat - meme si cette page contient, ailleurs
+// dans son contenu, le texte "Services additionnels".
+
+const runPartC = async (fixture: FixtureSite, browser: Browser): Promise<void> => {
+  log("PART-C", "=== isServiceLevelPage(): priorite stricte a l'URL, repli structurel strict (tests A-E) ===");
+
+  const checkPage = async (url: string): Promise<boolean> => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded" });
+      return await isServiceLevelPage(page);
+    } finally {
+      await context.close();
+    }
+  };
+
+  // ----- Test A: URL /workflow/service-level -> true -----
+  assert(
+    await checkPage(`${fixture.baseUrl}/workflow/service-level`) === true,
+    "A) URL /workflow/service-level -> isServiceLevelPage() === true (preuve principale: le chemin URL)"
+  );
+
+  // ----- Test B: URL inconnue + ancre exacte -> repli structurel true -----
+  assert(
+    await checkPage(`${fixture.baseUrl}/some/unknown/page`) === true,
+    "B) URL inconnue + ancre exacte #book-appointment-btn vers appointment-booking -> repli structurel true"
+  );
+
+  // ----- Test C: URL travel-groups + texte "Services additionnels" -> false -----
+  assert(
+    await checkPage(`${fixture.baseUrl}/fr-fr/travel-groups?next=service-level`) === false,
+    "C) URL /fr-fr/travel-groups + texte 'Services additionnels' present sur la page -> isServiceLevelPage() === false (URL prioritaire, jamais reclassee)"
+  );
+
+  // ----- Test D: URL home + texte "Services additionnels" -> false -----
+  assert(
+    await checkPage(`${fixture.baseUrl}/fr-fr/country/tn/vac/tnTUN2fr`) === false,
+    "D) URL page d'accueil (/country/.../vac/...) + texte 'Services additionnels' -> isServiceLevelPage() === false"
+  );
+
+  // ----- Test E: URL application-summary + texte "Services additionnels" -> false -----
+  assert(
+    await checkPage(`${fixture.baseUrl}/workflow/application-summary`) === false,
+    "E) URL /workflow/application-summary + texte 'Services additionnels' -> isServiceLevelPage() === false"
+  );
+
+  // ----- Regression directe: /fr-fr/login et /workflow/appointment-booking/ -----
+  // refusent eux aussi le repli structurel, meme si un marqueur fort y etait
+  // present par accident (defense en profondeur du point 3 du hotfix).
+  assert(
+    await checkPage(`${fixture.baseUrl}/fr-fr/login`) === false,
+    "(complement) URL /fr-fr/login -> isServiceLevelPage() === false"
+  );
+};
+
 // ===================== Orchestration =====================
 
 const main = async (): Promise<void> => {
@@ -412,6 +516,7 @@ const main = async (): Promise<void> => {
     browser = await chromium.launch({ headless: true });
     await runPartA(fixture, browser);
     await runPartB(fixture);
+    await runPartC(fixture, browser);
   } finally {
     if (browser) await browser.close().catch(() => undefined);
     // server.close() attend que TOUTE connexion keep-alive existante se

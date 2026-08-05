@@ -25,6 +25,7 @@
     "test:agent:release:integration": "tsx scripts/test-agent-release-integration.ts",
     "test:agent:hotfix-autologin:real": "tsx scripts/test-agent-hotfix-autologin-real.ts",
     "test:agent:hotfix-home-login:real": "tsx scripts/test-agent-hotfix-home-login-real.ts",
+    "test:agent:hotfix-travel-groups:real": "tsx scripts/test-agent-hotfix-travel-groups-real.ts",
     "test:agent:service-level-hotfix:real": "tsx scripts/test-agent-service-level-hotfix-real.ts",
     "test:agent:cloudflare-diagnostic:real": "tsx scripts/test-agent-cloudflare-diagnostic-real.ts",
     "test:agent:profile-pool:simulated": "tsx scripts/test-agent-profile-pool-simulated.ts",
