@@ -1,4 +1,4 @@
-import { sendAlertEmail, BrevoEmailResult } from "./brevoEmailService.js";
+import { sendAlertEmail, EmailResult } from "./emailService.js";
 
 export type SendAppAlertInput = {
   type?: "appointment" | "human" | "system" | "warning" | "info";
@@ -71,7 +71,7 @@ export const sendAppAlert = async ({
   message,
   userEmail,
   data
-}: SendAppAlertInput): Promise<BrevoEmailResult> => {
+}: SendAppAlertInput): Promise<EmailResult> => {
   const to = userEmail;
 
   if (!to || (Array.isArray(to) && to.length === 0)) {
