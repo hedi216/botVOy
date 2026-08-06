@@ -129,6 +129,11 @@ export const buildBrevoEmailPayload = (input: SendAlertEmailInput): Record<strin
 export const sendAlertEmail = async (input: SendAlertEmailInput): Promise<BrevoEmailResult> => {
   const apiKey = process.env.BREVO_API_KEY;
   if (!apiKey) {
+    // Jusqu'ici silencieux cote serveur: aucune trace ne distinguait "email
+    // jamais tente" de "email tente puis echoue" pour cette configuration
+    // manquante - desormais visible dans les logs serveur (jamais le
+    // contenu du message/destinataire, uniquement ce constat de config).
+    logger.warn(`Envoi email ignore (BREVO_API_KEY manquant): ${input.subject}`);
     return {
       success: false,
       provider: "brevo",

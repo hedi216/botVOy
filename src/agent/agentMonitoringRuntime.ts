@@ -1,8 +1,19 @@
 import { BrowserContext, Page } from "playwright";
-import { clickBookNewAppointment, clickContinueServiceLevel, clickSelectTravelGroup } from "../shared/loginFlow.js";
-import { monitorAppointments } from "../shared/monitor.js";
+import {
+  applicationSummaryPagePattern,
+  clickBookNewAppointment,
+  clickContinueServiceLevel,
+  clickSeConnecter,
+  clickSelectTravelGroup,
+  fillLoginForm,
+  homeCountryPagePattern,
+  isAuthPage,
+  isServiceLevelPage,
+  travelGroupsPagePattern
+} from "../shared/loginFlow.js";
+import { HUMAN_BLOCK_GRACE_MS, monitorAppointments, waitForConditionToClear } from "../shared/monitor.js";
 import { MonitorEventLevel } from "../shared/types.js";
-import { findReadyAppointmentPage, maskUrlForLog } from "./agentPageDetector.js";
+import { findReadyAppointmentPage, isCloudflareBlockedPage, maskUrlForLog } from "./agentPageDetector.js";
 import { AgentMonitoringSettings, toAppConfig } from "./agentMonitoringSettings.js";
 import { SlotAlertDeduplicator } from "./agentSlotDedup.js";
 import { AgentEventReporter } from "./agentEventReporter.js";
@@ -44,6 +55,23 @@ export type MonitoringRuntimeStatus = {
   lastSlotDetectedAt: string | null;
 };
 
+// HOTFIX 0.2.3 (section 5): permet au recovery workflow de refaire
+// fillLoginForm() si la session TLS expire pendant la surveillance (defaut
+// reel confirme: le recovery ne savait jusqu'ici jamais se reconnecter).
+// Contrat de securite strict, respecte partout ou ce type circule:
+// - JAMAIS ecrit sur disque, dans le mapping account/profile, en base, ni
+//   dans un BOT_STATUS/log/erreur ;
+// - JAMAIS assigne sur AgentBotHandle (deja documente comme ne devant jamais
+//   porter de credential, cf. types.ts) ;
+// - vit UNIQUEMENT dans la fermeture (closure) de startMonitoring() ci-dessous,
+//   pour la duree de vie de CETTE boucle de surveillance, et est explicitement
+//   dereferencee (mise a undefined) des la fin de la boucle (STOP_BOT ou fin
+//   naturelle) - jamais conservee au-dela.
+export type RuntimeCredentials = {
+  login: string;
+  password: string;
+};
+
 export type StartMonitoringParams = {
   botId: string;
   botName?: string;
@@ -63,6 +91,15 @@ export type StartMonitoringParams = {
   // est encore enregistre: si wireUnexpectedClosure l'a deja retire (vrai
   // Chrome ferme), ce module ne doit rien re-signaler par-dessus.
   isBotStillRegistered: () => boolean;
+  // Optionnel, EN MEMOIRE UNIQUEMENT (cf. commentaire sur RuntimeCredentials
+  // ci-dessus) - absent pour VALIDATE_BOT (jamais de credentials dans ce
+  // flux, comportement inchange) et pour START_BOT sans login/password.
+  runtimeCredentials?: RuntimeCredentials;
+  // HOTFIX 0.2.3: override test uniquement (cf. AgentRuntimeSettings) -
+  // absent en production reelle, retombe alors sur les constantes ci-dessous.
+  workflowRecoveryRetryIntervalMs?: number;
+  workflowRecoveryLongWaitMs?: number;
+  humanValidationGraceMs?: number;
 };
 
 export type MonitoringRuntimeHandle = {
@@ -83,6 +120,19 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
   let lastSlotDetectedAtIso: string | null = null;
   let consecutiveRefreshFailures = 0;
   let refreshFailureAbort = false;
+  let workflowRecoveryFailedEmitted = false;
+  // HOTFIX 0.2.3 (correctif Cloudflare/validation humaine): distingue un
+  // echec de recovery cause par un blocage humain TOUJOURS present au-dela de
+  // la fenetre deja prevue (HUMAN_BLOCK_GRACE_MS, jamais WORKFLOW_RECOVERY_FAILED)
+  // d'un echec de recovery REEL (aucun blocage humain, les tentatives
+  // automatiques elles-memes ont echoue). Empeche onWorkflowRecoveryFailed
+  // d'emettre WORKFLOW_RECOVERY_FAILED par-dessus une notification humaine
+  // deja emise pour le meme episode.
+  let humanValidationTimeoutEmitted = false;
+  // Reference locale UNIQUE a ce credential (cf. RuntimeCredentials
+  // ci-dessus) - explicitement videe dans le .finally() de la boucle, jamais
+  // conservee au-dela de la duree de vie de cette surveillance.
+  let runtimeCredentialsRef = params.runtimeCredentials;
 
   const clearRateLimitTimer = (): void => {
     if (rateLimitResumeTimer) {
@@ -124,15 +174,6 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
       ?? null;
   };
 
-  const isSafeRecoveryUrl = (rawUrl: string): boolean => {
-    try {
-      const parsed = new URL(rawUrl);
-      return parsed.protocol === "https:" || parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
-    } catch {
-      return false;
-    }
-  };
-
   const waitForReadyAppointment = async (timeoutMs: number): Promise<Page | null> => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline && !signal.aborted) {
@@ -143,6 +184,41 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
     return recoverCurrentPage();
+  };
+
+  // HOTFIX 0.2.3 (section 4 - recovery niveau 2, pilote par etat reel):
+  // remplace l'ancienne sequence aveugle (goto(targetUrl) INCONDITIONNEL puis
+  // select -> book -> continue, rejouee entierement a chaque tentative meme
+  // depuis un etat deja avance) par une classification de la page REELLEMENT
+  // affichee, puis UNE SEULE action pertinente pour cet etat - exactement le
+  // meme principe deja valide par agentBotManager.ts/dispatchOnState (0.1.9+),
+  // jamais duplique en logique divergente ici: memes helpers, meme ordre de
+  // priorite explicitement demande pour ce contexte de reprise (travel-groups
+  // -> application-summary -> service-level -> accueil -> login/auth ->
+  // Cloudflare/captcha -> inconnu).
+  type RecoveryState = "travel-groups" | "application-summary" | "service-level" | "home" | "auth" | "cloudflare" | "unknown";
+
+  const classifyRecoveryState = async (recoveryPage: Page): Promise<RecoveryState> => {
+    const url = recoveryPage.url();
+    if (travelGroupsPagePattern.test(url)) {
+      return "travel-groups";
+    }
+    if (applicationSummaryPagePattern.test(url)) {
+      return "application-summary";
+    }
+    if (await isServiceLevelPage(recoveryPage).catch(() => false)) {
+      return "service-level";
+    }
+    if (homeCountryPagePattern.test(url)) {
+      return "home";
+    }
+    if (await isAuthPage(recoveryPage).catch(() => false)) {
+      return "auth";
+    }
+    if (await isCloudflareBlockedPage(recoveryPage).catch(() => false)) {
+      return "cloudflare";
+    }
+    return "unknown";
   };
 
   const recoverWorkflowOnce = async (attempt: number, reason?: string): Promise<Page | null> => {
@@ -156,46 +232,137 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
       return null;
     }
 
-    agentLog("info", `Reprise workflow ${attempt}/${WORKFLOW_RECOVERY_FINAL_ATTEMPT}${reason ? " apres page inattendue" : ""}.`);
+    const state = await classifyRecoveryState(page);
+    agentLog(
+      "info",
+      `Reprise workflow ${attempt}/${WORKFLOW_RECOVERY_FINAL_ATTEMPT}${reason ? " apres page inattendue" : ""}: `
+      + `etat detecte = ${state} (${maskUrlForLog(page.url())}).`
+    );
 
-    if (isSafeRecoveryUrl(targetUrl)) {
-      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20_000 })
-        .then(() => agentLog("info", `Retour automatique vers l'URL cible (${maskUrlForLog(targetUrl)}).`))
-        .catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          agentLog("warn", `Navigation vers l'URL cible impossible: ${message}`);
-        });
-      const afterTarget = await waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
-      if (afterTarget) {
-        return afterTarget;
-      }
+    switch (state) {
+      case "travel-groups":
+        await clickSelectTravelGroup(page, agentLog).catch(() => false);
+        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+
+      case "application-summary":
+        await clickBookNewAppointment(page, agentLog).catch(() => false);
+        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+
+      case "service-level":
+        await clickContinueServiceLevel(page, agentLog).catch(() => false);
+        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+
+      case "home":
+        await clickSeConnecter(page, agentLog).catch(() => false);
+        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+
+      case "auth":
+        if (!runtimeCredentialsRef) {
+          agentLog("warn", "Page de connexion detectee pendant la reprise, mais aucun identifiant en memoire pour cette session: reconnexion automatique impossible.");
+          return null;
+        }
+        // fillLoginForm() attend deja, sans jamais la contourner, une
+        // resolution CAPTCHA manuelle si presente (waitForRecaptchaResolution,
+        // jusqu'a 15 min) - reutilise tel quel, aucune nouvelle logique
+        // captcha necessaire ici (section 6 du hotfix: CAPTCHA reste 100% manuel).
+        agentLog("info", "Page de connexion detectee pendant la reprise: nouvelle tentative de connexion automatique (identifiants en memoire, jamais journalises).");
+        await fillLoginForm(page, runtimeCredentialsRef.login, runtimeCredentialsRef.password, agentLog).catch(() => false);
+        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+
+      case "cloudflare":
+        // Section 6/8: ne jamais contourner Cloudflare/un captcha - aucune
+        // action automatique ici. La reprise automatique se fait naturellement
+        // a la PROCHAINE tentative (10s/10s/10s/5min) si le blocage a disparu.
+        agentLog("warn", "Blocage Cloudflare/validation humaine detecte pendant la reprise: aucune action automatique, attente d'une resolution (humaine ou naturelle).");
+        return null;
+
+      case "unknown":
+      default:
+        // Section 4.H: jamais de clic au hasard sur un etat non reconnu -
+        // cette tentative est simplement consideree comme non recuperee.
+        agentLog("warn", `Etat de page non reconnu pendant la reprise (${maskUrlForLog(page.url())}): aucune action automatique, tentative non recuperee.`);
+        return null;
+    }
+  };
+
+  const resolvedRetryIntervalMs = params.workflowRecoveryRetryIntervalMs ?? WORKFLOW_RECOVERY_RETRY_INTERVAL_MS;
+  const resolvedLongWaitMs = params.workflowRecoveryLongWaitMs ?? WORKFLOW_RECOVERY_LONG_WAIT_MS;
+  const resolvedHumanValidationGraceMs = params.humanValidationGraceMs ?? HUMAN_BLOCK_GRACE_MS;
+
+  // HOTFIX 0.2.3 (correctif Cloudflare/validation humaine, verifie AVANT
+  // chaque tentative numerotee - jamais seulement une fois avant la boucle,
+  // un challenge peut survenir entre deux tentatives): ne clique/contourne
+  // rien, ne fait ni goto agressif ni reload en boucle, se contente
+  // d'attendre/sonder la disparition du challenge a l'intervalle DEJA utilise
+  // par l'application (waitForConditionToClear/HUMAN_BLOCK_GRACE_MS,
+  // monitor.ts - jamais une nouvelle fenetre divergente). Tant que le
+  // challenge est present, la tentative en cours n'est JAMAIS comptee
+  // (#1/#2/#3/#4 inchanges); des sa disparition, reevaluation immediate de
+  // l'etat reel (retour en tete de boucle, toujours sans consommer de
+  // tentative). Au-dela de la fenetre humaine: raison distincte
+  // (HUMAN_VALIDATION_TIMEOUT), jamais WORKFLOW_RECOVERY_FAILED.
+  const waitOutHumanValidationBeforeAttempt = async (): Promise<"clear" | "timed-out" | "aborted"> => {
+    const blockedPage = pickWorkflowPage();
+    if (!blockedPage || blockedPage.isClosed()) {
+      return "clear";
+    }
+    const isBlocked = await isCloudflareBlockedPage(blockedPage).catch(() => false);
+    if (!isBlocked) {
+      return "clear";
     }
 
-    await clickSelectTravelGroup(page, agentLog).catch(() => false);
-    let recovered = await waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
-    if (recovered) {
-      return recovered;
+    agentLog(
+      "warn",
+      "Blocage Cloudflare/validation humaine detecte pendant le recovery: attente de sa disparition "
+      + "(aucun clic, aucun contournement, aucune tentative numerotee consommee)."
+    );
+    const cleared = await waitForConditionToClear(
+      blockedPage,
+      () => isCloudflareBlockedPage(blockedPage),
+      signal,
+      resolvedHumanValidationGraceMs
+    );
+    if (signal.aborted) {
+      return "aborted";
     }
-
-    await clickBookNewAppointment(page, agentLog).catch(() => false);
-    recovered = await waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
-    if (recovered) {
-      return recovered;
+    if (cleared) {
+      agentLog("success", "Blocage Cloudflare/validation humaine disparu: reevaluation immediate de l'etat reel.");
+      return "clear";
     }
-
-    await clickContinueServiceLevel(page, agentLog).catch(() => false);
-    return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+    return "timed-out";
   };
 
   const recoverWorkflowWithRetries = async (reason?: string): Promise<Page | null> => {
-    for (let attempt = 1; attempt <= WORKFLOW_RECOVERY_FINAL_ATTEMPT; attempt += 1) {
+    let attempt = 1;
+    while (attempt <= WORKFLOW_RECOVERY_FINAL_ATTEMPT) {
       if (signal.aborted) {
         return null;
       }
 
+      const humanValidationOutcome = await waitOutHumanValidationBeforeAttempt();
+      if (humanValidationOutcome === "aborted") {
+        return null;
+      }
+      if (humanValidationOutcome === "timed-out") {
+        humanValidationTimeoutEmitted = true;
+        reporter.botStatus(botId, commandId, WAITING_FOR_USER_STATUS, { reason: "HUMAN_VALIDATION_TIMEOUT" });
+        agentLog(
+          "error",
+          `Blocage Cloudflare/validation humaine toujours present au-dela de la fenetre prevue `
+          + `(${Math.round(resolvedHumanValidationGraceMs / 1_000)}s): intervention humaine requise (HUMAN_VALIDATION_TIMEOUT). Chrome reste ouvert.`
+        );
+        return null;
+      }
+      // "clear": aucun blocage (ou vient de disparaitre) - reevalue l'etat
+      // reel MAINTENANT, sans jamais consommer une tentative pour ce constat.
+      const alreadyReady = await recoverCurrentPage();
+      if (alreadyReady) {
+        return alreadyReady;
+      }
+
       if (attempt === WORKFLOW_RECOVERY_FINAL_ATTEMPT) {
-        agentLog("warn", `${WORKFLOW_RECOVERY_ATTEMPTS_BEFORE_LONG_WAIT} tentatives sans page reconnue. Attente de ${WORKFLOW_RECOVERY_LONG_WAIT_MS / 60_000} minutes avant la tentative finale.`);
-        await new Promise((resolve) => setTimeout(resolve, WORKFLOW_RECOVERY_LONG_WAIT_MS));
+        agentLog("warn", `${WORKFLOW_RECOVERY_ATTEMPTS_BEFORE_LONG_WAIT} tentatives sans page reconnue. Attente de ${Math.round(resolvedLongWaitMs / 60_000)} minutes avant la tentative finale.`);
+        await new Promise((resolve) => setTimeout(resolve, resolvedLongWaitMs));
       }
 
       const recovered = await recoverWorkflowOnce(attempt, reason);
@@ -204,8 +371,9 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
       }
 
       if (attempt < WORKFLOW_RECOVERY_ATTEMPTS_BEFORE_LONG_WAIT) {
-        await new Promise((resolve) => setTimeout(resolve, WORKFLOW_RECOVERY_RETRY_INTERVAL_MS));
+        await new Promise((resolve) => setTimeout(resolve, resolvedRetryIntervalMs));
       }
+      attempt += 1;
     }
 
     agentLog("error", `Reprise workflow impossible apres ${WORKFLOW_RECOVERY_FINAL_ATTEMPT} tentatives. Notification et intervention humaine requises.`);
@@ -283,6 +451,25 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
     abortController.abort();
   };
 
+  // HOTFIX 0.2.3 (section 9): declenche exactement une fois par episode,
+  // quand monitor.ts a deja epuise refresh simple + recovery workflow complet
+  // (jamais pour un rate limit, cf. section 8 - ce cas garde son propre
+  // cooldown). "reason" volontairement absent du payload BOT_STATUS: jamais
+  // d'URL/detail potentiellement sensible transmis au serveur, uniquement ce
+  // code stable.
+  const onWorkflowRecoveryFailed = (): void => {
+    if (humanValidationTimeoutEmitted) {
+      // Deja notifie ci-dessus avec la raison specifique HUMAN_VALIDATION_TIMEOUT:
+      // WORKFLOW_RECOVERY_FAILED reste reserve aux vraies tentatives
+      // automatiques ayant echoue APRES disparition/absence de blocage humain
+      // - jamais emis par-dessus une notification humaine deja envoyee.
+      return;
+    }
+    workflowRecoveryFailedEmitted = true;
+    reporter.botStatus(botId, commandId, WAITING_FOR_USER_STATUS, { reason: "WORKFLOW_RECOVERY_FAILED" });
+    agentLog("error", "Echec final de la reprise automatique du workflow (WORKFLOW_RECOVERY_FAILED): intervention humaine requise. Chrome reste ouvert.");
+  };
+
   const appConfig = toAppConfig(settings, targetUrl);
 
   const loopPromise = monitorAppointments(page, appConfig, {
@@ -296,13 +483,18 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
     onRateLimited,
     onSlotDetected,
     onRefreshFailed,
-    onRefreshSucceeded
+    onRefreshSucceeded,
+    onWorkflowRecoveryFailed
   })
     .catch((error) => {
       agentLog("error", `Surveillance interrompue par une erreur: ${error instanceof Error ? error.message : String(error)}`);
     })
     .finally(() => {
       clearRateLimitTimer();
+      // HOTFIX 0.2.3 (section 5): derniere reference vivante au credential en
+      // memoire pour cette boucle - videe ici, quelle que soit l'issue
+      // (STOP_BOT, fin naturelle, erreur), jamais conservee au-dela.
+      runtimeCredentialsRef = undefined;
 
       if (!isBotStillRegistered()) {
         // Fermeture navigateur reelle: wireUnexpectedClosure a deja tout pris
@@ -313,6 +505,13 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
       if (refreshFailureAbort) {
         reporter.botStatus(botId, commandId, "ERROR", { errorCode: "REFRESH_FAILED" });
         agentLog("error", "Bot en erreur: echecs de refresh repetes (REFRESH_FAILED).");
+        return;
+      }
+
+      if (workflowRecoveryFailedEmitted || humanValidationTimeoutEmitted) {
+        // Deja notifie explicitement ci-dessus (WORKFLOW_RECOVERY_FAILED ou
+        // HUMAN_VALIDATION_TIMEOUT): ne jamais emettre PAGE_CLOSED par-dessus
+        // (section 10 - une seule alerte par episode).
         return;
       }
 

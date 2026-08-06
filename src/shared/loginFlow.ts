@@ -454,7 +454,7 @@ export const serviceLevelPagePattern = /\/workflow\/service-level/i;
 export const appointmentBookingPathPattern = /\/workflow\/appointment-booking\//i;
 // Page d'accueil TLS reelle: /fr-fr/country/<pays>/vac/<code> (cf. capture
 // d'ecran/logs reels: .../fr-fr/country/tn/vac/tnTUN2fr).
-const homeCountryPagePattern = /\/country\/[^/]+\/vac\//i;
+export const homeCountryPagePattern = /\/country\/[^/]+\/vac\//i;
 
 // HOTFIX CIBLE 0.2.1 (cause racine - bot bloque a la fois sur la page
 // d'accueil ET sur /fr-fr/travel-groups, deux fois de suite en reel):

@@ -27,7 +27,7 @@ const stripTechnicalNoise = (message: string): string => message
   .split("Call log:")[0]
   .trim();
 
-type NotificationCategory = "appointment-detected" | "appointment-reserved" | "human-blocked";
+type NotificationCategory = "appointment-detected" | "appointment-reserved" | "human-blocked" | "workflow-recovery-failed";
 
 const normalizeMessage = (message: string): string => message
   .normalize("NFD")
@@ -48,6 +48,20 @@ const classifyNotification = (message: string): NotificationCategory | null => {
 
   if (text.trim() === "rendez_vous_reserve_temporaire") {
     return "appointment-reserved";
+  }
+
+  // HOTFIX 0.2.3 (section 10): message reel construit par agentGateway.ts
+  // pour un agent bot ("[Agent] Statut du bot: WAITING_FOR_USER
+  // {"reason":"WORKFLOW_RECOVERY_FAILED"}") - ne correspondait JUSQU'ICI a
+  // AUCUN motif ci-dessous (gap confirme: aucun email n'etait jamais envoye
+  // pour un WAITING_FOR_USER/ERROR issu de l'agent). Categorie DISTINCTE de
+  // "human-blocked": deliberement PAS soumise a la fenetre de grace
+  // HUMAN_BLOCK_GRACE_MS ci-dessous (le recovery a deja dure plusieurs
+  // minutes avant d'emettre ce statut - echec deja final, alertable
+  // directement), tout en restant soumise au dedoublonnage normal
+  // (DEDUPE_MS) pour ne jamais spammer plusieurs emails pour le meme episode.
+  if (text.includes("workflow_recovery_failed")) {
+    return "workflow-recovery-failed";
   }
 
   if (
@@ -89,6 +103,10 @@ const notificationSubject = (category: NotificationCategory): string => {
     return "[RendezBot] Rendez-vous reserve";
   }
 
+  if (category === "workflow-recovery-failed") {
+    return "[RendezBot] Recuperation automatique impossible - Intervention requise";
+  }
+
   return "[RendezBot] Intervention humaine requise";
 };
 
@@ -110,6 +128,10 @@ const notificationTitle = (category: NotificationCategory, botName?: string): st
     return `Rendez-vous reserve${suffix}`;
   }
 
+  if (category === "workflow-recovery-failed") {
+    return `Recuperation automatique impossible${suffix}`;
+  }
+
   return `Action requise${suffix}`;
 };
 
@@ -120,6 +142,10 @@ const notificationMessage = (category: NotificationCategory, message: string, bo
 
   if (category === "human-blocked") {
     return `Action recommandee pour le bot "${botName}":\n${message}`;
+  }
+
+  if (category === "workflow-recovery-failed") {
+    return `Le bot "${botName}" n'a pas pu se retablir automatiquement apres une erreur TLS (refresh puis recuperation complete du parcours epuises). Le navigateur reste ouvert: intervenez manuellement puis validez pour reprendre.`;
   }
 
   if (category === "appointment-detected") {

@@ -31,6 +31,7 @@ type ResolvedMonitorRuntime = {
   onSlotDetected?: (info: SlotDetectedInfo) => void;
   onRefreshFailed?: () => void;
   onRefreshSucceeded?: () => void;
+  onWorkflowRecoveryFailed?: () => void;
 };
 
 const defaultRuntime: ResolvedMonitorRuntime = {
@@ -62,7 +63,8 @@ const resolveRuntime = (runtime?: MonitorRuntime): ResolvedMonitorRuntime => ({
   onRateLimited: runtime?.onRateLimited,
   onSlotDetected: runtime?.onSlotDetected,
   onRefreshFailed: runtime?.onRefreshFailed,
-  onRefreshSucceeded: runtime?.onRefreshSucceeded
+  onRefreshSucceeded: runtime?.onRefreshSucceeded,
+  onWorkflowRecoveryFailed: runtime?.onWorkflowRecoveryFailed
 });
 
 export const waitForUserToStart = async (runtime?: MonitorRuntime): Promise<void> => {
@@ -73,19 +75,27 @@ export const waitForUserToStart = async (runtime?: MonitorRuntime): Promise<void
   await resolved.waitForUser("Validez quand la page de rendez-vous est prete.");
 };
 
-const HUMAN_BLOCK_GRACE_MS = 4 * 60 * 1000;
+// HOTFIX 0.2.3 (correctif Cloudflare/validation humaine pendant le recovery):
+// exportes pour reutilisation par agentMonitoringRuntime.ts - LA MEME fenetre
+// humaine "deja prevue par l'application" (jamais une seconde constante
+// divergente), pour qu'un challenge Cloudflare rencontre PENDANT le recovery
+// workflow n'ait jamais a inventer sa propre notion de patience.
+export const HUMAN_BLOCK_GRACE_MS = 4 * 60 * 1000;
 const HUMAN_RECHECK_INTERVAL_MS = 15_000;
 
 // La plupart des blocages (captcha, transition de session...) se resolvent seuls
 // en quelques dizaines de secondes. On sonde silencieusement pendant la fenetre
 // de grace: si la condition qui a declenche la pause disparait d'elle-meme, on
 // reprend sans jamais afficher de prompt ni solliciter l'humain.
-const waitForConditionToClear = async (
+export const waitForConditionToClear = async (
   page: Page,
   isStillBlocked: () => Promise<boolean>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  // Override TEST UNIQUEMENT (jamais en production sans configuration
+  // explicite, cf. agentMonitoringRuntime.ts) - defaut inchange sinon.
+  graceMs: number = HUMAN_BLOCK_GRACE_MS
 ): Promise<boolean> => {
-  const deadline = Date.now() + HUMAN_BLOCK_GRACE_MS;
+  const deadline = Date.now() + graceMs;
 
   while (Date.now() < deadline) {
     // Lot 4: un STOP_BOT ne doit jamais rester coince jusqu'a 4 minutes dans
@@ -269,6 +279,20 @@ const detectUnexpectedPageReason = async (page: Page): Promise<string | null> =>
     return `Session TLS sortie du workflow: le navigateur est revenu a l'accueil TLScontact. Retournez manuellement sur la page Prise de rendez-vous, puis cliquez Valider/continuer. URL: ${url}`;
   }
 
+  // HOTFIX 0.2.3 (cas reel observe): exception cote client Next.js/React -
+  // TLScontact affiche une page d'erreur applicative generique au lieu du
+  // contenu attendu, alors qu'un simple refresh manuel restaure immediatement
+  // la vraie page (confirme en reel). Classification DISTINCTE des motifs
+  // generiques ci-dessous (isClientSideExceptionReason la reconnait
+  // explicitement) car elle declenche une strategie differente: un refresh
+  // simple d'abord, jamais un goto/reload agressif comme pour Cloudflare/1015.
+  // Volontairement etroit (uniquement cette formulation precise et sa
+  // variante courte) - jamais un motif "erreur" generique qui capturerait
+  // trop de cas differents.
+  if (/application error:?\s*a client-side exception has occurred|client-side exception has occurred/i.test(bodyText)) {
+    return `Erreur applicative TLS (exception cote client) detectee: application instable, page inexploitable. URL: ${url}`;
+  }
+
   const patterns = [
     /bad gateway/i,
     /error code 502/i,
@@ -299,6 +323,67 @@ const detectUnexpectedPageReason = async (page: Page): Promise<string | null> =>
 
 const isRateLimitReason = (reason: string): boolean =>
   /1015|rate limited|temporarily banned/i.test(reason);
+
+const isClientSideExceptionReason = (reason: string): boolean =>
+  /exception cote client|client-side exception/i.test(reason);
+
+const isReloadableWorkflowUrl = (rawUrl: string): boolean => {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
+// HOTFIX 0.2.3 (niveau 1 de recovery - refresh simple): un simple
+// page.reload() de la MEME page (jamais un goto() vers une autre URL) a
+// suffi en reel a restaurer la page apres une exception cote client - donc
+// on l'essaie EN PREMIER, avant le recovery workflow complet (niveau 2,
+// beaucoup plus couteux). Section 3 du hotfix: jamais plus d'un reload
+// "normal" + un seul reload supplementaire, UNIQUEMENT si le premier a
+// echoue pour une raison technique (reseau/timeout) - jamais une boucle de
+// reload agressive.
+const CLIENT_SIDE_EXCEPTION_RELOAD_TIMEOUT_MS = 20_000;
+const CLIENT_SIDE_EXCEPTION_READY_WAIT_MS = 18_000;
+
+const attemptQuickRefresh = async (
+  page: Page,
+  runtime: ResolvedMonitorRuntime
+): Promise<boolean> => {
+  const tryReloadOnce = async (): Promise<boolean> => {
+    try {
+      await page.reload({ waitUntil: "domcontentloaded", timeout: CLIENT_SIDE_EXCEPTION_RELOAD_TIMEOUT_MS });
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      runtime.log("warn", `Refresh simple: tentative de reload en echec technique (${message}).`);
+      return false;
+    }
+  };
+
+  runtime.log("info", "Refresh simple (erreur applicative TLS): tentative de restauration sans repartir vers l'URL cible.");
+  let reloaded = await tryReloadOnce();
+  if (!reloaded && !page.isClosed()) {
+    runtime.log("warn", "Premier refresh en echec technique: un second refresh est tente (jamais davantage pour cet episode).");
+    reloaded = await tryReloadOnce();
+  }
+  if (!reloaded || page.isClosed()) {
+    return false;
+  }
+
+  const deadline = Date.now() + CLIENT_SIDE_EXCEPTION_READY_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (page.isClosed()) {
+      return false;
+    }
+    if (await isAppointmentPageReady(page)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  return isAppointmentPageReady(page);
+};
 
 const hasMovedPastAppointmentPage = async (page: Page): Promise<boolean> => {
   const url = page.url();
@@ -630,10 +715,28 @@ export const monitorAppointments = async (
 
     const unexpectedReason = await detectUnexpectedPageReason(activePage);
     if (unexpectedReason) {
-      if (isRateLimitReason(unexpectedReason)) {
+      const rateLimited = isRateLimitReason(unexpectedReason);
+      if (rateLimited) {
+        // Section 8 du hotfix 0.2.3: le cooldown existant est le vrai
+        // mecanisme de reprise ici (onRateLimited programme deja un retour
+        // automatique a MONITORING) - jamais de refresh simple ni d'echec
+        // terminal WORKFLOW_RECOVERY_FAILED pour ce cas, comportement
+        // historique conserve tel quel ci-dessous.
         applyRateLimitCooldown(pageDomain(activePage), config.rateLimitCooldownMinutes, resolved.log);
         resolved.onRateLimited?.(config.rateLimitCooldownMinutes);
+      } else if (isClientSideExceptionReason(unexpectedReason) && isReloadableWorkflowUrl(activePage.url())) {
+        // Niveau 1 (section 2 du hotfix 0.2.3): refresh simple de la MEME
+        // page, jamais un goto() vers TARGET_URL - un refresh manuel a
+        // suffi en reel, donc on l'essaie avant le recovery complet
+        // (beaucoup plus couteux et jamais necessaire si ce refresh suffit).
+        const refreshed = await attemptQuickRefresh(activePage, resolved);
+        if (refreshed) {
+          resolved.log("success", "Page de rendez-vous retablie apres refresh. Surveillance reprise.");
+          continue;
+        }
+        resolved.log("warn", "Refresh simple insuffisant: lancement du recovery workflow complet.");
       }
+
       const recoveredPage = await resolved.recoverWorkflow(unexpectedReason);
       if (recoveredPage) {
         activePage = recoveredPage;
@@ -641,14 +744,28 @@ export const monitorAppointments = async (
         resolved.log("success", "Page de rendez-vous retrouvee automatiquement. Surveillance reprise.");
         continue;
       }
+
+      if (rateLimited) {
+        await safeScreenshot(activePage, "unexpected-page");
+        await alertAndPause(
+          unexpectedReason,
+          resolved,
+          activePage,
+          () => detectUnexpectedPageReason(activePage).then((result) => result !== null)
+        );
+        continue;
+      }
+
+      // Section 9/10 du hotfix 0.2.3: echec terminal apres refresh + recovery
+      // complet (toutes tentatives bornees) - jamais une nouvelle boucle
+      // silencieuse ici (l'ancienne 4e minute de grace supplementaire de
+      // alertAndPause est explicitement retiree pour ce cas precis, deja
+      // alertable directement). Le Chrome/la page restent ouverts (aucune
+      // fermeture ici); seule la boucle de surveillance s'arrete.
       await safeScreenshot(activePage, "unexpected-page");
-      await alertAndPause(
-        unexpectedReason,
-        resolved,
-        activePage,
-        () => detectUnexpectedPageReason(activePage).then((result) => result !== null)
-      );
-      continue;
+      resolved.log("error", "Recuperation automatique impossible apres refresh simple et recovery workflow complet (WORKFLOW_RECOVERY_FAILED).");
+      resolved.onWorkflowRecoveryFailed?.();
+      return;
     }
 
     const domain = pageDomain(activePage);

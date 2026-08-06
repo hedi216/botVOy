@@ -48,6 +48,19 @@ export type AgentRuntimeSettings = {
   // comportement reel en production sans decision explicite).
   autoNavRetryIntervalMs: number;
   autoNavLongWaitMs: number;
+  // HOTFIX 0.2.3: meme principe que autoNavRetryIntervalMs/autoNavLongWaitMs
+  // ci-dessus, pour la cadence du recovery workflow du MONITORING (jamais
+  // celle de l'auto-navigation initiale). Optionnels: absent -> les
+  // constantes de production actuelles (10s/5min) restent utilisees dans
+  // agentMonitoringRuntime.ts, aucun changement de comportement reel sans
+  // decision explicite.
+  workflowRecoveryRetryIntervalMs?: number;
+  workflowRecoveryLongWaitMs?: number;
+  // HOTFIX 0.2.3 (correctif Cloudflare/validation humaine): meme principe -
+  // override TEST UNIQUEMENT de la fenetre humaine (HUMAN_BLOCK_GRACE_MS,
+  // src/shared/monitor.ts) consultee pendant le recovery. Absent en
+  // production reelle, comportement inchange (4 min).
+  humanValidationGraceMs?: number;
 };
 
 export type AgentLogLevelSetting = "debug" | "info" | "warn" | "error";

@@ -246,6 +246,15 @@ export const loadAgentSettings = (): AgentRuntimeSettings => {
     logMaxFiles: numberEnv("AGENT_LOG_MAX_FILES", 5),
     logLevel: resolveLogLevel(),
     autoNavRetryIntervalMs: numberEnv("AGENT_AUTO_NAV_RETRY_INTERVAL_MS", 10_000),
-    autoNavLongWaitMs: numberEnv("AGENT_AUTO_NAV_LONG_WAIT_MS", 5 * 60 * 1000)
+    autoNavLongWaitMs: numberEnv("AGENT_AUTO_NAV_LONG_WAIT_MS", 5 * 60 * 1000),
+    workflowRecoveryRetryIntervalMs: process.env.AGENT_WORKFLOW_RECOVERY_RETRY_INTERVAL_MS?.trim()
+      ? numberEnv("AGENT_WORKFLOW_RECOVERY_RETRY_INTERVAL_MS", 10_000)
+      : undefined,
+    workflowRecoveryLongWaitMs: process.env.AGENT_WORKFLOW_RECOVERY_LONG_WAIT_MS?.trim()
+      ? numberEnv("AGENT_WORKFLOW_RECOVERY_LONG_WAIT_MS", 5 * 60 * 1000)
+      : undefined,
+    humanValidationGraceMs: process.env.AGENT_HUMAN_VALIDATION_GRACE_MS?.trim()
+      ? numberEnv("AGENT_HUMAN_VALIDATION_GRACE_MS", 4 * 60 * 1000)
+      : undefined
   };
 };

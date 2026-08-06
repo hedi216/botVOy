@@ -413,7 +413,12 @@ export class AgentBotManager {
   // JAMAIS de commande elle-meme: chaque appelant garde la responsabilite de
   // son propre COMMAND_COMPLETED (ou aucun, si aucune commande n'est en
   // attente a ce moment-la).
-  private beginMonitoring(handle: AgentBotHandle, commandId: string): void {
+  // HOTFIX 0.2.3 (section 5): runtimeCredentials, si fourni, n'est JAMAIS
+  // assigne sur `handle` (deja documente comme ne devant jamais porter de
+  // credential) - transmis uniquement en parametre de fonction jusqu'a
+  // startMonitoring(), qui le conserve EN MEMOIRE pour la seule duree de vie
+  // de cette boucle de surveillance (cf. RuntimeCredentials, agentMonitoringRuntime.ts).
+  private beginMonitoring(handle: AgentBotHandle, commandId: string, runtimeCredentials?: { login: string; password: string }): void {
     const { botId } = handle;
     handle.monitoringPrepared = true;
     handle.currentStatus = "MONITORING";
@@ -430,7 +435,11 @@ export class AgentBotManager {
       commandId,
       reporter: this.reporter,
       log: this.log,
-      isBotStillRegistered: () => this.bots.has(botId)
+      isBotStillRegistered: () => this.bots.has(botId),
+      runtimeCredentials,
+      workflowRecoveryRetryIntervalMs: this.settings.workflowRecoveryRetryIntervalMs,
+      workflowRecoveryLongWaitMs: this.settings.workflowRecoveryLongWaitMs,
+      humanValidationGraceMs: this.settings.humanValidationGraceMs
     });
 
     this.reporter.botStatus(botId, commandId, "MONITORING");
@@ -909,7 +918,12 @@ export class AgentBotManager {
 
       if (await attemptOnce()) {
         await this.closeExtraPages(handle.page);
-        this.beginMonitoring(handle, handle.startCommandId);
+        // HOTFIX 0.2.3 (section 5): transmis EN MEMOIRE uniquement, jamais
+        // assigne sur handle (cf. beginMonitoring ci-dessus) - permet au
+        // recovery du monitoring de refaire fillLoginForm() si la session
+        // TLS expire pendant la surveillance. Absent si login/password
+        // n'ont pas ete fournis a START_BOT (flux extension locale).
+        this.beginMonitoring(handle, handle.startCommandId, login && password ? { login, password } : undefined);
         this.log("success", `Bot ${botId}: page de rendez-vous atteinte automatiquement, surveillance demarree.`);
         return;
       }

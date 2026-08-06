@@ -67,4 +67,11 @@ export type MonitorRuntime = {
   // "pas de boucle infinie de refresh"), remis a zero par onRefreshSucceeded.
   onRefreshFailed?: () => void;
   onRefreshSucceeded?: () => void;
+  // HOTFIX 0.2.3: declenche UNE SEULE FOIS par episode, exactement quand le
+  // refresh simple ET le recovery workflow complet (toutes tentatives
+  // bornees, cf. recoverWorkflow) ont echoue - jamais pour un rate limit
+  // (qui conserve son propre cooldown/reprise automatique, section 8).
+  // Parametre volontairement vide: aucune raison detaillee (qui peut
+  // contenir une URL/query string) n'est jamais transmise a l'appelant ici.
+  onWorkflowRecoveryFailed?: () => void;
 };
