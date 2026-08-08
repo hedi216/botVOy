@@ -823,6 +823,24 @@ tr.needs-validation {
   padding: 0 4px;
 }
 
+/* CORRECTIF CIBLE (release 0.2.4): bandeau obligatoire VERSION_INCOMPATIBLE -
+   plus de contenu que le bandeau generique (titre, version installee,
+   version requise, details de release, bouton) - colonne plutot que ligne,
+   sans bouton fermer (jamais dismissible). */
+.agent-banner-update {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agent-banner-update .agent-banner-title {
+  font-size: 15px;
+}
+
+.agent-banner-update .button-row {
+  margin-top: 8px;
+}
+
 .agent-modal-overlay {
   align-items: center;
   background: rgba(6, 38, 74, 0.55);

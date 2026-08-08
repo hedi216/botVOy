@@ -54,6 +54,21 @@
     bannerRedetect: document.getElementById("agentBannerRedetect"),
     bannerDismiss: document.getElementById("agentBannerDismiss"),
 
+    // CORRECTIF CIBLE (release 0.2.4): bandeau DEDIE, jamais dismissible,
+    // pour VERSION_INCOMPATIBLE.
+    updateBanner: document.getElementById("agentUpdateBanner"),
+    updateBannerInstalled: document.getElementById("agentUpdateBannerInstalled"),
+    updateBannerRequired: document.getElementById("agentUpdateBannerRequired"),
+    updateBannerReleaseInfo: document.getElementById("agentUpdateBannerReleaseInfo"),
+    updateBannerReleaseVersion: document.getElementById("agentUpdateBannerReleaseVersion"),
+    updateBannerReleaseSize: document.getElementById("agentUpdateBannerReleaseSize"),
+    updateBannerUnavailable: document.getElementById("agentUpdateBannerUnavailable"),
+    updateBannerDownload: document.getElementById("agentUpdateBannerDownload"),
+    updateBannerConfigure: document.getElementById("agentUpdateBannerConfigure"),
+
+    agentPageUpdateNotice: document.getElementById("agentPageUpdateNotice"),
+    agentModalDownload: document.getElementById("agentModalDownload"),
+
     indicatorDashboard: document.getElementById("agentIndicatorDashboard"),
     indicatorDashboardBadge: document.getElementById("agentIndicatorDashboardBadge"),
     indicatorDashboardText: document.getElementById("agentIndicatorDashboardText"),
@@ -333,12 +348,17 @@
   });
 
   const handleDownloadClick = () => {
+    // Reutilise TOUJOURS agentRelease.downloadUrl tel que renvoye par le
+    // serveur - jamais une URL reconstruite cote frontend a partir d'un
+    // numero de version.
     if (agentRelease?.available && agentRelease.downloadUrl) {
       window.location.href = agentRelease.downloadUrl;
     }
   };
   agentEls.setupDownload.addEventListener("click", handleDownloadClick);
   agentEls.agentPageDownload.addEventListener("click", handleDownloadClick);
+  agentEls.updateBannerDownload.addEventListener("click", handleDownloadClick);
+  agentEls.agentModalDownload.addEventListener("click", handleDownloadClick);
 
   agentEls.setupRedetect.addEventListener("click", () => CTX.refreshAgents());
   agentEls.setupGoDashboard.addEventListener("click", () => APP.showPage("dashboard"));
@@ -433,10 +453,32 @@
   const renderAgentLocalPage = async () => {
     await populateAgencySelectForAdmin();
 
-    const { agents, error } = CTX.getState();
+    const state = CTX.getState();
+    const { agents, error } = state;
     agentEls.agentPageGenerateCode.hidden = !isManager();
     const downloadAvailable = Boolean(agentRelease?.available && agentRelease.downloadUrl);
     agentEls.agentPageDownload.disabled = !downloadAvailable;
+
+    // CORRECTIF CIBLE (release 0.2.4): notice contextuelle des qu'au moins un
+    // ordinateur de cette agence est en Version incompatible - meme si
+    // l'agence reste par ailleurs utilisable (un autre agent CONNECTED
+    // existe, globalStatus=CONNECTED, aucun bandeau global bloquant). Le
+    // badge par ligne (ci-dessous) reste la source de verite par machine;
+    // cette notice est un simple rappel visible en haut de page, jamais un
+    // bouton par ligne (le bouton generique agentPageDownload suffit).
+    const incompatibleVersions = [...new Set(
+      agents.filter((agent) => agent.status === "VERSION_INCOMPATIBLE").map((agent) => agent.version).filter(Boolean)
+    )];
+    if (agentEls.agentPageUpdateNotice) {
+      agentEls.agentPageUpdateNotice.hidden = incompatibleVersions.length === 0;
+      if (incompatibleVersions.length > 0) {
+        const requiredVersion = clientConfig?.requiredAgentVersion || "-";
+        agentEls.agentPageUpdateNotice.textContent =
+          `Un ou plusieurs ordinateurs utilisent une version de RendezBot Agent incompatible `
+          + `(${incompatibleVersions.join(", ")}). Version requise : ${requiredVersion}. `
+          + `Ces ordinateurs ne peuvent pas etre selectionnes pour lancer un bot tant qu'ils ne sont pas mis a jour.`;
+      }
+    }
 
     agentEls.agentTableBody.replaceChildren();
 
@@ -558,12 +600,18 @@
   };
 
   // ---- Bandeau persistant apres "Ignorer la detection" ----
+  //
+  // CORRECTIF CIBLE (release 0.2.4): VERSION_INCOMPATIBLE a desormais son
+  // PROPRE bandeau obligatoire (renderUpdateBanner ci-dessous, jamais
+  // dismissible, independant de "Ignorer la detection") - explicitement
+  // exclu ici pour ne jamais afficher les deux bandeaux a la fois.
 
   const shouldShowBanner = (state) =>
     Boolean(
       clientConfig?.agentUiEnabled
       && isDetectionSkipped()
       && state.globalStatus !== CTX.STATUS.CONNECTED
+      && state.globalStatus !== CTX.STATUS.VERSION_INCOMPATIBLE
       && !bannerDismissedForView
     );
 
@@ -571,6 +619,7 @@
     const state = CTX.getState();
     agentEls.banner.hidden = !shouldShowBanner(state);
     agentEls.bannerMessage.textContent = BANNER_MESSAGE;
+    renderUpdateBanner(state);
   };
 
   agentEls.bannerConfigure.addEventListener("click", () => APP.showPage("agent-setup"));
@@ -579,6 +628,84 @@
     bannerDismissedForView = true;
     renderBanner();
   });
+
+  // ---- Bandeau OBLIGATOIRE de mise a jour (VERSION_INCOMPATIBLE) ----
+  //
+  // Regle centrale (section 5 du correctif): ce bandeau doit apparaitre
+  // exactement quand l'agence n'a AUCUN Agent compatible CONNECTE/pret -
+  // c'est EXACTEMENT ce que represente globalStatus === VERSION_INCOMPATIBLE
+  // (computeGlobalStatus, agentContext.js, deja verifie: CONNECTED est
+  // toujours prioritaire des qu'un seul agent compatible existe). Reutilise
+  // cette agregation existante telle quelle - AUCUNE nouvelle logique de
+  // priorite entre agents ici.
+  const shouldShowUpdateBanner = (state) =>
+    Boolean(clientConfig?.agentUiEnabled && state.globalStatus === CTX.STATUS.VERSION_INCOMPATIBLE);
+
+  // Version(s) "installee(s)" affichee(s): tous les agents REELLEMENT
+  // incompatibles de cette agence (jamais une valeur inventee) - une agence
+  // peut avoir plusieurs machines a des versions differentes, toutes
+  // affichees plutot que d'en masquer une arbitrairement.
+  const installedIncompatibleVersions = (state) => {
+    const versions = state.agents
+      .filter((agent) => agent.status === "VERSION_INCOMPATIBLE")
+      .map((agent) => agent.version)
+      .filter(Boolean);
+    return [...new Set(versions)];
+  };
+
+  // CORRECTIF CIBLE (section 6): ne reutilise JAMAIS des metadonnees de
+  // release potentiellement anciennes pour ce bandeau - un refetch reel est
+  // declenche a chaque TRANSITION vers VERSION_INCOMPATIBLE (jamais a chaque
+  // rendu: onAgentStateChange peut se declencher tres frequemment via le
+  // socket, un refetch par transition suffit et evite de marteler l'API).
+  let lastGlobalStatusForUpdateBanner = null;
+  let updateBannerReleaseFetchInFlight = false;
+
+  const refreshReleaseForUpdateBannerIfNeeded = (state) => {
+    const enteringIncompatible = state.globalStatus === CTX.STATUS.VERSION_INCOMPATIBLE
+      && lastGlobalStatusForUpdateBanner !== CTX.STATUS.VERSION_INCOMPATIBLE;
+    lastGlobalStatusForUpdateBanner = state.globalStatus;
+
+    if (!enteringIncompatible || updateBannerReleaseFetchInFlight) {
+      return;
+    }
+    updateBannerReleaseFetchInFlight = true;
+    fetchAgentRelease()
+      .then(() => renderUpdateBanner(CTX.getState()))
+      .finally(() => { updateBannerReleaseFetchInFlight = false; });
+  };
+
+  const renderUpdateBanner = (state) => {
+    const visible = shouldShowUpdateBanner(state);
+    agentEls.updateBanner.hidden = !visible;
+    if (!visible) {
+      return;
+    }
+
+    refreshReleaseForUpdateBannerIfNeeded(state);
+
+    const installedVersions = installedIncompatibleVersions(state);
+    agentEls.updateBannerInstalled.textContent = installedVersions.length > 0 ? installedVersions.join(", ") : "-";
+    // requiredAgentVersion vient EXCLUSIVEMENT de /api/client-config
+    // (agentGatewayConfig.minAgentVersion cote serveur) - jamais hardcode
+    // ici, jamais deduit de la release au telechargement.
+    agentEls.updateBannerRequired.textContent = clientConfig?.requiredAgentVersion || "-";
+
+    // CORRECTIF CIBLE (section 7): release indisponible -> jamais de faux
+    // bouton fonctionnel, message explicite, demarrage toujours bloque
+    // (canStartBot() ci-dessous reste independant de la disponibilite de la
+    // release: seul le statut de l'agent compte).
+    const downloadAvailable = Boolean(agentRelease?.available && agentRelease.downloadUrl);
+    agentEls.updateBannerDownload.hidden = !downloadAvailable;
+    agentEls.updateBannerUnavailable.hidden = downloadAvailable;
+    agentEls.updateBannerReleaseInfo.hidden = !downloadAvailable;
+    if (downloadAvailable) {
+      agentEls.updateBannerReleaseVersion.textContent = agentRelease.version ?? "-";
+      agentEls.updateBannerReleaseSize.textContent = formatApproxSize(agentRelease.sizeBytes);
+    }
+  };
+
+  agentEls.updateBannerConfigure.addEventListener("click", () => APP.showPage("agent-setup"));
 
   // ---- Bots pilotes par l'agent (section 12/13/14) ----
 
@@ -991,6 +1118,12 @@
   const showAgentRequiredModal = () => {
     const { globalStatus } = CTX.getState();
     agentEls.modalMessage.textContent = MODAL_MESSAGES[globalStatus] || MODAL_MESSAGES.NEVER_PAIRED;
+    // CORRECTIF CIBLE (release 0.2.4): "offrir si possible" le telechargement
+    // directement dans la modale de blocage pour VERSION_INCOMPATIBLE -
+    // jamais affiche pour les autres statuts, jamais un bouton fonctionnel
+    // si la release n'est pas reellement disponible.
+    const downloadAvailable = Boolean(agentRelease?.available && agentRelease.downloadUrl);
+    agentEls.agentModalDownload.hidden = !(globalStatus === CTX.STATUS.VERSION_INCOMPATIBLE && downloadAvailable);
     agentEls.modal.hidden = false;
   };
 

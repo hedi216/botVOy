@@ -96,6 +96,27 @@
           </div>
         </div>
 
+        <!-- CORRECTIF CIBLE (release 0.2.4): bandeau DEDIE et OBLIGATOIRE pour
+             VERSION_INCOMPATIBLE - independant de "Ignorer la detection",
+             jamais masquable (aucun bouton fermer), visible tant qu'aucun
+             Agent compatible CONNECTE/pret n'existe pour cette agence. -->
+        <div id="agentUpdateBanner" class="agent-banner agent-banner-update" hidden>
+          <p class="agent-banner-title"><strong>Mise a jour de RendezBot Agent requise.</strong></p>
+          <p>Version installee : <strong id="agentUpdateBannerInstalled">-</strong></p>
+          <p>Version requise : <strong id="agentUpdateBannerRequired">-</strong></p>
+          <p id="agentUpdateBannerReleaseInfo" class="quiet" hidden>
+            Mise a jour disponible : <span id="agentUpdateBannerReleaseVersion"></span>
+            (<span id="agentUpdateBannerReleaseSize"></span>)
+          </p>
+          <p id="agentUpdateBannerUnavailable" class="quiet" hidden>
+            Mise a jour requise, mais l'installateur n'est actuellement pas disponible. Contactez l'administrateur.
+          </p>
+          <div class="button-row">
+            <button id="agentUpdateBannerDownload" class="primary" type="button" hidden>Telecharger la mise a jour</button>
+            <button id="agentUpdateBannerConfigure" class="outline" type="button">Voir la page de mise a jour</button>
+          </div>
+        </div>
+
         <section class="content">
           <section class="page active" id="page-dashboard">
             <div id="agentIndicatorDashboard" class="agent-indicator" hidden>
@@ -416,6 +437,12 @@
               </div>
             </section>
 
+            <!-- CORRECTIF CIBLE (release 0.2.4): notice contextuelle des qu'au
+                 moins un ordinateur de cette agence est en Version incompatible
+                 - reutilise le bouton de telechargement generique deja present
+                 ci-dessus (agentPageDownload), jamais un bouton par ligne. -->
+            <p id="agentPageUpdateNotice" class="form-message error" hidden></p>
+
             <div id="agentPagePairingBox" class="agent-pairing-box" hidden>
               <p class="quiet">Ce code est valable dix minutes et ne peut etre utilise qu'une seule fois.</p>
               <div class="agent-pairing-code-row">
@@ -594,6 +621,9 @@
         <h3 id="agentModalTitle">RendezBot Agent requis</h3>
         <p id="agentModalMessage"></p>
         <div class="button-row">
+          <!-- CORRECTIF CIBLE (release 0.2.4): visible uniquement pour
+               VERSION_INCOMPATIBLE avec une release disponible (agentUi.js). -->
+          <button id="agentModalDownload" class="primary" type="button" hidden>Telecharger la mise a jour</button>
           <button id="agentModalConfigure" class="primary" type="button">Configurer l'agent</button>
           <button id="agentModalRedetect" class="outline" type="button">Detecter a nouveau</button>
           <button id="agentModalCancel" class="outline" type="button">Annuler</button>

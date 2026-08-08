@@ -243,6 +243,22 @@ const waitForBadgeText = (page: Page, selector: string, expectedSubstring: strin
     { timeout: 10_000 }
   ) as unknown as Promise<void>;
 
+// CORRECTIF CIBLE (release 0.2.4): trouve la ligne #agentTableBody dont une
+// cellule contient computerName, puis attend que sa colonne Statut (4e)
+// contienne le texte attendu - jamais ":has-text()" (extension Playwright
+// non comprise par document.querySelector natif execute dans la page).
+const waitForAgentRowStatus = (page: Page, computerName: string, expectedStatusSubstring: string): Promise<void> =>
+  page.waitForFunction(
+    ({ name, text }) => {
+      const rows = [...document.querySelectorAll("#agentTableBody tr")];
+      const row = rows.find((candidate) => (candidate.textContent || "").includes(name));
+      const statusCell = row?.querySelector("td:nth-child(4)");
+      return Boolean(statusCell && (statusCell.textContent || "").includes(text));
+    },
+    { name: computerName, text: expectedStatusSubstring },
+    { timeout: 10_000 }
+  ) as unknown as Promise<void>;
+
 // Le boot() de app.js sonde volontairement /api/me pour detecter une session
 // existante et attend un 401 pour un visiteur anonyme (cf. public/app.js) ;
 // Chromium journalise cet echec reseau attendu comme un message "error" cote
@@ -496,6 +512,12 @@ const run = async (): Promise<void> => {
     await pageB.waitForURL(/\/agent\/setup$/, { timeout: 10_000 });
     assert(!(await pageB.isDisabled("#agentSetupDownload")), "Bouton telecharger active quand AGENT_DOWNLOAD_URL est fourni");
 
+    // CORRECTIF CIBLE (release 0.2.4): requiredAgentVersion vient
+    // EXCLUSIVEMENT de agentGatewayConfig.minAgentVersion cote serveur -
+    // jamais hardcode ni deduit de la release.
+    const clientConfigB = await pageB.evaluate(() => fetch("/api/client-config").then((r) => r.json()));
+    assert(clientConfigB.requiredAgentVersion === "99.0.0", `client-config expose requiredAgentVersion=AGENT_MIN_VERSION (recu: ${clientConfigB.requiredAgentVersion})`);
+
     await pageB.click("#agentSetupGenerateCode");
     await pageB.waitForSelector("#agentSetupPairingBox:not([hidden])");
     const codeB = (await pageB.textContent("#agentSetupPairingCode"))?.trim() ?? "";
@@ -505,8 +527,113 @@ const run = async (): Promise<void> => {
       (await pageB.textContent("#agentSetupMessage"))?.includes("doit etre mise a jour") ?? false,
       "Message VERSION_INCOMPATIBLE affiche quand la version de l'agent est trop ancienne"
     );
+
+    // ---- Bandeau OBLIGATOIRE (section 5 du correctif): jamais masquable,
+    // independant de "Ignorer la detection" (jamais active dans ce contexte),
+    // affiche version installee/requise, propose le telechargement. ----
+    await pageB.click('[data-page-target="dashboard"]');
+    await pageB.waitForSelector("#page-dashboard.active");
+    await waitForBadgeText(pageB, "#agentUpdateBannerInstalled", "1.0.0");
+    assert(!(await pageB.isHidden("#agentUpdateBanner")), "Bandeau obligatoire de mise a jour visible (VERSION_INCOMPATIBLE, un seul agent, aucun compatible)");
+    assert((await pageB.textContent("#agentUpdateBannerInstalled"))?.trim() === "1.0.0", "Version installee affichee dans le bandeau obligatoire");
+    assert((await pageB.textContent("#agentUpdateBannerRequired"))?.trim() === "99.0.0", "Version requise affichee dans le bandeau obligatoire");
+    assert(await pageB.isHidden("#agentBanner"), "Le bandeau generique dismissible n'apparait jamais pour VERSION_INCOMPATIBLE (bandeau dedie a la place)");
+    assert(!(await pageB.locator("#agentUpdateBanner .agent-banner-close").count()), "Le bandeau obligatoire ne possede aucun bouton fermer");
+    assert(!(await pageB.isHidden("#agentUpdateBannerDownload")), "Bouton telecharger actif dans le bandeau obligatoire (release/override disponible)");
+    assert(await pageB.isHidden("#agentUpdateBannerUnavailable"), "Message 'installateur indisponible' absent quand une release est disponible");
+
+    // Preuve que le serveur (et non une URL reconstruite cote frontend) est
+    // bien la source de l'URL de telechargement exacte.
+    const releaseB = await pageB.evaluate(() => fetch("/api/agent/releases/latest").then((r) => r.json()));
+    assert(
+      releaseB.available === true && releaseB.downloadUrl === "https://downloads.example.test/RendezBotAgentSetup.exe",
+      `/api/agent/releases/latest renvoie exactement l'URL configuree (recu: ${releaseB.downloadUrl})`
+    );
+
+    // ---- Multi-agent (section "MULTI-AGENTS"): un second agent COMPATIBLE
+    // dans la MEME agence doit rendre l'agence utilisable, faire disparaitre
+    // le bandeau obligatoire, et laisser PW-TEST-B1 clairement marque
+    // "Version incompatible" sur la page Agent local. ----
+    await pageB.click('[data-page-target="agent"]');
+    await pageB.waitForSelector("#page-agent.active");
+    await pageB.click("#agentPageGenerateCode");
+    await pageB.waitForSelector("#agentPagePairingBox:not([hidden])");
+    const codeB2 = (await pageB.textContent("#agentPagePairingCode"))?.trim() ?? "";
+    const fakeAgentB2 = await pairFakeAgent(serverB.baseUrl, codeB2, "PW-TEST-B2", "99.0.0");
+    // Sans ceci, readyForCommands reste false (fenetre AGENT_SYNCING) et la
+    // ligne afficherait "Synchronisation..." plutot que "Connecte" - ce test
+    // verifie le statut stabilise, pas la fenetre transitoire.
+    fakeAgentB2.socket.emit("AGENT_RUNTIME_STATUS", { sentAt: new Date().toISOString(), bots: [] });
+    await pageB.waitForFunction(
+      () => (document.querySelectorAll("#agentTableBody tr").length) >= 2,
+      undefined,
+      { timeout: 5_000 }
+    );
+    // L'element du bandeau existe partout dans le layout (pas seulement sur
+    // Dashboard): son attribut hidden reflete le globalStatus courant
+    // independamment de la page active - pas besoin d'y naviguer.
+    await pageB.waitForFunction(
+      () => document.getElementById("agentUpdateBanner")?.hidden === true,
+      undefined,
+      { timeout: 5_000 }
+    );
+    assert(await pageB.isHidden("#agentUpdateBanner"), "Bandeau obligatoire disparait des qu'un agent compatible CONNECTE existe (agence de nouveau utilisable)");
+    assert(await pageB.isHidden("#agentBanner"), "Le bandeau generique reste absent (globalStatus=CONNECTED)");
+    await waitForAgentRowStatus(pageB, "PW-TEST-B1", "Version incompatible");
+    await waitForAgentRowStatus(pageB, "PW-TEST-B2", "Connecte");
+    assert(
+      !(await pageB.isHidden("#agentPageUpdateNotice")),
+      "Notice contextuelle 'mise a jour' visible sur la page Agent local tant qu'un ordinateur reste incompatible, meme agence utilisable"
+    );
+    assert(
+      (await pageB.textContent("#agentPageUpdateNotice"))?.includes("99.0.0") ?? false,
+      "Notice contextuelle mentionne la version requise"
+    );
+
     fakeAgentB1.socket.disconnect();
+    fakeAgentB2.socket.disconnect();
     await contextB.close();
+
+    // ===================== Serveur B2: version incompatible, AUCUNE release disponible =====================
+    const serverB2 = await startServer(3224, {
+      AGENT_UI_ENABLED: "true",
+      BOT_EXECUTION_MODE: "legacy_vm",
+      AGENT_MIN_VERSION: "99.0.0"
+    });
+    servers.push(serverB2);
+
+    const adminCookieB2 = await loginWithRetry(serverB2.baseUrl, ADMIN_LOGIN, ADMIN_PASSWORD);
+    const fixtureB2 = await createAgencyAndManager(serverB2.baseUrl, adminCookieB2, "B2");
+
+    const contextB2 = await browser.newContext();
+    const pageB2 = await contextB2.newPage();
+    collectConsoleErrors(pageB2, consoleErrors);
+
+    await loginViaUi(pageB2, serverB2.baseUrl, fixtureB2.managerLogin, fixtureB2.managerPassword);
+    await pageB2.waitForURL(/\/agent\/setup$/, { timeout: 10_000 });
+
+    const releaseB2 = await pageB2.evaluate(() => fetch("/api/agent/releases/latest").then((r) => r.json()));
+    assert(releaseB2.available === false, "CAS RELEASE INDISPONIBLE: /api/agent/releases/latest renvoie available:false (aucun AGENT_DOWNLOAD_URL, aucun manifeste)");
+
+    await pageB2.click("#agentSetupGenerateCode");
+    await pageB2.waitForSelector("#agentSetupPairingBox:not([hidden])");
+    const codeB2Setup = (await pageB2.textContent("#agentSetupPairingCode"))?.trim() ?? "";
+    const fakeAgentB2Old = await pairFakeAgent(serverB2.baseUrl, codeB2Setup, "PW-TEST-B2-OLD", "1.0.0");
+    await waitForBadgeText(pageB2, "#agentSetupBadge", "Version incompatible");
+
+    await pageB2.click('[data-page-target="dashboard"]');
+    await pageB2.waitForSelector("#page-dashboard.active");
+    await waitForBadgeText(pageB2, "#agentUpdateBannerInstalled", "1.0.0");
+    assert(!(await pageB2.isHidden("#agentUpdateBanner")), "Bandeau obligatoire toujours visible meme sans release disponible (demarrage reste bloque)");
+    assert(await pageB2.isHidden("#agentUpdateBannerDownload"), "CAS RELEASE INDISPONIBLE: jamais de bouton telecharger fonctionnel");
+    assert(!(await pageB2.isHidden("#agentUpdateBannerUnavailable")), "CAS RELEASE INDISPONIBLE: message explicite 'contactez l'administrateur' affiche");
+    assert(
+      (await pageB2.textContent("#agentUpdateBannerUnavailable"))?.includes("Contactez l'administrateur") ?? false,
+      "Le message d'indisponibilite mentionne bien de contacter l'administrateur"
+    );
+
+    fakeAgentB2Old.socket.disconnect();
+    await contextB2.close();
 
     // ===================== Serveur C: AGENT_UI_ENABLED=false, comportement historique =====================
     // Valeurs explicites (pas juste omises): le .env reel du depot peut definir

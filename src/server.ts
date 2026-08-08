@@ -146,11 +146,19 @@ app.get("/api/me", requireAuth, (req: AuthenticatedRequest, res) => {
   res.json({ user: req.user });
 });
 
+// CORRECTIF CIBLE (release 0.2.4, bandeau de mise a jour obligatoire):
+// requiredAgentVersion vient EXCLUSIVEMENT de agentGatewayConfig.minAgentVersion
+// (deja la source de verite utilisee par computeLiveStatus()/isVersionAtLeast()
+// pour calculer VERSION_INCOMPATIBLE) - jamais hardcode cote frontend, et
+// jamais deduit de la release disponible au telechargement (AGENT_RELEASE_VERSION
+// est une notion distincte: version de l'installateur propose, pas version
+// minimale exigee). Champ public, non sensible.
 app.get("/api/client-config", requireAuth, (_req, res) => {
   res.json({
     agentUiEnabled: featureFlags.agentUiEnabled,
     agentDownloadUrl: featureFlags.agentDownloadUrl,
-    botExecutionMode: featureFlags.botExecutionMode
+    botExecutionMode: featureFlags.botExecutionMode,
+    requiredAgentVersion: agentGatewayConfig.minAgentVersion
   });
 });
 

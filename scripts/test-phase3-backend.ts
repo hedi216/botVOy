@@ -700,6 +700,121 @@ const run = async (): Promise<void> => {
     agentOldVersion.socket.disconnect();
     uiVersion.disconnect();
 
+    // ===================== Serveur separe: flotte mixte (release 0.2.4) =====================
+    // CORRECTIF CIBLE (mise a jour obligatoire Agent 0.2.4): une agence avec
+    // un Agent incompatible ET un Agent compatible/pret ne doit JAMAIS etre
+    // bloquee - seul le lancement de NOUVEAUX START_BOT sur l'Agent
+    // incompatible est refuse, jamais l'agence entiere. Gap identifie par
+    // l'audit prealable: TC-multi (agents identiques) et TC-version (agent
+    // unique incompatible) existaient deja separement, jamais combines.
+    const serverMixed = await startServer(3244, { BOT_EXECUTION_MODE: "agent", AGENT_MIN_VERSION: "0.2.4" });
+    servers.push(serverMixed);
+    const adminCookieMixed = await loginWithRetry(serverMixed.baseUrl, ADMIN_LOGIN, ADMIN_PASSWORD);
+    const agencyMixed = await createAgencyAndManager(serverMixed.baseUrl, adminCookieMixed, "Mixed");
+    const uiMixed = await connectUiSocket(serverMixed.baseUrl, agencyMixed.managerCookie);
+    const mixedBotStatusEvents: Array<Record<string, unknown>> = [];
+    uiMixed.on("bot-status", (payload: Record<string, unknown>) => mixedBotStatusEvents.push(payload));
+
+    let oldReceivedCommand = false;
+    const agentOld = await pairAgentWithBehavior(serverMixed.baseUrl, agencyMixed.managerCookie, "PW-MIXED-OLD", "0.2.3", (socket, command) => {
+      oldReceivedCommand = true;
+      ackOnly(socket, command);
+    });
+
+    // --- A) 0.2.3 seul, requete explicite -> AGENT_VERSION_INCOMPATIBLE ---
+    uiMixed.emit("start-bot", {
+      botName: "Bot MixedExplicit", category: "Tourisme", agentId: agentOld.agentId, clientRequestId: `tc-mixed-explicit-${RUN_SUFFIX}`
+    });
+    await waitUntil(() => mixedBotStatusEvents.some((e) => e.code === "AGENT_VERSION_INCOMPATIBLE"));
+    assert(
+      mixedBotStatusEvents.some((e) => e.code === "AGENT_VERSION_INCOMPATIBLE"),
+      "TC-mixed A) Requete explicite vers un Agent 0.2.3 -> AGENT_VERSION_INCOMPATIBLE, jamais de commande envoyee"
+    );
+    assert(!oldReceivedCommand, "TC-mixed A) L'Agent 0.2.3 n'a recu AUCUNE commande");
+
+    // --- B) Un agent 0.2.4 CONNECTE mais pas encore pret -> AGENT_SYNCING,
+    // jamais confondu avec VERSION_INCOMPATIBLE (agent different, statut
+    // different). Connexion bas niveau volontaire (jamais AGENT_RUNTIME_STATUS
+    // envoye ici) pour observer precisement cette fenetre transitoire. ---
+    const pairingMid = await requestJson(serverMixed.baseUrl, "POST", "/api/agents/pairing-codes", agencyMixed.managerCookie, {});
+    const codeMid = (pairingMid.body as { pairing: { code: string } }).pairing.code;
+    let midReceivedCommand = false;
+    const midSocket: Socket = await new Promise((resolve, reject) => {
+      const socket = ioClient(`${serverMixed.baseUrl}/agent`, {
+        autoConnect: false,
+        reconnection: false,
+        forceNew: true,
+        auth: { mode: "pair", pairingCode: codeMid, computerName: "PW-MIXED-MID", version: "0.2.4", protocolVersion: 1 }
+      });
+      const timer = setTimeout(() => { socket.disconnect(); reject(new Error("Timeout appairage PW-MIXED-MID.")); }, 8_000);
+      socket.on("connect_error", (error: Error) => { clearTimeout(timer); reject(error); });
+      socket.on("AGENT_CONNECTED", () => { clearTimeout(timer); resolve(socket); });
+      socket.connect();
+    });
+    midSocket.on("AGENT_COMMAND", (command: Record<string, unknown>) => { midReceivedCommand = true; ackOnly(midSocket, command); });
+
+    mixedBotStatusEvents.length = 0;
+    uiMixed.emit("start-bot", { botName: "Bot MixedSyncing", category: "Tourisme", clientRequestId: `tc-mixed-syncing-${RUN_SUFFIX}` });
+    await waitUntil(() => mixedBotStatusEvents.some((e) => e.code === "AGENT_SYNCING"));
+    assert(
+      mixedBotStatusEvents.some((e) => e.code === "AGENT_SYNCING"),
+      "TC-mixed B) Agent 0.2.4 CONNECTE mais pas encore pret (readyForCommands=false) -> AGENT_SYNCING"
+    );
+    assert(!oldReceivedCommand && !midReceivedCommand, "TC-mixed B) Aucune commande envoyee a quiconque pendant la synchronisation");
+
+    // --- C) L'agent devient pret -> auto-selection le dispatche vers lui,
+    // jamais vers le 0.2.3 (agence non bloquee par l'agent incompatible). ---
+    midSocket.emit("AGENT_RUNTIME_STATUS", { sentAt: new Date().toISOString(), bots: [] });
+    mixedBotStatusEvents.length = 0;
+    uiMixed.emit("start-bot", { botName: "Bot MixedReady", category: "Tourisme", clientRequestId: `tc-mixed-ready-${RUN_SUFFIX}` });
+    await waitUntil(() => midReceivedCommand);
+    assert(midReceivedCommand, "TC-mixed C) 0.2.4 pret -> START_BOT auto-dispatche exactement vers lui (agence non bloquee par le 0.2.3)");
+    assert(!oldReceivedCommand, "TC-mixed C) L'Agent 0.2.3 (incompatible) n'a JAMAIS recu de commande, meme en auto-selection");
+    assert(
+      !mixedBotStatusEvents.some((e) => e.code === "AGENT_VERSION_INCOMPATIBLE" || e.code === "AGENT_NOT_CONNECTED"),
+      "TC-mixed C) Aucun code de blocage d'agence: le dispatch vers l'agent compatible a reussi normalement"
+    );
+
+    // --- D) Un troisieme agent, version STRICTEMENT SUPERIEURE a la minimale
+    // -> compatible, autorise. Avec deux agents prets, selection requise -
+    // l'agent 0.2.3 (s'il figure dans la liste brute assainie) reste marque
+    // VERSION_INCOMPATIBLE, jamais presente comme choix valide. ---
+    let newReceivedCommand = false;
+    const agentNew = await pairAgentWithBehavior(serverMixed.baseUrl, agencyMixed.managerCookie, "PW-MIXED-NEW", "0.2.5", (socket, command) => {
+      newReceivedCommand = true;
+      ackOnly(socket, command);
+    });
+    mixedBotStatusEvents.length = 0;
+    uiMixed.emit("start-bot", { botName: "Bot MixedSelection", category: "Tourisme", clientRequestId: `tc-mixed-selection-${RUN_SUFFIX}` });
+    await waitUntil(() => mixedBotStatusEvents.some((e) => e.code === "AGENT_SELECTION_REQUIRED"));
+    const selectionEvent = mixedBotStatusEvents.find((e) => e.code === "AGENT_SELECTION_REQUIRED");
+    assert(Boolean(selectionEvent), "TC-mixed D) Deux agents compatibles+prets -> AGENT_SELECTION_REQUIRED (comportement multi-agent existant inchange)");
+    const selectableAgents = (selectionEvent?.agents as Array<{ agentId: number; status: string }> | undefined) ?? [];
+    const oldEntry = selectableAgents.find((a) => a.agentId === agentOld.agentId);
+    assert(
+      !oldEntry || oldEntry.status === "VERSION_INCOMPATIBLE",
+      "TC-mixed D) Si l'Agent 0.2.3 figure dans la liste brute, son statut reste explicitement VERSION_INCOMPATIBLE (jamais presente comme selectionnable)"
+    );
+
+    uiMixed.emit("start-bot", {
+      botName: "Bot MixedSelection", category: "Tourisme", agentId: agentNew.agentId, clientRequestId: `tc-mixed-selection-${RUN_SUFFIX}`
+    });
+    await waitUntil(() => newReceivedCommand);
+    assert(newReceivedCommand, "TC-mixed D) Version strictement superieure a AGENT_MIN_VERSION (0.2.5 > 0.2.4) -> autorisee");
+    assert(!oldReceivedCommand, "TC-mixed D) L'Agent 0.2.3 n'a recu AUCUNE commande sur l'ensemble du scenario");
+
+    // --- E) requiredAgentVersion (client-config) reflete fidelement AGENT_MIN_VERSION ---
+    const clientConfigMixed = await requestJson(serverMixed.baseUrl, "GET", "/api/client-config", agencyMixed.managerCookie);
+    assert(
+      (clientConfigMixed.body as { requiredAgentVersion?: string } | null)?.requiredAgentVersion === "0.2.4",
+      `TC-mixed E) /api/client-config expose requiredAgentVersion=AGENT_MIN_VERSION (recu: ${JSON.stringify(clientConfigMixed.body)})`
+    );
+
+    midSocket.disconnect();
+    agentOld.socket.disconnect();
+    agentNew.socket.disconnect();
+    uiMixed.disconnect();
+
     // ===================== Serveur separe: legacy_vm inchange =====================
     // Valeurs explicites (pas juste omises): le .env reel du depot peut definir
     // BOT_EXECUTION_MODE=agent pour des tests manuels, et dotenv ne complete
