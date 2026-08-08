@@ -841,6 +841,52 @@ tr.needs-validation {
   margin-top: 8px;
 }
 
+.outline.full {
+  width: 100%;
+}
+
+/* CHANTIER CIBLE (gestion des echeances et impayes des agences): ecran de
+   blocage suspension paiement - reutilise .login-screen/.login-card (meme
+   mise en page plein ecran centree) avec un accent rouge distinctif, jamais
+   la palette ambre du bandeau Agent (Task 3). */
+.billing-lock-card {
+  border-color: var(--red);
+  border-width: 2px;
+}
+
+.billing-lock-title {
+  color: var(--red);
+  font-size: 20px;
+  font-weight: 700;
+  margin: 0;
+}
+
+/* Bandeau de facturation - distinct du bandeau Agent (fond/bordure propres),
+   jamais reutilise pour un autre sujet que la facturation. */
+.billing-banner {
+  background: #fde8e6;
+  border-bottom: 1px solid var(--red);
+  color: #7a251d;
+}
+
+.billing-banner.billing-banner-override {
+  background: #e7f3ff;
+  border-bottom-color: #1f6fb2;
+  color: #0d4a80;
+}
+
+.billing-inline-form {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.billing-inline-form input {
+  min-height: 30px;
+  padding: 0 6px;
+}
+
 .agent-modal-overlay {
   align-items: center;
   background: rgba(6, 38, 74, 0.55);

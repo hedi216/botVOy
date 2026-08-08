@@ -33,6 +33,26 @@
       </form>
     </section>
 
+    <!-- CHANTIER CIBLE (gestion des echeances et impayes des agences):
+         ecran de blocage DEDIE, distinct du login et de l'app-layout - jamais
+         le Dashboard/Bot derriere. Le seul chemin de sortie est la
+         deconnexion (mecanique reutilisee de logout() dans app.js). -->
+    <section class="login-screen" id="billingLockScreen" hidden>
+      <div class="login-card billing-lock-card">
+        <div class="brand-row">
+          <img class="login-logo" src="/assets/rendezbot-logo.svg" alt="RendezBot">
+          <div>
+            <h1>RendezBot</h1>
+            <p>Acces suspendu</p>
+          </div>
+        </div>
+        <p class="billing-lock-title">Acces suspendu</p>
+        <p id="billingLockMessage">Le paiement prevu le <strong id="billingLockDate">-</strong> n'a pas ete regularise.</p>
+        <p>Contactez votre agence ou l'administrateur RendezBot.</p>
+        <button id="billingLockLogout" class="outline full" type="button">Deconnexion</button>
+      </div>
+    </section>
+
     <main class="app-layout" id="appLayout" hidden>
       <aside class="sidebar">
         <div class="sidebar-brand">
@@ -115,6 +135,15 @@
             <button id="agentUpdateBannerDownload" class="primary" type="button" hidden>Telecharger la mise a jour</button>
             <button id="agentUpdateBannerConfigure" class="outline" type="button">Voir la page de mise a jour</button>
           </div>
+        </div>
+
+        <!-- CHANTIER CIBLE (gestion des echeances et impayes des agences):
+             bandeau de FACTURATION - jamais le bandeau Agent (Task 3), jamais
+             bloquant (due_today/grace_period/override laissent l'app
+             pleinement utilisable). Masque pour role 0 et pour les statuts
+             not_configured/current. -->
+        <div id="billingBanner" class="agent-banner billing-banner" hidden>
+          <p id="billingBannerMessage"></p>
         </div>
 
         <section class="content">
@@ -564,7 +593,9 @@
                     <th>Email notifications</th>
                     <th>Utilisateurs actifs</th>
                     <th>Limite</th>
-                    <th>Statut</th>
+                    <th>Statut agence</th>
+                    <th>Prochain paiement</th>
+                    <th>Statut paiement</th>
                     <th>Actions</th>
                   </tr>
                 </thead>

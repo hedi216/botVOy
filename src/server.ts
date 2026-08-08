@@ -73,6 +73,16 @@ import {
   toPublicAgentCommand,
   toPublicAgentCommandDetail
 } from "./agentCommandService.js";
+import {
+  checkAgencyBillingAccess,
+  computeAgencyBillingState,
+  getAgencyBillingState,
+  PAYMENT_SUSPENDED_CODE,
+  PAYMENT_SUSPENDED_MESSAGE,
+  requireAgencyBillingAccess,
+  updateAgencyBilling
+} from "./agencyBillingService.js";
+import { startAgencyBillingScheduler } from "./agencyBillingScheduler.js";
 
 type SessionOwner = {
   userId: number;
@@ -119,6 +129,27 @@ if (featureFlags.agentUiEnabled) {
   });
 }
 
+// CHANTIER CIBLE (gestion des echeances et impayes): meme si l'agence est
+// suspendue, le login REUSSIT toujours pour des identifiants corrects (une
+// session limitee est necessaire pour afficher l'ecran de suspension et
+// permettre logout - jamais un blocage au niveau du login lui-meme). Le
+// signal distinctif n'est pas un statut HTTP special mais l'objet `billing`
+// inclus dans la reponse: billing.status==="suspended" (ou plus generalement
+// !accessAllowed) est ce que le frontend utilise pour basculer immediatement
+// sur l'ecran verrouille des la reponse de login, sans jamais recalculer la
+// logique metier lui-meme (source unique: computeAgencyBillingState cote
+// serveur). null pour role 0 (admin global, jamais concerne).
+const billingContextForUser = async (user: DbUser): Promise<ReturnType<typeof computeAgencyBillingState> | null> => {
+  if (user.role === 0 || !user.agency_id) {
+    return null;
+  }
+  try {
+    return await getAgencyBillingState(user.agency_id);
+  } catch {
+    return null;
+  }
+};
+
 app.post("/api/login", async (req, res) => {
   const { login, password } = req.body as { login?: string; password?: string };
   const user = await authenticateUser(login ?? "", password ?? "");
@@ -133,7 +164,7 @@ app.post("/api/login", async (req, res) => {
     httpOnly: true,
     sameSite: "lax"
   });
-  res.json({ user });
+  res.json({ user, billing: await billingContextForUser(user) });
 });
 
 app.post("/api/logout", (req, res) => {
@@ -142,8 +173,8 @@ app.post("/api/logout", (req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/api/me", requireAuth, (req: AuthenticatedRequest, res) => {
-  res.json({ user: req.user });
+app.get("/api/me", requireAuth, async (req: AuthenticatedRequest, res) => {
+  res.json({ user: req.user, billing: await billingContextForUser(req.user!) });
 });
 
 // CORRECTIF CIBLE (release 0.2.4, bandeau de mise a jour obligatoire):
@@ -233,8 +264,17 @@ app.post("/api/profile/password", requireAuth, async (req: AuthenticatedRequest,
   res.json({ ok: true });
 });
 
+// CHANTIER CIBLE: `billing` est calcule ici (jamais stocke) et ajoute a
+// chaque ligne, en plus des champs bruts deja renvoyes par listAgencies()
+// (SELECT a.* -> next_payment_date/billing_override_until/payment_suspended_at
+// deja presents automatiquement) - la meme fonction unique
+// computeAgencyBillingState() que le guard d'acces et le scheduler, jamais
+// une logique recalculee cote frontend.
 app.get("/api/agencies", requireAuth, requireAdmin, async (_req, res) => {
-  res.json({ agencies: await listAgencies() });
+  const agencies = await listAgencies();
+  res.json({
+    agencies: agencies.map((agency) => ({ ...agency, billing: computeAgencyBillingState(agency) }))
+  });
 });
 
 app.post("/api/agencies", requireAuth, requireAdmin, async (req, res) => {
@@ -263,6 +303,24 @@ app.patch("/api/agencies/:id", requireAuth, requireAdmin, async (req, res) => {
   });
 });
 
+// CHANTIER CIBLE (gestion des echeances et impayes): route DEDIEE, jamais
+// fusionnee dans le PATCH /api/agencies/:id generique ci-dessus, qui repose
+// sur COALESCE pour les champs absents - un COALESCE ne peut jamais exprimer
+// "remettre explicitement billing_override_until a NULL" (supprimer une
+// autorisation temporaire), contrairement a la semantique explicite voulue
+// ici (cle absente = ne pas toucher, cle presente avec valeur null =
+// effacer reellement). Reserve a role 0 (requireAdmin), comme le reste des
+// routes /api/agencies.
+app.patch("/api/agencies/:id/billing", requireAuth, requireAdmin, async (req: AuthenticatedRequest, res) => {
+  const body = req.body as { nextPaymentDate?: string | null; overrideUntil?: string | null };
+  try {
+    const agency = await updateAgencyBilling(Number(req.params.id), body, req.user!.id);
+    res.json({ agency: { ...agency, billing: computeAgencyBillingState(agency) } });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "Requete invalide." });
+  }
+});
+
 app.get("/api/users", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
   res.json({ users: await listUsersForRequester(req.user!) });
 });
@@ -284,6 +342,10 @@ app.post("/api/users", requireAuth, requireAgencyManager, async (req: Authentica
     return;
   }
 
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
+    return;
+  }
+
   if (!body.email || !body.email.trim()) {
     res.status(400).json({ error: "L'adresse e-mail est obligatoire." });
     return;
@@ -302,7 +364,16 @@ app.post("/api/users", requireAuth, requireAgencyManager, async (req: Authentica
   });
 });
 
+// CHANTIER CIBLE: la gestion des utilisateurs d'agence est une "modification
+// metier qui permet de continuer a exploiter RendezBot" (audit exhaustif) -
+// bloquee pour une agence billing-suspendue. Role 1 ne peut de toute facon
+// agir que sur SA PROPRE agence (deja applique par updateUser/resetUserPassword
+// ci-dessous): req.user!.agency_id est donc la bonne agence a verifier ici,
+// role 0 etant deja exempte par requireAgencyBillingAccess.
 app.patch("/api/users/:id", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
+  if (!(await requireAgencyBillingAccess(req, res, req.user!.agency_id))) {
+    return;
+  }
   const body = req.body as { name?: string; email?: string; photoUrl?: string; isActive?: boolean; role?: 1 | 2 };
   const role = body.role === 1 || body.role === 2 ? body.role : undefined;
   res.json({
@@ -317,6 +388,9 @@ app.patch("/api/users/:id", requireAuth, requireAgencyManager, async (req: Authe
 });
 
 app.post("/api/users/:id/reset-password", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
+  if (!(await requireAgencyBillingAccess(req, res, req.user!.agency_id))) {
+    return;
+  }
   res.json(await resetUserPassword(Number(req.params.id), req.user!));
 });
 
@@ -341,6 +415,10 @@ app.patch("/api/monitoring-settings", requireAuth, async (req: AuthenticatedRequ
 
   if (![0, 1].includes(req.user!.role) || !agencyId) {
     res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
     return;
   }
 
@@ -401,6 +479,10 @@ app.post("/api/extensions", requireAuth, async (req: AuthenticatedRequest, res) 
     return;
   }
 
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
+    return;
+  }
+
   res.json({
     extension: await createExtensionLink({
       agencyId,
@@ -420,6 +502,10 @@ app.patch("/api/extensions/:id", requireAuth, async (req: AuthenticatedRequest, 
     return;
   }
 
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
+    return;
+  }
+
   res.json({
     extension: await updateExtensionLink(agencyId, Number(req.params.id), body)
   });
@@ -430,6 +516,10 @@ app.delete("/api/extensions/:id", requireAuth, async (req: AuthenticatedRequest,
 
   if (!agencyId) {
     res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
     return;
   }
 
@@ -449,6 +539,10 @@ app.patch("/api/recording-extension/settings", requireAuth, async (req: Authenti
 
   if (!agencyId) {
     res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
     return;
   }
 
@@ -483,6 +577,10 @@ app.post("/api/recording-extension/prepare", requireAuth, async (req: Authentica
     return;
   }
 
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
+    return;
+  }
+
   const settings = (await getAgencySettings(agencyId)).recordingExtension;
   const snapshot = await startRecordingExtensionPreparation(agencyId, settings, {
     onEvent: (level, message, prepareSnapshot) => {
@@ -505,6 +603,10 @@ app.post("/api/recording-extension/confirm", requireAuth, async (req: Authentica
     return;
   }
 
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
+    return;
+  }
+
   const profile = await confirmRecordingExtensionPreparation(agencyId);
   emitRecordingExtensionStatus(agencyId, {
     level: "success",
@@ -519,6 +621,10 @@ app.post("/api/recording-extension/cancel", requireAuth, async (req: Authenticat
 
   if (!agencyId) {
     res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
     return;
   }
 
@@ -539,6 +645,10 @@ app.post("/api/recording-extension/profiles/:id/manage", requireAuth, async (req
     return;
   }
 
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
+    return;
+  }
+
   const preparation = await startProfileExtensionManagement(agencyId, Number(req.params.id));
   emitRecordingExtensionStatus(agencyId, {
     level: "info",
@@ -555,6 +665,10 @@ app.post("/api/recording-extension/profiles/:id/stop-management", requireAuth, a
     return;
   }
 
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
+    return;
+  }
+
   stopProfileExtensionManagement(Number(req.params.id));
   emitRecordingExtensionStatus(agencyId, {
     level: "info",
@@ -568,6 +682,10 @@ app.delete("/api/recording-extension/profiles/:id", requireAuth, async (req: Aut
 
   if (!agencyId) {
     res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
     return;
   }
 
@@ -717,9 +835,20 @@ app.delete("/api/agent-commands/:commandId", requireAuth, async (req: Authentica
   res.json({ ok: true });
 });
 
+// CHANTIER CIBLE: "creation de nouveaux pairing codes" est explicitement
+// nommee comme action a bloquer pour une agence billing-suspendue (provisionne
+// une NOUVELLE capacite Agent). A l'inverse, renommer/revoquer un agent
+// (routes suivantes) reste volontairement EXEMPT: ces actions ne "permettent
+// jamais de continuer a exploiter" (elles reduisent ou sont neutres vis-a-vis
+// de la capacite), et revoquer doit rester possible pour securiser/decommissionner
+// une machine meme agence suspendue.
 app.post("/api/agents/pairing-codes", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
   const agencyId = requireAgencyId(req, res);
   if (agencyId === null) {
+    return;
+  }
+
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
     return;
   }
 
@@ -1288,6 +1417,23 @@ io.on("connection", (socket) => {
     const password = payload?.password || "";
     const owner: SessionOwner = { userId: user.id, agencyId: user.agency_id, botName, category, login };
 
+    // CHANTIER CIBLE (gestion des echeances et impayes): point de blocage
+    // CENTRAL pour "demarrer de nouveaux bots" - couvre les DEUX modes
+    // (agent ET legacy_vm, qui partagent ce meme handler) en un seul
+    // controle, avant toute branche. Charge TOUJOURS l'etat de facturation
+    // depuis PostgreSQL (jamais depuis `user`, un DbUser peut etre le
+    // snapshot memoire perime de socketUsers/getUserFromSocket - cf.
+    // src/auth.ts). Ne bloque JAMAIS pause/resume/continue/stop d'un bot deja
+    // actif (aucun controle equivalent n'est ajoute sur ces handlers,
+    // volontairement - cf. rapport final): seul le lancement d'un NOUVEAU bot
+    // est concerne ici.
+    const billingCheck = await checkAgencyBillingAccess(user.role, user.agency_id);
+    if (!billingCheck.allowed) {
+      emitOwnedLog(socket, owner, makeEvent("error", PAYMENT_SUSPENDED_MESSAGE));
+      socket.emit("bot-status", { status: "error", code: PAYMENT_SUSPENDED_CODE, billing: billingCheck.state });
+      return;
+    }
+
     // Mode agent: plus de refus systematique (Phase 2) mais un vrai dispatch.
     // Le moteur Chrome/Playwright reste hors de cette phase (Phase 4): aucune
     // reservation de profil local ni aucun lancement de Chrome n'a lieu ici,
@@ -1653,10 +1799,18 @@ const listen = (port: number): void => {
 
 listen(preferredPort);
 
-initUserModule().catch((error) => {
-  logger.error(`Module utilisateurs indisponible: ${error instanceof Error ? error.message : String(error)}`);
-  logger.error("Verifie que PostgreSQL est installe, lance, et accessible avec postgres / SMART.");
-});
+initUserModule()
+  .then(() => {
+    // CHANTIER CIBLE (gestion des echeances et impayes): demarre APRES la
+    // migration (ensureSchema(), executee par initUserModule()) - jamais en
+    // parallele, pour ne jamais interroger next_payment_date/les tables
+    // agency_billing_* avant qu'elles n'existent sur une base fraiche.
+    startAgencyBillingScheduler();
+  })
+  .catch((error) => {
+    logger.error(`Module utilisateurs indisponible: ${error instanceof Error ? error.message : String(error)}`);
+    logger.error("Verifie que PostgreSQL est installe, lance, et accessible avec postgres / SMART.");
+  });
 
 process.once("exit", cleanupServerLock);
 process.once("SIGINT", () => {

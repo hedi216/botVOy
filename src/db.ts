@@ -38,6 +38,36 @@ export type DbAgency = {
   refresh_every_cycles: number;
   rate_limit_cooldown_minutes: number;
   created_at: string;
+  // CHANTIER CIBLE (gestion des echeances et impayes): source de verite pour
+  // computeAgencyBillingState() (src/agencyBillingService.ts) - jamais un
+  // statut stocke (deliberement absent ici), toujours derive dynamiquement de
+  // ces 3 champs + de la date du jour (Africa/Tunis). NULL par defaut (donc
+  // pour toute agence existante avant cette migration): "not_configured",
+  // jamais suspendue par la seule migration.
+  next_payment_date: string | null;
+  billing_override_until: string | null;
+  payment_suspended_at: string | null;
+  billing_updated_at: string | null;
+};
+
+export type DbAgencyBillingNotification = {
+  id: number;
+  agency_id: number;
+  payment_due_date: string;
+  stage: string;
+  sent_at: string | null;
+  last_error: string | null;
+  created_at: string;
+};
+
+export type DbAgencyBillingEvent = {
+  id: number;
+  agency_id: number;
+  event_type: string;
+  old_value: string | null;
+  new_value: string | null;
+  created_by_user_id: number | null;
+  created_at: string;
 };
 
 export type RecordingExtensionStatus =
@@ -406,5 +436,55 @@ export const ensureSchema = async (): Promise<void> => {
     CREATE INDEX IF NOT EXISTS agent_commands_expiry_sweep_idx
       ON agent_commands (expires_at)
       WHERE status IN ('pending', 'sent', 'acknowledged');
+  `);
+
+  // CHANTIER CIBLE (gestion des echeances et impayes des agences): idempotent
+  // comme toutes les migrations ci-dessus - toute agence existante recoit
+  // next_payment_date=NULL (via le DEFAULT implicite d'une colonne nullable
+  // sans DEFAULT), donc "not_configured"/accessAllowed=true immediatement
+  // apres deploiement, jamais suspendue par la seule migration. Aucun
+  // billing_status stocke (deliberement absent): toujours derive par
+  // computeAgencyBillingState() a partir de ces 3 champs + la date du jour.
+  await pool.query(`
+    ALTER TABLE agencies
+      ADD COLUMN IF NOT EXISTS next_payment_date DATE,
+      ADD COLUMN IF NOT EXISTS billing_override_until TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS payment_suspended_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS billing_updated_at TIMESTAMPTZ;
+
+    CREATE TABLE IF NOT EXISTS agency_billing_notifications (
+      id SERIAL PRIMARY KEY,
+      agency_id INTEGER NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
+      payment_due_date DATE NOT NULL,
+      stage TEXT NOT NULL CHECK (stage IN (
+        'D_MINUS_7', 'D_MINUS_2', 'DUE_TODAY',
+        'OVERDUE_1', 'OVERDUE_2', 'OVERDUE_3', 'OVERDUE_4', 'OVERDUE_5', 'OVERDUE_6',
+        'SUSPENDED'
+      )),
+      sent_at TIMESTAMPTZ,
+      last_error TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT agency_billing_notifications_unique UNIQUE (agency_id, payment_due_date, stage)
+    );
+
+    CREATE TABLE IF NOT EXISTS agency_billing_events (
+      id SERIAL PRIMARY KEY,
+      agency_id INTEGER NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL CHECK (event_type IN (
+        'PAYMENT_DATE_CHANGED', 'OVERRIDE_GRANTED', 'OVERRIDE_REMOVED', 'SUSPENDED', 'ACCESS_RESTORED'
+      )),
+      old_value TEXT,
+      new_value TEXT,
+      created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS agency_billing_notifications_agency_idx
+      ON agency_billing_notifications (agency_id, payment_due_date);
+    CREATE INDEX IF NOT EXISTS agency_billing_events_agency_idx
+      ON agency_billing_events (agency_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS agencies_next_payment_date_idx
+      ON agencies (next_payment_date)
+      WHERE next_payment_date IS NOT NULL;
   `);
 };

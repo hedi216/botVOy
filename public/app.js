@@ -2,6 +2,7 @@ const socket = io();
 
 const state = {
   user: null,
+  billing: null,
   users: [],
   agencies: [],
   logs: [],
@@ -110,7 +111,12 @@ const els = {
   currentPassword: $("#currentPassword"),
   newPassword: $("#newPassword"),
   confirmPassword: $("#confirmPassword"),
-  passwordMessage: $("#passwordMessage")
+  passwordMessage: $("#passwordMessage"),
+  billingLockScreen: $("#billingLockScreen"),
+  billingLockDate: $("#billingLockDate"),
+  billingLockLogout: $("#billingLockLogout"),
+  billingBanner: $("#billingBanner"),
+  billingBannerMessage: $("#billingBannerMessage")
 };
 
 const pageMeta = {
@@ -154,7 +160,17 @@ const requestJson = async (url, options = {}) => {
   }
 
   if (!response.ok) {
-    throw new Error(data.error || "Erreur serveur");
+    // CHANTIER CIBLE (gestion des echeances et impayes des agences):
+    // reconnaissance GLOBALE du code machine PAYMENT_SUSPENDED, quel que soit
+    // l'appelant - jamais un simple texte d'erreur local a chaque formulaire.
+    // Bascule immediate sur l'ecran de blocage, PUIS l'erreur continue a
+    // remonter normalement pour que l'appelant arrete son propre traitement.
+    if (data.code === "PAYMENT_SUSPENDED") {
+      showBillingLockScreen(data.billing);
+    }
+    const error = new Error(data.error || "Erreur serveur");
+    error.code = data.code;
+    throw error;
   }
 
   return data;
@@ -172,6 +188,95 @@ const formatDate = (value) => {
     hour: "2-digit",
     minute: "2-digit"
   });
+};
+
+// CHANTIER CIBLE (gestion des echeances et impayes des agences): les dates de
+// facturation sont des chaines 'YYYY-MM-DD' pures (jamais un objet Date, pour
+// eviter tout glissement de fuseau horaire cote navigateur) - reformatage
+// texte simple, jamais new Date(...).
+const formatDateOnly = (dateOnly) => {
+  if (!dateOnly) {
+    return "-";
+  }
+  const [year, month, day] = dateOnly.split("-");
+  return `${day}/${month}/${year}`;
+};
+
+// Ecran de blocage suspension paiement - distinct du login (aucun retour
+// possible vers l'app, seule la deconnexion est proposee). Appele depuis
+// requestJson (toute reponse 403 PAYMENT_SUSPENDED) ET depuis
+// applyBillingState (etat retourne par un /api/login ou /api/me reussi).
+const showBillingLockScreen = (billing) => {
+  state.billing = billing || state.billing;
+  els.loginScreen.hidden = true;
+  els.appLayout.hidden = true;
+  els.billingLockScreen.hidden = false;
+  els.billingLockDate.textContent = formatDateOnly(state.billing?.nextPaymentDate);
+};
+
+const hideBillingLockScreen = () => {
+  els.billingLockScreen.hidden = true;
+};
+
+// Bandeau non bloquant (due_today/grace_period/override) - jamais reutilise
+// pour VERSION_INCOMPATIBLE (Task 3, agentUpdateBanner) ni l'inverse.
+const renderBillingBanner = (billing) => {
+  if (!billing || !els.billingBanner) {
+    return;
+  }
+
+  els.billingBanner.classList.remove("billing-banner-override");
+
+  if (billing.status === "due_today") {
+    els.billingBannerMessage.textContent = `Votre paiement RendezBot etait du aujourd'hui (${formatDateOnly(billing.nextPaymentDate)}). Merci de regulariser votre situation.`;
+    els.billingBanner.hidden = false;
+    return;
+  }
+
+  if (billing.status === "grace_period") {
+    els.billingBannerMessage.textContent = `Paiement en attente depuis le ${formatDateOnly(billing.nextPaymentDate)}. Il vous reste ${billing.graceDaysRemaining} jour${billing.graceDaysRemaining > 1 ? "s" : ""} avant la suspension de l'acces.`;
+    els.billingBanner.hidden = false;
+    return;
+  }
+
+  if (billing.status === "override") {
+    els.billingBanner.classList.add("billing-banner-override");
+    els.billingBannerMessage.textContent = `Acces autorise temporairement jusqu'au ${formatDate(billing.overrideUntil)}, en attente de regularisation du paiement du ${formatDateOnly(billing.nextPaymentDate)}.`;
+    els.billingBanner.hidden = false;
+    return;
+  }
+
+  els.billingBanner.hidden = true;
+};
+
+// Point d'entree unique appele apres chaque reponse contenant `billing`
+// (login, /api/me, rafraichissement periodique) - jamais le seul canal
+// requestJson/PAYMENT_SUSPENDED, qui ne couvre que les refus explicites d'une
+// action business alors que la session est deja ouverte.
+const applyBillingState = (billing) => {
+  state.billing = billing || null;
+
+  if (!billing) {
+    hideBillingLockScreen();
+    if (els.billingBanner) {
+      els.billingBanner.hidden = true;
+    }
+    return;
+  }
+
+  if (!billing.accessAllowed) {
+    showBillingLockScreen(billing);
+    return;
+  }
+
+  hideBillingLockScreen();
+  // Restaure l'app si l'ecran de blocage l'avait masquee (ex. rafraichissement
+  // periodique detectant un paiement regularise entre-temps) - sans effet si
+  // l'utilisateur n'est pas encore authentifie (boot() gere ce cas seul).
+  if (state.user) {
+    els.appLayout.hidden = false;
+  }
+  renderBillingBanner(billing);
 };
 
 const roleLabel = (role) => {
@@ -350,6 +455,28 @@ const loadAgencies = async () => {
   renderAgencies();
 };
 
+// CHANTIER CIBLE (gestion des echeances et impayes des agences): badge de
+// statut COMMERCIAL (billing.status), volontairement separe du badge
+// "Statut agence" (is_active, administratif) ci-dessus - jamais fusionnes,
+// pour ne pas laisser croire qu'une reactivation de l'un reactive l'autre.
+const billingStatusBadge = (billing) => {
+  switch (billing?.status) {
+    case "current":
+      return makeBadge("A jour", "green");
+    case "due_today":
+      return makeBadge("Echeance du jour", "amber");
+    case "grace_period":
+      return makeBadge(`Delai de grace (${billing.graceDaysRemaining}j)`, "amber");
+    case "override":
+      return makeBadge("Autorisation temporaire", "blue");
+    case "suspended":
+      return makeBadge("Suspendu", "red");
+    case "not_configured":
+    default:
+      return makeBadge("Non configure", "grey");
+  }
+};
+
 const renderAgencies = () => {
   els.agencyTableBody.replaceChildren();
   els.userAgency.replaceChildren();
@@ -360,6 +487,7 @@ const renderAgencies = () => {
     option.textContent = agency.name;
     els.userAgency.append(option);
 
+    const billing = agency.billing || null;
     const row = document.createElement("tr");
     addCell(row, agency.name);
     addCell(row, agency.notification_email || "-");
@@ -369,6 +497,57 @@ const renderAgencies = () => {
     const statusCell = document.createElement("td");
     statusCell.append(makeBadge(agency.is_active ? "Active" : "Inactive", agency.is_active ? "green" : "red"));
     row.append(statusCell);
+
+    // Prochain paiement: <input type="date"> + bouton "Enregistrer" - jamais
+    // window.prompt (correction utilisateur explicite).
+    const paymentDateCell = document.createElement("td");
+    const paymentDateForm = document.createElement("div");
+    paymentDateForm.className = "billing-inline-form";
+    const paymentDateInput = document.createElement("input");
+    paymentDateInput.type = "date";
+    paymentDateInput.value = billing?.nextPaymentDate || "";
+    paymentDateInput.dataset.role = "next-payment-date-input";
+    const paymentDateSave = document.createElement("button");
+    paymentDateSave.type = "button";
+    paymentDateSave.className = "outline";
+    paymentDateSave.textContent = "Enregistrer";
+    paymentDateSave.dataset.saveNextPaymentDate = String(agency.id);
+    paymentDateForm.append(paymentDateInput, paymentDateSave);
+    paymentDateCell.append(paymentDateForm);
+    row.append(paymentDateCell);
+
+    // Statut paiement: badge derive de computeAgencyBillingState (jamais un
+    // etat stocke) + gestion inline de l'autorisation temporaire.
+    const billingStatusCell = document.createElement("td");
+    billingStatusCell.append(billingStatusBadge(billing));
+
+    if (billing?.status === "override") {
+      const overrideInfo = document.createElement("div");
+      overrideInfo.className = "billing-inline-form";
+      const overrideText = document.createElement("small");
+      overrideText.textContent = `Jusqu'au ${formatDate(billing.overrideUntil)}`;
+      const removeOverrideButton = document.createElement("button");
+      removeOverrideButton.type = "button";
+      removeOverrideButton.className = "outline danger-text";
+      removeOverrideButton.textContent = "Supprimer l'autorisation";
+      removeOverrideButton.dataset.removeOverride = String(agency.id);
+      overrideInfo.append(overrideText, removeOverrideButton);
+      billingStatusCell.append(overrideInfo);
+    } else {
+      const overrideForm = document.createElement("div");
+      overrideForm.className = "billing-inline-form";
+      const overrideInput = document.createElement("input");
+      overrideInput.type = "datetime-local";
+      overrideInput.dataset.role = "override-until-input";
+      const grantOverrideButton = document.createElement("button");
+      grantOverrideButton.type = "button";
+      grantOverrideButton.className = "outline";
+      grantOverrideButton.textContent = "Autoriser temporairement";
+      grantOverrideButton.dataset.grantOverride = String(agency.id);
+      overrideForm.append(overrideInput, grantOverrideButton);
+      billingStatusCell.append(overrideForm);
+    }
+    row.append(billingStatusCell);
 
     const actionCell = document.createElement("td");
     actionCell.className = "action-cell";
@@ -804,7 +983,7 @@ els.loginForm.addEventListener("submit", async (event) => {
   els.loginError.textContent = "";
 
   try {
-    const { user } = await requestJson("/api/login", {
+    const { user, billing } = await requestJson("/api/login", {
       method: "POST",
       body: JSON.stringify({
         login: els.loginInput.value,
@@ -812,6 +991,7 @@ els.loginForm.addEventListener("submit", async (event) => {
       })
     });
     setAuthenticated(user);
+    applyBillingState(billing);
     socket.disconnect();
     socket.connect();
     await routeAfterAuth();
@@ -827,6 +1007,7 @@ const logout = async () => {
 
 els.sidebarLogout.addEventListener("click", logout);
 els.dropdownLogout.addEventListener("click", logout);
+els.billingLockLogout.addEventListener("click", logout);
 
 els.accountButton.addEventListener("click", () => {
   els.accountDropdown.hidden = !els.accountDropdown.hidden;
@@ -869,6 +1050,44 @@ els.agencyTableBody.addEventListener("click", async (event) => {
     await requestJson(`/api/agencies/${emailButton.dataset.agencyEmail}`, {
       method: "PATCH",
       body: JSON.stringify({ notificationEmail: nextEmail.trim() || null })
+    });
+    await loadAgencies();
+    return;
+  }
+
+  // CHANTIER CIBLE (gestion des echeances et impayes des agences): route
+  // DEDIEE /api/agencies/:id/billing - jamais le PATCH generique ci-dessus
+  // (son COALESCE ne peut pas exprimer "remettre explicitement a NULL").
+  const saveDateButton = event.target.closest("button[data-save-next-payment-date]");
+  if (saveDateButton) {
+    const input = saveDateButton.closest("tr").querySelector('input[data-role="next-payment-date-input"]');
+    await requestJson(`/api/agencies/${saveDateButton.dataset.saveNextPaymentDate}/billing`, {
+      method: "PATCH",
+      body: JSON.stringify({ nextPaymentDate: input.value || null })
+    });
+    await loadAgencies();
+    return;
+  }
+
+  const grantOverrideButton = event.target.closest("button[data-grant-override]");
+  if (grantOverrideButton) {
+    const input = grantOverrideButton.closest("tr").querySelector('input[data-role="override-until-input"]');
+    if (!input.value) {
+      return;
+    }
+    await requestJson(`/api/agencies/${grantOverrideButton.dataset.grantOverride}/billing`, {
+      method: "PATCH",
+      body: JSON.stringify({ overrideUntil: input.value })
+    });
+    await loadAgencies();
+    return;
+  }
+
+  const removeOverrideButton = event.target.closest("button[data-remove-override]");
+  if (removeOverrideButton) {
+    await requestJson(`/api/agencies/${removeOverrideButton.dataset.removeOverride}/billing`, {
+      method: "PATCH",
+      body: JSON.stringify({ overrideUntil: null })
     });
     await loadAgencies();
     return;
@@ -1208,7 +1427,15 @@ socket.on("bot-session", (session) => {
   updateStartBotAvailability();
 });
 
-socket.on("bot-status", ({ sessionId, status }) => {
+socket.on("bot-status", ({ sessionId, status, code, billing }) => {
+  // CHANTIER CIBLE (gestion des echeances et impayes des agences): start-bot
+  // passe par Socket.IO, jamais requestJson - la reconnaissance du code
+  // machine PAYMENT_SUSPENDED doit donc AUSSI etre geree ici pour rester
+  // "globale" (pas seulement HTTP).
+  if (code === "PAYMENT_SUSPENDED") {
+    showBillingLockScreen(billing);
+  }
+
   const session = state.sessions.find((item) => item.id === sessionId);
   if (session) {
     session.status = status;
@@ -1294,10 +1521,32 @@ socket.on("maintenance", ({ pid, port, maxClients, agencyActiveCount, agencyMaxC
   }
 });
 
+// Rafraichissement periodique leger de l'etat de facturation en session (ex.
+// une agence suspendue par le scheduler, ou reactivee par l'admin, pendant
+// qu'un utilisateur reste connecte) - jamais pour role 0 (toujours
+// accessAllowed=true, aucun etat a suivre). Ignore silencieusement les echecs
+// reseau: requestJson gere deja elle-meme le cas PAYMENT_SUSPENDED explicite.
+const BILLING_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+
+const refreshBillingState = async () => {
+  if (!state.user || state.user.role === 0) {
+    return;
+  }
+  try {
+    const { billing } = await requestJson("/api/me");
+    applyBillingState(billing);
+  } catch {
+    // Suspension deja geree par requestJson; autres erreurs (reseau) ignorees.
+  }
+};
+
+setInterval(refreshBillingState, BILLING_REFRESH_INTERVAL_MS);
+
 const boot = async () => {
   try {
-    const { user } = await requestJson("/api/me");
+    const { user, billing } = await requestJson("/api/me");
     setAuthenticated(user);
+    applyBillingState(billing);
     await routeAfterAuth();
   } catch {
     els.loginScreen.hidden = false;
