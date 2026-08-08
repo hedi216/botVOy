@@ -9,6 +9,7 @@ import {
   homeCountryPagePattern,
   isAuthPage,
   isServiceLevelPage,
+  isTlsLoggedOutLandingPage,
   travelGroupsPagePattern
 } from "../shared/loginFlow.js";
 import { HUMAN_BLOCK_GRACE_MS, monitorAppointments, waitForConditionToClear } from "../shared/monitor.js";
@@ -49,6 +50,14 @@ const WORKFLOW_RECOVERY_FINAL_ATTEMPT = 4;
 const WORKFLOW_RECOVERY_RETRY_INTERVAL_MS = 10_000;
 const WORKFLOW_RECOVERY_LONG_WAIT_MS = 5 * 60 * 1000;
 const WORKFLOW_STEP_SETTLE_MS = 8_000;
+
+// CORRECTIF CIBLE (retour vers TARGET_URL apres expiration session TLS):
+// delai borne raisonnable pour le SEUL goto() explicitement autorise ici (vers
+// targetUrl deja fourni au monitoring, jamais une URL arbitraire issue de la
+// page) - aligne sur les autres delais de navigation deja utilises ailleurs
+// dans le projet (ex. CLIENT_SIDE_EXCEPTION_RELOAD_TIMEOUT_MS), jamais une
+// nouvelle fenetre divergente.
+const LOGGED_OUT_LANDING_GOTO_TIMEOUT_MS = 20_000;
 
 export type MonitoringRuntimeStatus = {
   rateLimited: boolean;
@@ -196,7 +205,7 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
   // priorite explicitement demande pour ce contexte de reprise (travel-groups
   // -> application-summary -> service-level -> accueil -> login/auth ->
   // Cloudflare/captcha -> inconnu).
-  type RecoveryState = "travel-groups" | "application-summary" | "service-level" | "home" | "auth" | "cloudflare" | "unknown";
+  type RecoveryState = "travel-groups" | "application-summary" | "logged-out-landing" | "service-level" | "home" | "auth" | "cloudflare" | "unknown";
 
   const classifyRecoveryState = async (recoveryPage: Page): Promise<RecoveryState> => {
     const url = recoveryPage.url();
@@ -205,6 +214,15 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
     }
     if (applicationSummaryPagePattern.test(url)) {
       return "application-summary";
+    }
+    // CORRECTIF CIBLE (retour vers TARGET_URL apres expiration session TLS):
+    // detecte AVANT "unknown" (et avant les etats async ci-dessous, pour ne
+    // pas leur faire interroger inutilement le DOM d'une page dont on sait
+    // deja qu'elle est l'accueil deconnecte) - jamais confondu avec "home"
+    // (homeCountryPagePattern exige /country/.../vac/..., strictement plus
+    // long qu'un pathname de locale seule).
+    if (isTlsLoggedOutLandingPage(url)) {
+      return "logged-out-landing";
     }
     if (await isServiceLevelPage(recoveryPage).catch(() => false)) {
       return "service-level";
@@ -247,6 +265,44 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
       case "application-summary":
         await clickBookNewAppointment(page, agentLog).catch(() => false);
         return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+
+      case "logged-out-landing": {
+        // CORRECTIF CIBLE: le seul goto() autorise ici cible EXCLUSIVEMENT
+        // targetUrl deja fourni au monitoring (jamais une URL arbitraire
+        // issue de la page) - revalide http(s) avant tout usage, meme
+        // principe deja etabli par isSafeNavigationBase/isReloadableWorkflowUrl
+        // ailleurs dans le projet. Ne declenche ensuite aucune action en
+        // aveugle: on attend brievement, puis on laisse le state-driven
+        // recovery existant reevaluer l'etat reel a la prochaine tentative
+        // (meme principe que tous les autres cas de ce switch).
+        let validTargetUrl: URL | null = null;
+        try {
+          const parsed = new URL(targetUrl);
+          if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+            validTargetUrl = parsed;
+          }
+        } catch {
+          validTargetUrl = null;
+        }
+
+        if (!validTargetUrl) {
+          agentLog("warn", "Accueil TLS deconnecte (logged-out-landing) detecte pendant la reprise, mais targetUrl invalide/non http(s): retour impossible.");
+          return null;
+        }
+
+        agentLog(
+          "info",
+          `Accueil TLS deconnecte (logged-out-landing) detecte pendant la reprise: retour vers targetUrl (${maskUrlForLog(validTargetUrl.toString())}), meme Chrome/profil/bot/monitoring - jamais un nouveau START_BOT.`
+        );
+        try {
+          await page.goto(validTargetUrl.toString(), { waitUntil: "domcontentloaded", timeout: LOGGED_OUT_LANDING_GOTO_TIMEOUT_MS });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          agentLog("warn", `Retour vers targetUrl impossible depuis l'accueil TLS deconnecte: ${message}`);
+          return null;
+        }
+        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+      }
 
       case "service-level":
         await clickContinueServiceLevel(page, agentLog).catch(() => false);

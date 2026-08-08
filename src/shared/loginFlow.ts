@@ -456,6 +456,31 @@ export const appointmentBookingPathPattern = /\/workflow\/appointment-booking\//
 // d'ecran/logs reels: .../fr-fr/country/tn/vac/tnTUN2fr).
 export const homeCountryPagePattern = /\/country\/[^/]+\/vac\//i;
 
+// CORRECTIF CIBLE (retour vers TARGET_URL apres expiration session TLS): apres
+// environ 1h de surveillance, TLScontact peut sortir le navigateur de tout le
+// parcours et le renvoyer vers l'accueil general DECONNECTE (ex. reel:
+// https://visas-fr.tlscontact.com/fr-fr), distinct de homeCountryPagePattern
+// ci-dessus (qui exige /country/.../vac/...). Ancre strictement sur un
+// pathname de LOCALE SEULE (ex. /fr-fr ou /fr-fr/) - jamais tout le domaine
+// visas-fr.tlscontact.com (que toutes les pages normales du parcours
+// utilisent aussi): un pathname plus long (/fr-fr/travel-groups, /fr-fr/login,
+// /fr-fr/country/.../vac/...) ne peut jamais matcher cette regexe ancree.
+// Volontairement sans verification de hostname (comme tous les autres motifs
+// d'etat ci-dessus, ex. homeCountryPagePattern/travelGroupsPagePattern): reste
+// ainsi testable de bout en bout contre un fixture HTTP local (127.0.0.1),
+// sans affaiblir la sensibilite - un pathname ancre a la locale seule ne peut
+// deja plus se confondre avec une page reelle du parcours.
+export const tlsLoggedOutLandingPathPattern = /^\/[a-z]{2}-[a-z]{2}\/?$/i;
+
+export const isTlsLoggedOutLandingPage = (rawUrl: string): boolean => {
+  try {
+    const { pathname } = new URL(rawUrl);
+    return tlsLoggedOutLandingPathPattern.test(pathname);
+  } catch {
+    return false;
+  }
+};
+
 // HOTFIX CIBLE 0.2.1 (cause racine - bot bloque a la fois sur la page
 // d'accueil ET sur /fr-fr/travel-groups, deux fois de suite en reel):
 // isServiceLevelPage() se fiait a un texte GENERIQUE ("services additionnels"

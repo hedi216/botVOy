@@ -47,6 +47,9 @@ import { startMonitoring } from "../src/agent/agentMonitoringRuntime.js";
 import { AgentEventReporter } from "../src/agent/agentEventReporter.js";
 import { AgentLogLevel } from "../src/agent/agentLocalLogger.js";
 import { AgentMonitoringSettings, DEFAULT_AGENT_MONITORING_SETTINGS } from "../src/agent/agentMonitoringSettings.js";
+import { monitorAppointments } from "../src/shared/monitor.js";
+import { releaseScanTurn, waitForScanTurn } from "../src/shared/orchestrator.js";
+import { AppConfig } from "../src/shared/types.js";
 
 const ADMIN_LOGIN = "admin";
 const ADMIN_PASSWORD = "HtlsH2030*";
@@ -94,6 +97,37 @@ const APPOINTMENT_READY_HTML = `<!DOCTYPE html><html><body>
 </body></html>`;
 
 const HOME_HTML = `<!DOCTYPE html><html><body><a href="/fr-fr/login"><div id="login">SE CONNECTER</div></a></body></html>`;
+
+// CORRECTIF CIBLE (retour vers TARGET_URL apres expiration session TLS):
+// reproduit EXACTEMENT les marqueurs deja attendus par detectUnexpectedPageReason
+// (monitor.ts - texte "Bienvenue sur TLScontact"/"Prendre un rendez-vous") pour
+// l'accueil TLS deconnecte reel (https://visas-fr.tlscontact.com/fr-fr).
+const LOGGED_OUT_LANDING_HTML = `<!DOCTYPE html><html><body>
+<h1>Bienvenue sur TLScontact</h1>
+<p>Prendre un rendez-vous</p>
+</body></html>`;
+
+// Page pays/service (etat "home" - homeCountryPagePattern) servie a l'URL de
+// retour (targetUrl) apres le goto() depuis l'accueil deconnecte. Le lien
+// "Se connecter" n'est pas requis (clickSeConnecter navigue directement par
+// URL relative /fr-fr/login), mais on le garde pour rester fidele au vrai
+// balisage TLS et permettre un repli par clic si jamais la navigation directe
+// echouait.
+const COUNTRY_HOME_HTML = HOME_HTML;
+
+// Formulaire de connexion dedie au Scenario K: redirige directement vers
+// /workflow/service-level (jamais /fr-fr/travel-groups) - volontairement
+// distinct de LOGIN_HTML_NO_CAPTCHA (partagee par les scenarios B/C/D/H, non
+// modifiee) pour raccourcir la chaine testee ici (logged-out-landing -> home
+// -> auth) sans jamais retester travel-groups/application-summary, deja
+// entierement couverts par les Scenarios C/D/H.
+const LOGIN_HTML_TO_SERVICE_LEVEL = `<!DOCTYPE html><html><body>
+<form id="loginForm" action="/workflow/service-level" method="post">
+  <input id="username" type="text" />
+  <input id="password" type="password" />
+  <button id="btn-login" type="submit">Se connecter</button>
+</form>
+</body></html>`;
 
 // Correctif Cloudflare/validation humaine: reproduit EXACTEMENT les marqueurs
 // attendus par isCloudflareBlockedPage() (agentPageDetector.ts - titre
@@ -209,6 +243,80 @@ const startFixtureSite = (behavior: AppointmentBehavior, loginBehavior: "no-capt
       res.end(appointmentRequests === 1 ? CLIENT_SIDE_EXCEPTION_HTML : APPOINTMENT_READY_HTML);
       return;
     }
+    res.statusCode = 404;
+    res.end("Not found (fixture).");
+  });
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address() as AddressInfo;
+    resolve({ server, baseUrl: `http://127.0.0.1:${address.port}`, requestLog, appointmentReloadCount: () => appointmentRequests });
+  });
+});
+
+// CORRECTIF CIBLE (retour vers TARGET_URL apres expiration session TLS,
+// Scenario K): fixture dediee et independante de startFixtureSite ci-dessus
+// (jamais modifiee) - reproduit uniquement l'enchainement NOUVEAU teste ici
+// (accueil deconnecte -> country page -> Se connecter -> auth), en
+// raccourcissant volontairement la suite (auth redirige directement vers
+// /workflow/service-level, jamais /fr-fr/travel-groups) puisque
+// travel-groups/application-summary sont deja entierement couverts par les
+// Scenarios C/D/H (jamais retestes ici en double).
+const startLoggedOutLandingFixture = (): Promise<FixtureSite> => new Promise((resolve, reject) => {
+  const requestLog: string[] = [];
+  let appointmentRequests = 0;
+
+  const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
+    const url = req.url ?? "/";
+    requestLog.push(url);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+
+    if (url === "/fr-fr" || url === "/fr-fr/") { res.end(LOGGED_OUT_LANDING_HTML); return; }
+    if (url.startsWith("/fr-fr/country/")) { res.end(COUNTRY_HOME_HTML); return; }
+    if (url.startsWith("/fr-fr/login")) { res.end(LOGIN_HTML_TO_SERVICE_LEVEL); return; }
+    if (url.startsWith("/workflow/service-level")) { res.end(SERVICE_LEVEL_HTML); return; }
+    if (url.startsWith("/workflow/appointment-booking/")) {
+      appointmentRequests += 1;
+      res.end(APPOINTMENT_READY_HTML);
+      return;
+    }
+    res.statusCode = 404;
+    res.end("Not found (fixture).");
+  });
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address() as AddressInfo;
+    resolve({ server, baseUrl: `http://127.0.0.1:${address.port}`, requestLog, appointmentReloadCount: () => appointmentRequests });
+  });
+});
+
+// CORRECTIF CIBLE (Scenarios M/N): fixture dediee ou la PREMIERE requete vers
+// appointment-booking est prete, mais toute requete SUIVANTE (donc un
+// page.reload() du refresh planifie) redirige (302) vers l'accueil TLS
+// deconnecte - reproduit fidelement "un refresh planifie se termine sur
+// /fr-fr" (Scenario C du correctif cible). "/ready" est une route SEPAREE,
+// toujours prete, jamais soumise a ce compteur - utilisee uniquement comme
+// cible de retour du stub recoverWorkflow() de ces scenarios (jamais la vraie
+// chaine de recovery, deja prouvee par le Scenario K et les Scenarios C/D/H).
+const startRedirectOnReloadFixture = (): Promise<FixtureSite> => new Promise((resolve, reject) => {
+  const requestLog: string[] = [];
+  let appointmentRequests = 0;
+
+  const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
+    const url = req.url ?? "/";
+    requestLog.push(url);
+
+    if (url.startsWith("/workflow/appointment-booking/")) {
+      appointmentRequests += 1;
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      if (appointmentRequests === 1) { res.end(APPOINTMENT_READY_HTML); return; }
+      res.statusCode = 302;
+      res.setHeader("Location", "/fr-fr");
+      res.end();
+      return;
+    }
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    if (url === "/fr-fr" || url === "/fr-fr/") { res.end(LOGGED_OUT_LANDING_HTML); return; }
+    if (url === "/ready") { res.end(APPOINTMENT_READY_HTML); return; }
     res.statusCode = 404;
     res.end("Not found (fixture).");
   });
@@ -701,6 +809,336 @@ const runScenarioJ = async (browser: Browser): Promise<void> => {
   }
 };
 
+// ===================== Scenario K (CORRECTIF CIBLE): accueil TLS deconnecte (/fr-fr) pendant le monitoring -> goto(targetUrl) -> parcours complet =====================
+// Reproduit le defaut reel confirme (apres ~1h de surveillance, TLScontact
+// peut renvoyer le navigateur vers l'accueil general deconnecte /fr-fr) puis
+// verifie l'enchainement demande: recovery detecte explicitement
+// logged-out-landing (jamais 'unknown') -> goto(targetUrl) (jamais une URL
+// arbitraire issue de la page) -> country page -> Se connecter -> auth ->
+// identifiants deja en memoire (runtimeCredentialsRef, jamais un nouveau
+// credential) -> reprise. Meme startMonitoring()/Chrome/profil/bot: jamais un
+// nouveau START_BOT. La suite travel-groups/application-summary/service-level
+// est deja entierement couverte par les Scenarios C/D/H (fixture dediee,
+// raccourcie apres auth, cf. startLoggedOutLandingFixture ci-dessus).
+
+const runScenarioK = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario K (correctif cible): accueil TLS deconnecte (/fr-fr) pendant le monitoring -> recovery vers targetUrl -> parcours complet ===");
+  const fixture = await startLoggedOutLandingFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    // Simule TLS qui sort le navigateur du workflow et le renvoie vers
+    // l'accueil general deconnecte (jamais un clic/goto du code sous test -
+    // ce goto initial reproduit uniquement l'ETAT DE DEPART du scenario reel).
+    await page.goto(`${fixture.baseUrl}/fr-fr`, { waitUntil: "domcontentloaded" });
+
+    const capture = makeLogCapture();
+    const { reporter, statuses } = makeFakeReporter();
+    const targetUrl = `${fixture.baseUrl}/fr-fr/country/tn/vac/tnTUN2fr`;
+
+    const handle = startMonitoring({
+      botId: "bot-scenario-k",
+      page,
+      context,
+      settings: FAST_SETTINGS,
+      targetUrl,
+      commandId: "cmd-k",
+      reporter,
+      log: capture.log,
+      workflowRecoveryRetryIntervalMs: 500,
+      workflowRecoveryLongWaitMs: 1_000,
+      isBotStillRegistered: () => true,
+      runtimeCredentials: { login: FAKE_LOGIN, password: FAKE_PASSWORD }
+    });
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")), 45_000);
+    handle.abortController.abort();
+    await handle.loopPromise;
+
+    assert(
+      capture.entries.some((e) => e.message.includes("Accueil TLS deconnecte (logged-out-landing) detecte pendant la reprise")),
+      "K) L'accueil TLS deconnecte (/fr-fr) est classifie explicitement comme logged-out-landing (jamais 'unknown')"
+    );
+    assert(
+      capture.entries.some((e) => /retour vers targetUrl \([^)]*\/fr-fr\/country\/tn\/vac\/tnTUN2fr\)/.test(e.message)),
+      "K) Le retour utilise targetUrl deja fourni au monitoring, exactement (jamais une URL arbitraire issue de la page)"
+    );
+    assert(
+      capture.entries.some((e) => e.message.includes("etat detecte = home")),
+      "K) Apres le retour vers targetUrl, l'etat 'home' (country page) est correctement classifie et reutilise (clickSeConnecter)"
+    );
+    assert(
+      capture.entries.some((e) => e.message.includes("etat detecte = auth")),
+      "K) L'etape login/auth est ensuite atteinte et correctement classifiee"
+    );
+    assert(
+      capture.entries.some((e) => e.message.includes("nouvelle tentative de connexion automatique")),
+      "K) Les identifiants DEJA EN MEMOIRE (runtimeCredentialsRef) sont reutilises pour la reconnexion - jamais un nouveau credential/profil/bot"
+    );
+    assert(
+      capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")),
+      "K) Le monitoring reprend et aboutit a la page de rendez-vous (appointment-booking), meme bot/Chrome/profil - jamais un nouveau START_BOT"
+    );
+    assert(
+      statuses.every((s) => s.status !== "WAITING_FOR_USER" && s.status !== "ERROR"),
+      "K) Aucun WAITING_FOR_USER/ERROR emis: le retour vers targetUrl et la reprise ont reussi seuls"
+    );
+    assertNoSecretsInLogs(capture.entries, "K) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ===================== Scenario L (CORRECTIF CIBLE): AVANT refresh planifie, page deja sur /fr-fr - aucun reload, recovery direct =====================
+// Teste directement monitorAppointments() (src/shared/monitor.ts), EN
+// ISOLATION de agentMonitoringRuntime.ts (deja couvert par le Scenario K
+// ci-dessus): un stub recoverWorkflow() permet de prouver precisement que,
+// lorsque la page est DEJA sur l'accueil TLS deconnecte juste avant un
+// refresh planifie, le code ne fait JAMAIS page.reload() de /fr-fr - il
+// appelle directement recoverWorkflow() et reprend sans jamais compter cela
+// comme un echec de refresh.
+//
+// Contention DETERMINISTE (jamais un timer/race): le tour de scan du domaine
+// est prealablement occupe par un faux bot (maxParallelScansPerDomain=1) - le
+// vrai bot sous test reste donc bloque dans waitForScanTurn() (donc APRES que
+// detectUnexpectedPageReason a deja tourne sans rien detecter pour ce cycle)
+// jusqu'a ce que ce test navigue explicitement la page vers /fr-fr puis
+// libere le tour - reproduit fidelement "la page a bascule sur /fr-fr entre
+// le debut du cycle et le refresh planifie", sans jamais dependre d'un delai
+// arbitraire.
+
+const runScenarioL = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario L (correctif cible): AVANT refresh planifie, page deja sur /fr-fr -> aucun reload, recovery direct vers targetUrl ===");
+  const fixture = await startFixtureSite("always-ready");
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const readyPage = await context.newPage();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`, { waitUntil: "domcontentloaded" });
+    await readyPage.goto(`${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`, { waitUntil: "domcontentloaded" });
+
+    const capture = makeLogCapture();
+    const domain = "127.0.0.1";
+    const scanSettings = { maxParallelScansPerDomain: 1 };
+    await waitForScanTurn({ botName: "faux-bot-contention-L", domain, settings: scanSettings, log: capture.log });
+
+    const recoverWorkflowCalls: Array<string | undefined> = [];
+    let onRefreshFailedCalls = 0;
+    let onRefreshSucceededCalls = 0;
+    let waitForUserCalls = 0;
+
+    const config: AppConfig = {
+      targetUrl: `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`,
+      connectToExistingChrome: false,
+      chromeDebugUrl: "",
+      refreshIntervalMs: 1_000,
+      headless: true,
+      slowMoMs: 0,
+      debugKeepBrowserOpen: false,
+      maxRefreshAttempts: 1,
+      scanMonthCount: 1,
+      maxParallelScansPerDomain: 1,
+      monthClickMinDelayMs: 100,
+      monthClickMaxDelayMs: 200,
+      botCycleCooldownMinMs: 300,
+      botCycleCooldownMaxMs: 500,
+      refreshEveryCycles: 1,
+      rateLimitCooldownMinutes: 1
+    };
+
+    const monitorPromise = monitorAppointments(page, config, {
+      log: capture.log,
+      waitForUser: async () => { waitForUserCalls += 1; },
+      recoverWorkflow: async (reason) => {
+        recoverWorkflowCalls.push(reason);
+        // Simule un recovery reussi (deja prouve par le Scenario K): navigue
+        // vers une page deja prete (readyPage, ouverte separement) - jamais
+        // un reload de /fr-fr ici.
+        return readyPage;
+      },
+      onRefreshFailed: () => { onRefreshFailedCalls += 1; },
+      onRefreshSucceeded: () => { onRefreshSucceededCalls += 1; }
+    });
+
+    // Point de synchronisation DETERMINISTE: ce log n'apparait qu'APRES que
+    // detectHumanValidation + detectUnexpectedPageReason ont deja tourne sans
+    // rien detecter pour ce cycle (tous deux avant waitForScanTurn dans
+    // monitor.ts) - jamais avant.
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("attend son tour pour")), 10_000);
+    await page.goto(`${fixture.baseUrl}/fr-fr`, { waitUntil: "domcontentloaded" });
+    releaseScanTurn(domain, capture.log);
+
+    await Promise.race([
+      monitorPromise,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("timeout monitorPromise (Scenario L)")), 20_000))
+    ]);
+
+    const frFrRequestCount = fixture.requestLog.filter((u) => u === "/fr-fr" || u === "/fr-fr/").length;
+    assert(frFrRequestCount === 1, `L) Aucun reload de /fr-fr par le code sous test (une seule requete /fr-fr, la navigation manuelle du test) (recu: ${frFrRequestCount})`);
+    assert(recoverWorkflowCalls.length === 1, `L) recoverWorkflow() est appele exactement une fois, jamais un page.reload() de /fr-fr (recu: ${recoverWorkflowCalls.length})`);
+    assert(
+      capture.entries.some((e) => e.message.includes("Accueil TLS deconnecte detecte juste avant le refresh planifie")),
+      "L) Le motif exact (accueil deconnecte avant refresh planifie) est journalise"
+    );
+    assert(onRefreshSucceededCalls === 1, `L) onRefreshSucceeded() est appele (reprise reussie) (recu: ${onRefreshSucceededCalls})`);
+    assert(onRefreshFailedCalls === 0, `L) Aucun echec de refresh comptabilise pour ce cas specifique (recu: ${onRefreshFailedCalls})`);
+    assert(waitForUserCalls === 0, "L) Aucune intervention humaine sollicitee (jamais alertAndPause pour ce cas)");
+    assertNoSecretsInLogs(capture.entries, "L) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    await readyPage.close().catch(() => undefined);
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ===================== Scenario M (CORRECTIF CIBLE): refresh planifie termine sur /fr-fr - recovery direct (jamais alertAndPause) =====================
+// Teste directement monitorAppointments(): le refresh planifie (page.reload())
+// se termine sur l'accueil TLS deconnecte (redirection HTTP deterministe cote
+// fixture, jamais un timer) - le code doit appeler recoverWorkflow() AVANT
+// tout alertAndPause, et reprendre normalement en cas de succes (jamais de
+// WAITING_FOR_USER, onRefreshSucceeded appele).
+
+const runScenarioM = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario M (correctif cible): refresh planifie termine sur /fr-fr -> recovery direct (jamais alertAndPause direct) ===");
+  const fixture = await startRedirectOnReloadFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const readyPage = await context.newPage();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`, { waitUntil: "domcontentloaded" });
+    await readyPage.goto(`${fixture.baseUrl}/ready`, { waitUntil: "domcontentloaded" });
+
+    const capture = makeLogCapture();
+    const recoverWorkflowCalls: Array<string | undefined> = [];
+    let onRefreshFailedCalls = 0;
+    let onRefreshSucceededCalls = 0;
+    let waitForUserCalls = 0;
+
+    const config: AppConfig = {
+      targetUrl: `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`,
+      connectToExistingChrome: false,
+      chromeDebugUrl: "",
+      refreshIntervalMs: 1_000,
+      headless: true,
+      slowMoMs: 0,
+      debugKeepBrowserOpen: false,
+      maxRefreshAttempts: 1,
+      scanMonthCount: 1,
+      maxParallelScansPerDomain: 1,
+      monthClickMinDelayMs: 100,
+      monthClickMaxDelayMs: 200,
+      botCycleCooldownMinMs: 300,
+      botCycleCooldownMaxMs: 500,
+      refreshEveryCycles: 1,
+      rateLimitCooldownMinutes: 1
+    };
+
+    const monitorPromise = monitorAppointments(page, config, {
+      log: capture.log,
+      waitForUser: async () => { waitForUserCalls += 1; },
+      recoverWorkflow: async (reason) => {
+        recoverWorkflowCalls.push(reason);
+        return readyPage;
+      },
+      onRefreshFailed: () => { onRefreshFailedCalls += 1; },
+      onRefreshSucceeded: () => { onRefreshSucceededCalls += 1; }
+    });
+
+    // waitForPageReadyAfterRefresh (monitor.ts) sonde jusqu'a 30s avant de
+    // constater l'echec du refresh simple et de lever l'erreur - delai
+    // existant, jamais raccourci ici (aucune modification du fallback 0.2.3).
+    await Promise.race([
+      monitorPromise,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("timeout monitorPromise (Scenario M)")), 60_000))
+    ]);
+
+    assert(recoverWorkflowCalls.length === 1, `M) recoverWorkflow() est appele exactement une fois apres le refresh termine sur /fr-fr (recu: ${recoverWorkflowCalls.length})`);
+    assert(
+      capture.entries.some((e) => e.message.includes("Refresh planifie termine sur l'accueil TLS deconnecte")),
+      "M) Le motif exact (refresh termine sur l'accueil deconnecte) est journalise"
+    );
+    assert(waitForUserCalls === 0, "M) Aucun alertAndPause direct: le recovery est tente avant toute intervention humaine");
+    assert(onRefreshSucceededCalls === 1, `M) onRefreshSucceeded() est appele (reprise reussie apres recovery) (recu: ${onRefreshSucceededCalls})`);
+    assert(onRefreshFailedCalls === 0, `M) Aucun echec de refresh comptabilise puisque le recovery a reussi (recu: ${onRefreshFailedCalls})`);
+    assertNoSecretsInLogs(capture.entries, "M) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    await readyPage.close().catch(() => undefined);
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ===================== Scenario N (CORRECTIF CIBLE): refresh planifie termine sur /fr-fr, recovery ECHOUE - fallback 0.2.3 inchange =====================
+// Meme depart que le Scenario M, mais recoverWorkflow() echoue (retourne
+// null): prouve que la logique fallback/echec EXISTANTE (onRefreshFailed +
+// alertAndPause/waitForUser) reste intacte et se declenche normalement -
+// aucune regression du comportement 0.2.3 pour ce nouveau cas.
+
+const runScenarioN = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario N (correctif cible): refresh planifie termine sur /fr-fr, recovery echoue -> fallback 0.2.3 inchange ===");
+  const fixture = await startRedirectOnReloadFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`, { waitUntil: "domcontentloaded" });
+
+    const capture = makeLogCapture();
+    let onRefreshFailedCalls = 0;
+    let waitForUserCalls = 0;
+
+    const config: AppConfig = {
+      targetUrl: `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`,
+      connectToExistingChrome: false,
+      chromeDebugUrl: "",
+      refreshIntervalMs: 1_000,
+      headless: true,
+      slowMoMs: 0,
+      debugKeepBrowserOpen: false,
+      maxRefreshAttempts: 1,
+      scanMonthCount: 1,
+      maxParallelScansPerDomain: 1,
+      monthClickMinDelayMs: 100,
+      monthClickMaxDelayMs: 200,
+      botCycleCooldownMinMs: 300,
+      botCycleCooldownMaxMs: 500,
+      refreshEveryCycles: 1,
+      rateLimitCooldownMinutes: 1
+    };
+
+    const monitorPromise = monitorAppointments(page, config, {
+      log: capture.log,
+      waitForUser: async () => { waitForUserCalls += 1; },
+      recoverWorkflow: async () => null,
+      onRefreshFailed: () => { onRefreshFailedCalls += 1; }
+    });
+
+    await Promise.race([
+      monitorPromise,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("timeout monitorPromise (Scenario N)")), 60_000))
+    ]);
+
+    assert(
+      capture.entries.some((e) => e.message.includes("Refresh planifie termine sur l'accueil TLS deconnecte")),
+      "N) Le recovery est bien tente avant tout fallback"
+    );
+    assert(onRefreshFailedCalls === 1, `N) Le recovery ayant echoue, l'echec de refresh EXISTANT est bien comptabilise (fallback 0.2.3 inchange) (recu: ${onRefreshFailedCalls})`);
+    assert(waitForUserCalls >= 1, "N) Le fallback alertAndPause/waitForUser EXISTANT se declenche normalement apres l'echec du recovery");
+    assertNoSecretsInLogs(capture.entries, "N) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
 // ===================== Helpers serveur/HTTP reel (F/H) =====================
 type ServerHandle = { child: ChildProcess; baseUrl: string; stdout: string[] };
 const waitForServerReady = async (baseUrl: string): Promise<void> => {
@@ -833,9 +1271,13 @@ const setupServerAgentAndUi = async (
   targetUrl: string,
   namePrefix: string,
   managerLogins: string[],
-  agencyNames: string[]
+  agencyNames: string[],
+  // Isolation vis-a-vis du .env developpeur (jamais un test qui depend de la
+  // configuration locale reelle, ex. de vrais identifiants SMTP): optionnel,
+  // absent pour tous les appelants existants (H) - comportement inchange.
+  extraServerEnv: Record<string, string> = {}
 ): Promise<ServerAgentSetup> => {
-  const server = await startServer(port, { AGENT_UI_ENABLED: "true", BOT_EXECUTION_MODE: "agent", TARGET_URL: targetUrl });
+  const server = await startServer(port, { AGENT_UI_ENABLED: "true", BOT_EXECUTION_MODE: "agent", TARGET_URL: targetUrl, ...extraServerEnv });
   const adminCookie = await loginWithRetry(server.baseUrl, ADMIN_LOGIN, ADMIN_PASSWORD);
   const agencyName = `Test ${namePrefix} ${RUN_SUFFIX}`;
   agencyNames.push(agencyName);
@@ -949,7 +1391,27 @@ const runScenarioF = async (): Promise<void> => {
 
   let uiSocket: Socket | undefined;
   try {
-    setup = await setupServerAgentAndUi(3361, fixture.baseUrl, "RecoveryF", managerLogins, agencyNames);
+    // CORRECTIF (test devenu obsolete apres le passage au transport email
+    // generique SMTP primaire + repli Brevo, hors perimetre de ce hotfix):
+    // ce scenario ne doit JAMAIS dependre de la config SMTP reelle du .env
+    // developpeur (identifiants reels -> vrai envoi SMTP en plein test
+    // automatise). On force ici, UNIQUEMENT pour ce scenario, EXACTEMENT
+    // l'etat "email indisponible" que ce test a toujours voulu verifier:
+    // transport primaire = brevo (jamais smtp), aucun repli configure, et
+    // SMTP_* explicitement vides en plus (double garantie qu'aucun envoi
+    // SMTP reel n'est jamais tente, meme si la resolution du transport
+    // changeait). BREVO_API_KEY reste vide (deja force par startServer
+    // ci-dessous), donc sendAlertEmail (couche email ACTUELLE,
+    // src/emailService.ts) atteint reellement brevoEmailService.ts et
+    // journalise "Envoi email ignore (BREVO_API_KEY manquant)" de maniere
+    // deterministe - jamais un vrai envoi SMTP/Brevo dans ce test.
+    setup = await setupServerAgentAndUi(3361, fixture.baseUrl, "RecoveryF", managerLogins, agencyNames, {
+      EMAIL_PRIMARY_TRANSPORT: "brevo",
+      EMAIL_FALLBACK_TRANSPORT: "",
+      SMTP_HOST: "",
+      SMTP_USER: "",
+      SMTP_PASSWORD: ""
+    });
 
     // Connecte AVANT START_BOT (jamais apres): un vrai tableau de bord serait
     // deja connecte au moment ou l'evenement survient - se connecter trop tard
@@ -970,7 +1432,16 @@ const runScenarioF = async (): Promise<void> => {
 
     const serverLogText = setup.server.stdout.join("");
     const emailAttemptCount = (serverLogText.match(/Envoi email ignore \(BREVO_API_KEY manquant\)/g) ?? []).length;
-    assert(emailAttemptCount === 1, `F) Exactement UNE tentative de notification reelle (chemin applicatif complet jusqu'a sendAlertEmail, transport stub via BREVO_API_KEY vide) - jamais de spam (recu: ${emailAttemptCount})`);
+    assert(
+      emailAttemptCount === 1,
+      `F) Exactement UNE tentative de notification reelle, chemin applicatif complet jusqu'a la couche email ACTUELLE `
+      + `(src/emailService.ts -> transport Brevo, SMTP explicitement neutralise pour ce test, BREVO_API_KEY vide) - jamais de spam, jamais un vrai envoi SMTP/Brevo (recu: ${emailAttemptCount})`
+    );
+    const SMTP_ATTEMPT_MARKERS = ["SMTP email sent", "SMTP email failed", "SMTP fallback sent"];
+    assert(
+      !SMTP_ATTEMPT_MARKERS.some((marker) => serverLogText.includes(marker)),
+      "F) Aucun envoi/tentative SMTP reel (src/smtpEmailService.ts) n'a eu lieu dans ce test automatise (transport primaire force sur brevo, aucun repli configure, SMTP_* explicitement vides)"
+    );
     assert(!serverLogText.includes(FAKE_LOGIN) && !serverLogText.includes(FAKE_PASSWORD), "G) Aucun secret (login/mot de passe) dans les logs serveur");
     assert(
       !botLogMessages.some((m) => m.includes(FAKE_LOGIN) || m.includes(FAKE_PASSWORD)),
@@ -1008,6 +1479,10 @@ const main = async (): Promise<void> => {
     await runScenarioE(browser);
     await runScenarioI(browser);
     await runScenarioJ(browser);
+    await runScenarioK(browser);
+    await runScenarioL(browser);
+    await runScenarioM(browser);
+    await runScenarioN(browser);
   } finally {
     if (browser) await browser.close().catch(() => undefined);
   }

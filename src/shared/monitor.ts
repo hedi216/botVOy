@@ -4,6 +4,7 @@ import { Page } from "playwright";
 import { detectAppointmentAvailability, findBestCandidateElement, findReserveAppointmentButton, isAppointmentPageReady } from "./detectors.js";
 import { detectHumanValidation } from "./humanValidation.js";
 import { highlightElement } from "./highlight.js";
+import { isTlsLoggedOutLandingPage } from "./loginFlow.js";
 import { logger } from "../logger.js";
 import {
   applyRateLimitCooldown,
@@ -880,6 +881,34 @@ export const monitorAppointments = async (
     }
 
     if (config.refreshEveryCycles > 0 && attempts % config.refreshEveryCycles === 0) {
+      // CORRECTIF CIBLE (retour vers TARGET_URL apres expiration session TLS):
+      // si la page est DEJA sur l'accueil TLS deconnecte juste avant ce
+      // refresh planifie, un reload() de /fr-fr ne servirait a rien (TLS y
+      // reste) - on declenche directement le recovery pilote par etat
+      // (goto(targetUrl) via classifyRecoveryState/recoverWorkflowOnce), sans
+      // jamais compter cela comme un echec de refresh. Comportement inchange
+      // pour toute autre page.
+      if (!activePage.isClosed() && isTlsLoggedOutLandingPage(activePage.url())) {
+        resolved.log(
+          "warn",
+          "Accueil TLS deconnecte detecte juste avant le refresh planifie: recovery direct vers targetUrl (aucun reload de /fr-fr)."
+        );
+        const recoveredPage = await resolved.recoverWorkflow("Accueil TLS deconnecte detecte avant refresh planifie.");
+        if (recoveredPage) {
+          activePage = recoveredPage;
+          lastKnownUrl = activePage.url();
+          resolved.onRefreshSucceeded?.();
+          resolved.log("success", "Page de rendez-vous retrouvee automatiquement (recovery avant refresh planifie). Surveillance reprise.");
+          continue;
+        }
+
+        resolved.log(
+          "warn",
+          "Recovery avant refresh planifie non abouti pour cette tentative: nouvel essai au prochain cycle (aucun echec de refresh comptabilise)."
+        );
+        continue;
+      }
+
       resolved.log("info", `Refresh planifie apres ${config.refreshEveryCycles} cycle(s) sans creneau.`);
       try {
         if (activePage.isClosed()) {
@@ -903,6 +932,26 @@ export const monitorAppointments = async (
           activePage = recovered;
           lastKnownUrl = activePage.url();
           continue;
+        }
+
+        // CORRECTIF CIBLE: si ce refresh planifie s'est termine sur l'accueil
+        // TLS deconnecte (ex. TLS a redirige pendant le reload), jamais
+        // d'alertAndPause direct - on tente d'abord le recovery pilote par
+        // etat (goto(targetUrl)); en cas d'echec, on retombe ci-dessous sur la
+        // logique fallback/echec existante, totalement inchangee.
+        if (!activePage.isClosed() && isTlsLoggedOutLandingPage(activePage.url())) {
+          resolved.log(
+            "warn",
+            "Refresh planifie termine sur l'accueil TLS deconnecte: recovery direct vers targetUrl (jamais alertAndPause direct)."
+          );
+          const recoveredPage = await resolved.recoverWorkflow("Accueil TLS deconnecte detecte apres refresh planifie.");
+          if (recoveredPage) {
+            activePage = recoveredPage;
+            lastKnownUrl = activePage.url();
+            resolved.onRefreshSucceeded?.();
+            resolved.log("success", "Page de rendez-vous retrouvee automatiquement (recovery apres refresh planifie). Surveillance reprise.");
+            continue;
+          }
         }
 
         const reason = `Refresh impossible ou page instable: ${error instanceof Error ? error.message : String(error)}`;
