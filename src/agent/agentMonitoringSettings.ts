@@ -104,9 +104,20 @@ export const validateMonitoringSettings = (
 // d'un snapshot deja valide, en completant les champs restants avec des
 // valeurs neutres pour un contexte agent (Chrome deja ouvert/connecte par
 // agentBrowserManager.ts, jamais relance par ce module).
+//
+// CORRECTIF CIBLE (refresh temporel securise toutes les 20 minutes):
+// controlRefreshIntervalMs est TOUJOURS renseigne ici (jamais absent) pour
+// l'agent - c'est ce qui fait basculer monitorAppointments() (src/shared/
+// monitor.ts) sur la cadence en temps reel plutot que sur refreshEveryCycles
+// (qui reste dans `settings` uniquement pour retrocompatibilite/legacy_vm,
+// et n'est alors plus la cadence principale de l'agent). Parametre requis
+// (jamais implicite): l'appelant (agentMonitoringRuntime.ts) est seul
+// responsable de resoudre la valeur reelle (constante interne ou override
+// test uniquement).
 export const toAppConfig = (
   settings: AgentMonitoringSettings,
-  targetUrl: string
+  targetUrl: string,
+  controlRefreshIntervalMs: number
 ): AppConfig => ({
   targetUrl,
   connectToExistingChrome: true,
@@ -116,5 +127,6 @@ export const toAppConfig = (
   slowMoMs: 0,
   debugKeepBrowserOpen: true,
   maxRefreshAttempts: 0,
-  ...settings
+  ...settings,
+  controlRefreshIntervalMs
 });

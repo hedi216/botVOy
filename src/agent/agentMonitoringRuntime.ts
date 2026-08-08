@@ -59,6 +59,14 @@ const WORKFLOW_STEP_SETTLE_MS = 8_000;
 // nouvelle fenetre divergente.
 const LOGGED_OUT_LANDING_GOTO_TIMEOUT_MS = 20_000;
 
+// CORRECTIF CIBLE (refresh temporel securise toutes les 20 minutes): cadence
+// de refresh de controle de l'agent, basee sur le temps REEL ecoule (jamais
+// un nombre de cycles - remplace refreshEveryCycles comme cadence PRINCIPALE
+// de l'agent, cf. toAppConfig/monitor.ts). refreshEveryCycles reste dans
+// AgentMonitoringSettings uniquement pour retrocompatibilite (legacy_vm/UI
+// agence), mais n'est plus consulte comme declencheur ici.
+const AGENT_CONTROL_REFRESH_INTERVAL_MS = 20 * 60 * 1000;
+
 export type MonitoringRuntimeStatus = {
   rateLimited: boolean;
   lastSlotDetectedAt: string | null;
@@ -109,6 +117,11 @@ export type StartMonitoringParams = {
   workflowRecoveryRetryIntervalMs?: number;
   workflowRecoveryLongWaitMs?: number;
   humanValidationGraceMs?: number;
+  // CORRECTIF CIBLE (refresh temporel securise toutes les 20 minutes):
+  // override TEST UNIQUEMENT (jamais en production reelle, retombe alors sur
+  // AGENT_CONTROL_REFRESH_INTERVAL_MS ci-dessus) - jamais d'attente reelle de
+  // 20 minutes dans les tests.
+  controlRefreshIntervalMs?: number;
 };
 
 export type MonitoringRuntimeHandle = {
@@ -239,6 +252,55 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
     return "unknown";
   };
 
+  // CORRECTIF CIBLE (refresh temporel securise toutes les 20 minutes, CAS D -
+  // etat inconnu apres refresh): meme mecanisme QUE le cas "logged-out-landing"
+  // ci-dessous, jamais une deuxieme architecture de navigation - le seul
+  // goto() autorise cible EXCLUSIVEMENT targetUrl deja fourni au monitoring
+  // (jamais une URL arbitraire issue de la page, jamais un clic au hasard sur
+  // l'etat inconnu lui-meme). Deja borne par le plafond partage
+  // WORKFLOW_RECOVERY_FINAL_ATTEMPT (recoverWorkflowWithRetries ci-dessous):
+  // jamais une boucle separee/infinie, meme si l'etat reste "unknown" apres
+  // le retour (nouvelle classification tentee a chaque tentative numerotee
+  // suivante, jusqu'a epuisement du meme plafond que tous les autres etats).
+  // `description` est la phrase COMPLETE decrivant l'etat detecte (jamais un
+  // simple nom d'etat interpole) - preserve exactement le libelle deja
+  // existant pour "logged-out-landing" (deja verifie par un test anterieur),
+  // "unknown" recoit sa propre description distincte.
+  const attemptReturnToTargetUrl = async (page: Page, description: string): Promise<Page | null> => {
+    let validTargetUrl: URL | null = null;
+    try {
+      const parsed = new URL(targetUrl);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        validTargetUrl = parsed;
+      }
+    } catch {
+      validTargetUrl = null;
+    }
+
+    if (!validTargetUrl) {
+      agentLog("warn", `${description}, mais targetUrl invalide/non http(s): retour impossible.`);
+      return null;
+    }
+
+    agentLog(
+      "info",
+      `${description}: retour vers targetUrl (${maskUrlForLog(validTargetUrl.toString())}), meme Chrome/profil/bot/monitoring - jamais un nouveau START_BOT.`
+    );
+    try {
+      await page.goto(validTargetUrl.toString(), { waitUntil: "domcontentloaded", timeout: LOGGED_OUT_LANDING_GOTO_TIMEOUT_MS });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      agentLog("warn", `Retour vers targetUrl impossible (${description}): ${message}`);
+      return null;
+    }
+    // Jamais d'action en aveugle enchainee ici: on attend brievement, puis on
+    // laisse le state-driven recovery existant reevaluer l'etat REEL
+    // (potentiellement deja avance si la session TLS etait encore valide -
+    // CAS E du correctif: fillLoginForm() n'est jamais utilise ici, seulement
+    // si "auth" est reellement (re)classifie a la prochaine tentative).
+    return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+  };
+
   const recoverWorkflowOnce = async (attempt: number, reason?: string): Promise<Page | null> => {
     const ready = await recoverCurrentPage();
     if (ready) {
@@ -266,43 +328,8 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
         await clickBookNewAppointment(page, agentLog).catch(() => false);
         return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
 
-      case "logged-out-landing": {
-        // CORRECTIF CIBLE: le seul goto() autorise ici cible EXCLUSIVEMENT
-        // targetUrl deja fourni au monitoring (jamais une URL arbitraire
-        // issue de la page) - revalide http(s) avant tout usage, meme
-        // principe deja etabli par isSafeNavigationBase/isReloadableWorkflowUrl
-        // ailleurs dans le projet. Ne declenche ensuite aucune action en
-        // aveugle: on attend brievement, puis on laisse le state-driven
-        // recovery existant reevaluer l'etat reel a la prochaine tentative
-        // (meme principe que tous les autres cas de ce switch).
-        let validTargetUrl: URL | null = null;
-        try {
-          const parsed = new URL(targetUrl);
-          if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-            validTargetUrl = parsed;
-          }
-        } catch {
-          validTargetUrl = null;
-        }
-
-        if (!validTargetUrl) {
-          agentLog("warn", "Accueil TLS deconnecte (logged-out-landing) detecte pendant la reprise, mais targetUrl invalide/non http(s): retour impossible.");
-          return null;
-        }
-
-        agentLog(
-          "info",
-          `Accueil TLS deconnecte (logged-out-landing) detecte pendant la reprise: retour vers targetUrl (${maskUrlForLog(validTargetUrl.toString())}), meme Chrome/profil/bot/monitoring - jamais un nouveau START_BOT.`
-        );
-        try {
-          await page.goto(validTargetUrl.toString(), { waitUntil: "domcontentloaded", timeout: LOGGED_OUT_LANDING_GOTO_TIMEOUT_MS });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          agentLog("warn", `Retour vers targetUrl impossible depuis l'accueil TLS deconnecte: ${message}`);
-          return null;
-        }
-        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
-      }
+      case "logged-out-landing":
+        return attemptReturnToTargetUrl(page, "Accueil TLS deconnecte (logged-out-landing) detecte pendant la reprise");
 
       case "service-level":
         await clickContinueServiceLevel(page, agentLog).catch(() => false);
@@ -334,10 +361,17 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
 
       case "unknown":
       default:
-        // Section 4.H: jamais de clic au hasard sur un etat non reconnu -
-        // cette tentative est simplement consideree comme non recuperee.
-        agentLog("warn", `Etat de page non reconnu pendant la reprise (${maskUrlForLog(page.url())}): aucune action automatique, tentative non recuperee.`);
-        return null;
+        // CORRECTIF CIBLE (refresh temporel 20 min, CAS D): Section 4.H
+        // interdisait tout CLIC au hasard sur un etat non reconnu - toujours
+        // vrai ici (aucun clic tente sur la page inconnue elle-meme). Mais une
+        // navigation vers targetUrl, DEJA connu/fourni au monitoring, n'est
+        // pas un clic au hasard: on tente donc desormais UNE reprise bornee
+        // vers targetUrl (meme mecanisme, meme plafond que logged-out-landing)
+        // plutot que de ne rien faire - jamais une boucle separee/infinie
+        // (bornee par le meme WORKFLOW_RECOVERY_FINAL_ATTEMPT que tout le
+        // reste de ce recovery).
+        agentLog("warn", `Etat de page non reconnu pendant la reprise (${maskUrlForLog(page.url())}): tentative bornee de retour vers targetUrl.`);
+        return attemptReturnToTargetUrl(page, "Etat de page non reconnu (unknown) detecte pendant la reprise");
     }
   };
 
@@ -526,7 +560,8 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
     agentLog("error", "Echec final de la reprise automatique du workflow (WORKFLOW_RECOVERY_FAILED): intervention humaine requise. Chrome reste ouvert.");
   };
 
-  const appConfig = toAppConfig(settings, targetUrl);
+  const resolvedControlRefreshIntervalMs = params.controlRefreshIntervalMs ?? AGENT_CONTROL_REFRESH_INTERVAL_MS;
+  const appConfig = toAppConfig(settings, targetUrl, resolvedControlRefreshIntervalMs);
 
   const loopPromise = monitorAppointments(page, appConfig, {
     botName,

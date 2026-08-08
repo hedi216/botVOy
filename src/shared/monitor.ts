@@ -682,6 +682,22 @@ const detectOnAccessibleMonths = async (
   return { detected: false };
 };
 
+// CORRECTIF CIBLE (refresh temporel securise toutes les 20 minutes): quand
+// config.controlRefreshIntervalMs est fourni (agent uniquement - absent pour
+// legacy_vm/CLI autonome, qui gardent refreshEveryCycles inchange), le refresh
+// planifie est du au TEMPS REEL ecoule plutot qu'a un nombre de cycles.
+// nextControlRefreshAt est une simple valeur numerique comparee a Date.now()
+// a CHAQUE iteration (jamais un setTimeout/setInterval independant): rien a
+// annuler, rien ne peut survivre a l'arret de la boucle (STOP_BOT/signal
+// aborted, deja verifie en tete de boucle ci-dessous) - et puisqu'elle vit
+// dans la fermeture de CET appel de monitorAppointments(), chaque bot a
+// necessairement son propre timer (jamais partage entre bots, section
+// "MULTI-BOTS" du correctif).
+const resolveControlRefreshIntervalMs = (config: AppConfig): number | null => {
+  const value = config.controlRefreshIntervalMs;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+};
+
 export const monitorAppointments = async (
   page: Page,
   config: AppConfig,
@@ -691,6 +707,18 @@ export const monitorAppointments = async (
   let activePage = page;
   let lastKnownUrl = page.url();
   let attempts = 0;
+
+  const controlRefreshIntervalMs = resolveControlRefreshIntervalMs(config);
+  // "Quand monitoring commence reellement sur appointment-booking": initialise
+  // ici, au tout debut de la boucle (le point d'entree de monitorAppointments
+  // est deja, par contrat existant, la page de rendez-vous reelle - agent et
+  // legacy_vm n'appellent tous deux cette fonction qu'apres l'avoir atteinte).
+  let nextControlRefreshAt = controlRefreshIntervalMs !== null ? Date.now() + controlRefreshIntervalMs : null;
+  const scheduleNextControlRefresh = (): void => {
+    if (controlRefreshIntervalMs !== null) {
+      nextControlRefreshAt = Date.now() + controlRefreshIntervalMs;
+    }
+  };
 
   while (config.maxRefreshAttempts === 0 || attempts < config.maxRefreshAttempts) {
     if (resolved.signal?.aborted) {
@@ -742,6 +770,10 @@ export const monitorAppointments = async (
       if (recoveredPage) {
         activePage = recoveredPage;
         lastKnownUrl = activePage.url();
+        // "Apres un recovery complet reussi qui ramene a appointment-booking":
+        // repart pour un cycle complet de 20 min (agent) - sans effet si le
+        // refresh de controle temporel n'est pas configure (legacy_vm/CLI).
+        scheduleNextControlRefresh();
         resolved.log("success", "Page de rendez-vous retrouvee automatiquement. Surveillance reprise.");
         continue;
       }
@@ -880,7 +912,30 @@ export const monitorAppointments = async (
       }
     }
 
-    if (config.refreshEveryCycles > 0 && attempts % config.refreshEveryCycles === 0) {
+    // CORRECTIF CIBLE (refresh temporel securise toutes les 20 minutes):
+    // point d'entree UNIQUE du refresh planifie, atteint UNIQUEMENT depuis un
+    // "point sur" deja garanti par tout ce qui precede dans cette iteration:
+    // ni validation humaine/Cloudflare (deja gere plus haut, `continue` avant
+    // d'arriver ici), ni page inattendue/rate-limit (idem), ni creneau
+    // detecte/en cours de reservation (return/continue avant ce point, jamais
+    // atteint pendant un tryReserveAvailableSlots en cours), ni mode creneau
+    // actif (branche ci-dessus, deja `continue`e). Le refresh planifie ne
+    // peut donc jamais interrompre une operation critique - il n'est meme
+    // jamais evalue pendant qu'une telle operation est en cours.
+    //
+    // Deux cadences mutuellement exclusives (jamais combinees): si
+    // controlRefreshIntervalMs est configure (agent), le declencheur est le
+    // TEMPS REEL ecoule (nextControlRefreshAt) - refreshEveryCycles est alors
+    // ignore pour ce declenchement. Sinon (legacy_vm/CLI autonome, champ
+    // absent), comportement 0.2.3 inchange: cycle-count via refreshEveryCycles.
+    const controlRefreshDue = controlRefreshIntervalMs !== null
+      && nextControlRefreshAt !== null
+      && Date.now() >= nextControlRefreshAt;
+    const cycleRefreshDue = controlRefreshIntervalMs === null
+      && config.refreshEveryCycles > 0
+      && attempts % config.refreshEveryCycles === 0;
+
+    if (controlRefreshDue || cycleRefreshDue) {
       // CORRECTIF CIBLE (retour vers TARGET_URL apres expiration session TLS):
       // si la page est DEJA sur l'accueil TLS deconnecte juste avant ce
       // refresh planifie, un reload() de /fr-fr ne servirait a rien (TLS y
@@ -898,10 +953,16 @@ export const monitorAppointments = async (
           activePage = recoveredPage;
           lastKnownUrl = activePage.url();
           resolved.onRefreshSucceeded?.();
+          scheduleNextControlRefresh();
           resolved.log("success", "Page de rendez-vous retrouvee automatiquement (recovery avant refresh planifie). Surveillance reprise.");
           continue;
         }
 
+        // Ni echec de refresh comptabilise, ni nouveau timer programme ici:
+        // le refresh de controle reste "du" (pending) et sera retente au
+        // prochain point sur, jamais un rattrapage en rafale (section
+        // "DEMARRAGE DU TIMER" du correctif: un seul refresh, jamais plusieurs
+        // accumules).
         resolved.log(
           "warn",
           "Recovery avant refresh planifie non abouti pour cette tentative: nouvel essai au prochain cycle (aucun echec de refresh comptabilise)."
@@ -909,7 +970,12 @@ export const monitorAppointments = async (
         continue;
       }
 
-      resolved.log("info", `Refresh planifie apres ${config.refreshEveryCycles} cycle(s) sans creneau.`);
+      resolved.log(
+        "info",
+        controlRefreshIntervalMs !== null
+          ? `Refresh de controle planifie (${Math.round(controlRefreshIntervalMs / 60_000)} min ecoulees).`
+          : `Refresh planifie apres ${config.refreshEveryCycles} cycle(s) sans creneau.`
+      );
       try {
         if (activePage.isClosed()) {
           const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
@@ -923,6 +989,11 @@ export const monitorAppointments = async (
         lastKnownUrl = activePage.url();
         await refreshAndWaitForReady(activePage, resolved);
         resolved.onRefreshSucceeded?.();
+        // CAS A du correctif (refresh reussi, toujours sur appointment-booking):
+        // aucune notification speciale, le timer repart simplement pour un
+        // cycle complet - sans effet si le refresh de controle n'est pas
+        // configure (legacy_vm/CLI).
+        scheduleNextControlRefresh();
       } catch (error) {
         if (isTargetClosedError(error)) {
           const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
@@ -934,31 +1005,37 @@ export const monitorAppointments = async (
           continue;
         }
 
-        // CORRECTIF CIBLE: si ce refresh planifie s'est termine sur l'accueil
-        // TLS deconnecte (ex. TLS a redirige pendant le reload), jamais
-        // d'alertAndPause direct - on tente d'abord le recovery pilote par
-        // etat (goto(targetUrl)); en cas d'echec, on retombe ci-dessous sur la
-        // logique fallback/echec existante, totalement inchangee.
-        if (!activePage.isClosed() && isTlsLoggedOutLandingPage(activePage.url())) {
-          resolved.log(
-            "warn",
-            "Refresh planifie termine sur l'accueil TLS deconnecte: recovery direct vers targetUrl (jamais alertAndPause direct)."
-          );
-          const recoveredPage = await resolved.recoverWorkflow("Accueil TLS deconnecte detecte apres refresh planifie.");
+        const reason = `Refresh impossible ou page instable: ${error instanceof Error ? error.message : String(error)}`;
+        const rateLimited = isRateLimitReason(reason);
+
+        if (rateLimited) {
+          // RATE LIMIT (comportement existant strictement conserve): le
+          // cooldown deja en place est le seul mecanisme de reprise - jamais
+          // de recovery/goto declenche ici "pour tester" si le blocage a leve.
+          applyRateLimitCooldown(pageDomain(activePage), config.rateLimitCooldownMinutes, resolved.log);
+          resolved.onRateLimited?.(config.rateLimitCooldownMinutes);
+        } else if (!activePage.isClosed()) {
+          // CAS B/C/D du correctif: le refresh planifie ne s'est PAS termine
+          // sur une page prete - plutot que d'alerter directement, on tente
+          // d'abord le recovery pilote par etat DEJA EXISTANT
+          // (classifyRecoveryState/recoverWorkflowOnce, agentMonitoringRuntime.ts) -
+          // couvre logged-out-landing, tout etat intermediaire deja reconnu
+          // (home/auth/travel-groups/application-summary/service-level), et
+          // desormais aussi un etat "unknown" (tentative bornee de retour vers
+          // targetUrl). Jamais une seconde architecture de navigation/recovery
+          // ici: exactement le meme recoverWorkflow() deja utilise plus haut
+          // pour les pages inattendues detectees en tete de cycle.
+          const recoveredPage = await resolved.recoverWorkflow(reason);
           if (recoveredPage) {
             activePage = recoveredPage;
             lastKnownUrl = activePage.url();
             resolved.onRefreshSucceeded?.();
+            scheduleNextControlRefresh();
             resolved.log("success", "Page de rendez-vous retrouvee automatiquement (recovery apres refresh planifie). Surveillance reprise.");
             continue;
           }
         }
 
-        const reason = `Refresh impossible ou page instable: ${error instanceof Error ? error.message : String(error)}`;
-        if (isRateLimitReason(reason)) {
-          applyRateLimitCooldown(pageDomain(activePage), config.rateLimitCooldownMinutes, resolved.log);
-          resolved.onRateLimited?.(config.rateLimitCooldownMinutes);
-        }
         resolved.onRefreshFailed?.();
         if (resolved.signal?.aborted) {
           return;
@@ -966,6 +1043,9 @@ export const monitorAppointments = async (
         await safeScreenshot(activePage, "reload-error");
         await alertAndPause(reason, resolved);
       }
+    } else if (controlRefreshIntervalMs !== null && nextControlRefreshAt !== null) {
+      const remainingMs = Math.max(0, nextControlRefreshAt - Date.now());
+      resolved.log("info", `Refresh de controle non du (prochain dans ${Math.ceil(remainingMs / 1_000)}s).`);
     } else {
       resolved.log("info", `Refresh ignore ce cycle. Prochain refresh planifie tous les ${config.refreshEveryCycles || 0} cycle(s).`);
     }

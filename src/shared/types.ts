@@ -17,6 +17,17 @@ export type AppConfig = {
   botCycleCooldownMaxMs: number;
   refreshEveryCycles: number;
   rateLimitCooldownMinutes: number;
+  // CORRECTIF CIBLE (refresh temporel securise toutes les 20 minutes):
+  // cadence de refresh de controle basee sur le temps REEL ecoule
+  // (Date.now()), pas sur un nombre de cycles - optionnel et absent par
+  // defaut, donc AUCUN changement pour legacy_vm (sessionManager.ts) ni pour
+  // le mode CLI autonome (index.ts/loadConfig()), qui continuent d'utiliser
+  // exclusivement refreshEveryCycles ci-dessus, inchange. Seul l'agent
+  // (agentMonitoringSettings.ts/toAppConfig) renseigne ce champ: quand il est
+  // present et > 0, monitorAppointments() (src/shared/monitor.ts) bascule sa
+  // cadence de refresh planifie sur ce delai en millisecondes plutot que sur
+  // refreshEveryCycles - jamais les deux a la fois.
+  controlRefreshIntervalMs?: number;
 };
 
 export type HumanValidationResult = {

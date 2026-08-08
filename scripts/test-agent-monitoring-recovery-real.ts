@@ -1059,9 +1059,16 @@ const runScenarioM = async (browser: Browser): Promise<void> => {
     ]);
 
     assert(recoverWorkflowCalls.length === 1, `M) recoverWorkflow() est appele exactement une fois apres le refresh termine sur /fr-fr (recu: ${recoverWorkflowCalls.length})`);
+    // CORRECTIF CIBLE (refresh temporel 20 min): la branche est desormais
+    // GENERALISEE (recoverWorkflow tente pour TOUT etat non pret apres
+    // refresh planifie, plus seulement /fr-fr - cf. CAS B/C/D du correctif) -
+    // l'ancien message specifique a /fr-fr n'existe donc plus tel quel; le
+    // succes de la reprise (recoverWorkflowCalls ci-dessus + ce message de
+    // reprise) est la preuve equivalente et plus generale que le recovery a
+    // bien ete tente et a reussi.
     assert(
-      capture.entries.some((e) => e.message.includes("Refresh planifie termine sur l'accueil TLS deconnecte")),
-      "M) Le motif exact (refresh termine sur l'accueil deconnecte) est journalise"
+      capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement (recovery apres refresh planifie)")),
+      "M) La reprise via le recovery pilote par etat (desormais generalise a tout etat, pas seulement /fr-fr) est bien journalisee comme reussie"
     );
     assert(waitForUserCalls === 0, "M) Aucun alertAndPause direct: le recovery est tente avant toute intervention humaine");
     assert(onRefreshSucceededCalls === 1, `M) onRefreshSucceeded() est appele (reprise reussie apres recovery) (recu: ${onRefreshSucceededCalls})`);
@@ -1093,6 +1100,7 @@ const runScenarioN = async (browser: Browser): Promise<void> => {
     const capture = makeLogCapture();
     let onRefreshFailedCalls = 0;
     let waitForUserCalls = 0;
+    let recoverWorkflowCalls = 0;
 
     const config: AppConfig = {
       targetUrl: `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`,
@@ -1116,7 +1124,7 @@ const runScenarioN = async (browser: Browser): Promise<void> => {
     const monitorPromise = monitorAppointments(page, config, {
       log: capture.log,
       waitForUser: async () => { waitForUserCalls += 1; },
-      recoverWorkflow: async () => null,
+      recoverWorkflow: async () => { recoverWorkflowCalls += 1; return null; },
       onRefreshFailed: () => { onRefreshFailedCalls += 1; }
     });
 
@@ -1125,10 +1133,13 @@ const runScenarioN = async (browser: Browser): Promise<void> => {
       new Promise((_resolve, reject) => setTimeout(() => reject(new Error("timeout monitorPromise (Scenario N)")), 60_000))
     ]);
 
-    assert(
-      capture.entries.some((e) => e.message.includes("Refresh planifie termine sur l'accueil TLS deconnecte")),
-      "N) Le recovery est bien tente avant tout fallback"
-    );
+    // CORRECTIF CIBLE (refresh temporel 20 min): la branche est desormais
+    // GENERALISEE (recoverWorkflow tente pour TOUT etat non pret apres
+    // refresh planifie, plus seulement /fr-fr) - l'ancien message specifique
+    // a /fr-fr n'existe donc plus tel quel; le compteur d'appel est la preuve
+    // equivalente et plus generale que le recovery a bien ete TENTE (et a
+    // echoue ici, cf. le stub recoverWorkflow ci-dessus) avant tout fallback.
+    assert(recoverWorkflowCalls === 1, `N) Le recovery pilote par etat est bien tente exactement une fois avant tout fallback (recu: ${recoverWorkflowCalls})`);
     assert(onRefreshFailedCalls === 1, `N) Le recovery ayant echoue, l'echec de refresh EXISTANT est bien comptabilise (fallback 0.2.3 inchange) (recu: ${onRefreshFailedCalls})`);
     assert(waitForUserCalls >= 1, "N) Le fallback alertAndPause/waitForUser EXISTANT se declenche normalement apres l'echec du recovery");
     assertNoSecretsInLogs(capture.entries, "N) Aucun secret dans les logs");
