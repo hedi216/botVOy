@@ -41,12 +41,16 @@ import { ChildProcess, spawn } from "node:child_process";
 import http, { Server, IncomingMessage, ServerResponse } from "node:http";
 import { AddressInfo } from "node:net";
 import { rmSync } from "node:fs";
+import path from "node:path";
 import { Browser, chromium } from "playwright";
 import { Socket, io as ioClient } from "socket.io-client";
 import { startMonitoring } from "../src/agent/agentMonitoringRuntime.js";
+import { AgentBotManager } from "../src/agent/agentBotManager.js";
 import { AgentEventReporter } from "../src/agent/agentEventReporter.js";
 import { AgentLogLevel } from "../src/agent/agentLocalLogger.js";
 import { AgentMonitoringSettings, DEFAULT_AGENT_MONITORING_SETTINGS } from "../src/agent/agentMonitoringSettings.js";
+import { AgentRuntimeSettings } from "../src/agent/types.js";
+import { detectHumanValidation } from "../src/shared/humanValidation.js";
 import { monitorAppointments } from "../src/shared/monitor.js";
 import { releaseScanTurn, waitForScanTurn } from "../src/shared/orchestrator.js";
 import { AppConfig } from "../src/shared/types.js";
@@ -325,6 +329,117 @@ const startRedirectOnReloadFixture = (): Promise<FixtureSite> => new Promise((re
     const address = server.address() as AddressInfo;
     resolve({ server, baseUrl: `http://127.0.0.1:${address.port}`, requestLog, appointmentReloadCount: () => appointmentRequests });
   });
+});
+
+// ===================== BUG CIBLE 0.2.4: fixtures dediees =====================
+
+// Reprend EXACTEMENT le balisage "pret" deja valide ci-dessus
+// (APPOINTMENT_READY_HTML), avec un self-redirect JS additionnel: reproduit
+// "TLScontact sort silencieusement le navigateur du workflow" (le bug reel
+// confirme par les logs 0.2.4) SANS avoir besoin d'un acces externe a la Page
+// Playwright du bot (deliberement hors de portee d'un test noir sur
+// AgentBotManager - browser/page ne sont jamais exposes, cf. types.ts).
+const selfRedirectToLoggedOutLandingHtml = (afterMs: number): string => `<!DOCTYPE html><html><body>
+<div data-testid="fixture-appointment-page">Fausse page de rendez-vous (test uniquement)</div>
+<button data-testid="btn-current-month-unavailable" disabled>Mois courant</button>
+<button data-testid="btn-next-month-unavailable" disabled>Mois suivant</button>
+<p>Nous n'avons actuellement plus de creneaux de rendez-vous disponibles.</p>
+<script>setTimeout(function () { location.href = "/fr-fr"; }, ${afterMs});</script>
+</body></html>`;
+
+// Fixture dediee Scenarios O/R (BUG CIBLE 0.2.4, recoveryTargetUrl +
+// credentials apres VALIDATE_BOT): accueil deconnecte (/fr-fr) -> country
+// home -> login (formulaire reel, meme balisage que LOGIN_HTML_TO_SERVICE_LEVEL
+// deja valide ci-dessus) -> service-level -> appointment-booking, dont la
+// PREMIERE arrivee se redirige seule vers /fr-fr apres `redirectAfterMs`
+// (episode UNIQUE, jamais une boucle de redirections a chaque nouvelle arrivee).
+const startTargetUrlWiringFixture = (redirectAfterMs: number): Promise<FixtureSite> => new Promise((resolve, reject) => {
+  const requestLog: string[] = [];
+  let appointmentRequests = 0;
+
+  const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
+    const url = req.url ?? "/";
+    requestLog.push(url);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+
+    if (url === "/fr-fr" || url === "/fr-fr/") { res.end(LOGGED_OUT_LANDING_HTML); return; }
+    if (url.startsWith("/fr-fr/country/")) { res.end(COUNTRY_HOME_HTML); return; }
+    if (url.startsWith("/fr-fr/login")) { res.end(LOGIN_HTML_TO_SERVICE_LEVEL); return; }
+    if (url.startsWith("/workflow/service-level")) { res.end(SERVICE_LEVEL_HTML); return; }
+    if (url.startsWith("/workflow/appointment-booking/")) {
+      appointmentRequests += 1;
+      res.end(appointmentRequests === 1 ? selfRedirectToLoggedOutLandingHtml(redirectAfterMs) : APPOINTMENT_READY_HTML);
+      return;
+    }
+    res.statusCode = 404;
+    res.end("Not found (fixture).");
+  });
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address() as AddressInfo;
+    resolve({ server, baseUrl: `http://127.0.0.1:${address.port}`, requestLog, appointmentReloadCount: () => appointmentRequests });
+  });
+});
+
+// Fixture dediee Scenario P (BUG CIBLE 0.2.4, URL arbitraire pendant
+// MONITORING): appointment-booking pret + UNE page normale, sans aucun
+// rapport avec TLScontact (reproduit fidelement l'exemple demande:
+// "https://example.com/") - jamais Cloudflare/CAPTCHA/motif d'erreur connu.
+const ARBITRARY_UNRELATED_PAGE_HTML = `<!DOCTYPE html><html><body>
+<h1>Bienvenue</h1>
+<p>Ceci est une page web tout a fait normale, sans aucun rapport avec TLScontact.</p>
+</body></html>`;
+
+const startArbitraryUrlFixture = (): Promise<FixtureSite> => new Promise((resolve, reject) => {
+  const requestLog: string[] = [];
+
+  const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
+    const url = req.url ?? "/";
+    requestLog.push(url);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+
+    if (url.startsWith("/workflow/appointment-booking/")) { res.end(APPOINTMENT_READY_HTML); return; }
+    if (url.startsWith("/unknown")) { res.end(ARBITRARY_UNRELATED_PAGE_HTML); return; }
+    res.statusCode = 404;
+    res.end("Not found (fixture).");
+  });
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address() as AddressInfo;
+    resolve({ server, baseUrl: `http://127.0.0.1:${address.port}`, requestLog, appointmentReloadCount: () => 0 });
+  });
+});
+
+// Construit un AgentRuntimeSettings de test complet et coherent (mode
+// "test"/targetMode "fixture") - `targetUrl: "about:blank"` REPRODUIT
+// DELIBEREMENT le defaut reel d'une installation packaged (cf.
+// agentSettings.ts: AGENT_TARGET_URL absent -> "about:blank"), exactement la
+// precondition du bug cible - jamais change par les scenarios eux-memes,
+// c'est justement ce que la correction doit rendre sans consequence.
+const makeTestAgentSettings = (overrides: { dataRoot: string } & Partial<AgentRuntimeSettings>): AgentRuntimeSettings => ({
+  serverUrl: "http://127.0.0.1:1",
+  credentialsPath: path.join(overrides.dataRoot, "credentials.json"),
+  computerName: "TEST-BUG024-PC",
+  version: "0.2.4",
+  protocolVersion: 1,
+  runtimeMode: "test",
+  targetMode: "fixture",
+  fixtureUrl: "about:blank",
+  targetUrl: "about:blank",
+  maxActiveBots: 5,
+  reconnectMinDelayMs: 1_000,
+  reconnectMaxDelayMs: 5_000,
+  reconnectJitterRatio: 0.2,
+  offlineEventBufferMax: 100,
+  logMaxFileSizeMb: 5,
+  logMaxFiles: 3,
+  logLevel: "info",
+  autoNavRetryIntervalMs: 500,
+  autoNavLongWaitMs: 800,
+  workflowRecoveryRetryIntervalMs: 500,
+  workflowRecoveryLongWaitMs: 1_000,
+  humanValidationGraceMs: 2_000,
+  ...overrides
 });
 
 // ===================== Capture de logs =====================
@@ -1471,6 +1586,270 @@ const runScenarioF = async (): Promise<void> => {
   }
 };
 
+// ===================== BUG CIBLE 0.2.4 =====================
+// Scenarios O/P/Q/R: reproduisent et corrigent les 4 points de rupture
+// confirmes en reel (mauvais target URL, URL arbitraire pendant le
+// monitoring, session expiree classee a tort comme validation humaine,
+// credentials perdus apres VALIDATE_BOT). O/R testent le VRAI AgentBotManager
+// (vrai Chrome via launchChromeForBot, jamais un Chrome fantome) - a executer
+// sur un PC Windows avec Chrome installe, comme le reste de ce fichier.
+
+const removeTestDataRoot = async (dataRoot: string): Promise<void> => {
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    try {
+      rmSync(dataRoot, { recursive: true, force: true });
+      return;
+    } catch {
+      if (attempt < 5) {
+        await sleep(300);
+      }
+    }
+  }
+};
+
+// ----- Scenario O: recoveryTargetUrl = START_BOT.startUrl, jamais settings.targetUrl (about:blank) -----
+
+const runScenarioO = async (): Promise<void> => {
+  log("BOOT", "=== Scenario O (BUG CIBLE 0.2.4): recoveryTargetUrl = START_BOT.startUrl, jamais settings.targetUrl (about:blank) ===");
+  const fixture = await startTargetUrlWiringFixture(3_000);
+  const dataRoot = `.test-bug024-o-${RUN_SUFFIX}`;
+  const capture = makeLogCapture();
+  const { reporter, statuses } = makeFakeReporter();
+  const settings = makeTestAgentSettings({ dataRoot });
+  const manager = new AgentBotManager(settings, capture.log, reporter);
+  const botId = "bot-scenario-o";
+
+  try {
+    await manager.startBot({
+      commandId: "cmd-o-start",
+      botId,
+      botName: "ScenarioO",
+      login: FAKE_LOGIN,
+      password: FAKE_PASSWORD,
+      rawMonitoringSettings: { botCycleCooldownMinMs: 5_000, botCycleCooldownMaxMs: 6_000, refreshEveryCycles: 0 },
+      startUrl: `${fixture.baseUrl}/fr-fr/country/tn/vac/tnTUN2fr`
+    });
+
+    await waitUntil(() => statuses.some((s) => s.status === "MONITORING"), 30_000);
+    assert(statuses.some((s) => s.status === "MONITORING"), "O) Le bot atteint MONITORING via le vrai startUrl fourni par START_BOT (settings.targetUrl reste about:blank pendant tout ce temps)");
+    assert(!capture.entries.some((e) => e.message.includes("about:blank")), "O) 'about:blank' n'apparait jamais dans les logs (jamais utilise comme cible de navigation reelle)");
+
+    // La page auto-redirige vers /fr-fr apres 3s (simule TLS qui sort
+    // silencieusement le navigateur du workflow, exactement le bug reel
+    // confirme par les logs 0.2.4) -> logged-out-landing -> recovery.
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Accueil TLS deconnecte (logged-out-landing) detecte pendant la reprise")), 20_000);
+    await waitUntil(() => capture.entries.some((e) => /retour vers targetUrl/.test(e.message)), 10_000);
+
+    const returnLog = capture.entries.find((e) => /retour vers targetUrl/.test(e.message));
+    assert(
+      Boolean(returnLog?.message.includes("country")),
+      `O) Le retour utilise le VRAI startUrl fourni par START_BOT (chemin /fr-fr/country/...), jamais about:blank (obtenu: ${returnLog?.message})`
+    );
+    assert(
+      !capture.entries.some((e) => e.message.includes("targetUrl invalide/non http(s): retour impossible")),
+      "O) Jamais le message d'echec exact du bug reel ('targetUrl invalide/non http(s): retour impossible')"
+    );
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")), 30_000);
+    assert(true, "O) Apres le retour vers le vrai startUrl, le parcours complet (home->login->service-level->appointment-booking) reprend et aboutit, meme bot/Chrome/profil/monitoring - jamais un nouveau START_BOT");
+    assertNoSecretsInLogs(capture.entries, "O) Aucun secret dans les logs");
+  } finally {
+    await manager.stopBot({ commandId: "cmd-o-stop", botId }).catch(() => undefined);
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+    await removeTestDataRoot(dataRoot);
+  }
+};
+
+// ----- Scenario P: URL arbitraire pendant MONITORING -> detection hors workflow -> recovery -----
+
+const runScenarioP = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario P (BUG CIBLE 0.2.4): URL arbitraire normale pendant MONITORING -> detection hors workflow -> recovery -> appointment-booking ===");
+  const fixture = await startArbitraryUrlFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture();
+    const { reporter } = makeFakeReporter();
+
+    const handle = startMonitoring({
+      botId: "bot-scenario-p",
+      page,
+      context,
+      settings: FAST_SETTINGS,
+      targetUrl: `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`,
+      commandId: "cmd-p",
+      reporter,
+      log: capture.log,
+      workflowRecoveryRetryIntervalMs: 500,
+      workflowRecoveryLongWaitMs: 1_000,
+      isBotStillRegistered: () => true
+    });
+
+    // Point de synchronisation deterministe: attend le premier cycle avant de
+    // remplacer volontairement l'URL - jamais un delai arbitraire.
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Surveillance tentative")), 5_000);
+    // L'UTILISATEUR remplace volontairement l'URL de Chrome par une page
+    // normale, sans aucun rapport avec TLScontact (exemple demande:
+    // https://example.com/) - jamais un clic/une action du code sous test.
+    await page.goto(`${fixture.baseUrl}/unknown`, { waitUntil: "domcontentloaded" });
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")), 30_000);
+    handle.abortController.abort();
+    await handle.loopPromise;
+
+    // Le texte exact "Page hors workflow detectee" (unexpectedReason) n'est
+    // jamais imprime verbatim sur le chemin de succes (utilise uniquement
+    // comme valeur interne/flag - seul un echec terminal l'aurait journalise
+    // via alertAndPause) - la preuve observable equivalente est le suffixe
+    // "apres page inattendue" du log de reprise, qui ne s'affiche QUE lorsque
+    // detectUnexpectedPageReason (donc mon repli isAppointmentPageReady) a
+    // bien produit un motif non nul pour cette page arbitraire.
+    assert(
+      capture.entries.some((e) => /Reprise workflow \d\/4 apres page inattendue/.test(e.message)),
+      "P) Une URL arbitraire normale (jamais Cloudflare/CAPTCHA/motif d'erreur connu) declenche bien le recovery comme une page hors workflow"
+    );
+    assert(
+      capture.entries.some((e) => e.message.includes("etat detecte = unknown")),
+      "P) L'etat est classifie 'unknown' (jamais confondu avec un etat reconnu)"
+    );
+    assert(
+      capture.entries.some((e) => /retour vers targetUrl/.test(e.message)),
+      "P) Retour BORNE vers targetUrl deja fourni au monitoring (jamais une URL derivee de la page elle-meme)"
+    );
+    assert(
+      capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")),
+      "P) Le monitoring reprend et aboutit a appointment-booking, meme bot/Chrome/profil/monitoring - jamais un nouveau START_BOT"
+    );
+    assertNoSecretsInLogs(capture.entries, "P) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ----- Scenario Q: session expiree seule -> jamais classee CAPTCHA/validation humaine -----
+
+const runScenarioQ = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario Q (BUG CIBLE 0.2.4): 'session expired' seul -> jamais CAPTCHA/validation humaine, route vers le recovery automatique ===");
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    await page.setContent(
+      "<!DOCTYPE html><html><body><h1>Session expired</h1><p>Votre session a expire. Merci de vous reconnecter.</p></body></html>"
+    );
+
+    const validation = await detectHumanValidation(page);
+    assert(!validation.detected, `Q) 'session expired' seul n'est plus classe comme validation humaine/CAPTCHA par detectHumanValidation (obtenu: ${JSON.stringify(validation)})`);
+
+    const capture = makeLogCapture();
+    let recoverWorkflowCalls = 0;
+    let waitForUserCalls = 0;
+    let recoverWorkflowReason: string | undefined;
+
+    const config: AppConfig = {
+      targetUrl: "about:blank",
+      connectToExistingChrome: false,
+      chromeDebugUrl: "",
+      refreshIntervalMs: 1_000,
+      headless: true,
+      slowMoMs: 0,
+      debugKeepBrowserOpen: false,
+      maxRefreshAttempts: 1,
+      scanMonthCount: 1,
+      maxParallelScansPerDomain: 1,
+      monthClickMinDelayMs: 100,
+      monthClickMaxDelayMs: 200,
+      botCycleCooldownMinMs: 300,
+      botCycleCooldownMaxMs: 500,
+      refreshEveryCycles: 1,
+      rateLimitCooldownMinutes: 1
+    };
+
+    const monitorPromise = monitorAppointments(page, config, {
+      log: capture.log,
+      waitForUser: async () => { waitForUserCalls += 1; },
+      recoverWorkflow: async (reason) => { recoverWorkflowCalls += 1; recoverWorkflowReason = reason; return null; }
+    });
+
+    await Promise.race([
+      monitorPromise,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("timeout monitorPromise (Scenario Q)")), 20_000))
+    ]);
+
+    assert(recoverWorkflowCalls === 1, `Q) Le recovery workflow (automatique) est bien declenche pour 'session expired' (recu: ${recoverWorkflowCalls})`);
+    assert(Boolean(recoverWorkflowReason && /session expir/i.test(recoverWorkflowReason)), `Q) Le motif transmis mentionne bien la session expiree (obtenu: ${recoverWorkflowReason})`);
+    assert(waitForUserCalls === 0, `Q) Aucune intervention humaine sollicitee pour ce motif (pauseForHuman/alertAndPause jamais declenche) (recu: ${waitForUserCalls})`);
+    assert(
+      !capture.entries.some((e) => e.message.includes("Intervention humaine potentiellement requise")),
+      "Q) Jamais le chemin CAPTCHA/validation humaine (pauseForHuman) pour une simple session expiree"
+    );
+    assertNoSecretsInLogs(capture.entries, "Q) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+  }
+};
+
+// ----- Scenario R: VALIDATE_BOT redonne au monitoring les runtime credentials du START_BOT initial -----
+
+const runScenarioR = async (): Promise<void> => {
+  log("BOOT", "=== Scenario R (BUG CIBLE 0.2.4): VALIDATE_BOT redonne au monitoring les runtime credentials du START_BOT initial ===");
+  const fixture = await startTargetUrlWiringFixture(3_000);
+  const dataRoot = `.test-bug024-r-${RUN_SUFFIX}`;
+  const capture = makeLogCapture();
+  const { reporter, statuses } = makeFakeReporter();
+  const settings = makeTestAgentSettings({ dataRoot });
+  const manager = new AgentBotManager(settings, capture.log, reporter);
+  const botId = "bot-scenario-r";
+
+  try {
+    await manager.startBot({
+      commandId: "cmd-r-start",
+      botId,
+      botName: "ScenarioR",
+      login: FAKE_LOGIN,
+      password: FAKE_PASSWORD,
+      rawMonitoringSettings: { botCycleCooldownMinMs: 5_000, botCycleCooldownMaxMs: 6_000, refreshEveryCycles: 0 },
+      startUrl: `${fixture.baseUrl}/fr-fr/country/tn/vac/tnTUN2fr`
+    });
+    await waitUntil(() => statuses.filter((s) => s.status === "MONITORING").length >= 1, 30_000);
+
+    // Exerce deliberement le point d'entree VALIDATE_BOT sur un bot deja
+    // reconnu (page de rendez-vous deja affichee) - reproduit fidelement
+    // l'appel this.beginMonitoring(handle, commandId) qui, avant ce
+    // correctif, ne recevait JAMAIS runtimeCredentials (contrairement au
+    // chemin automatique) - sans avoir besoin d'un acces externe a la Page
+    // Playwright du bot (deliberement hors de portee, cf. AgentBotHandle).
+    await manager.validateBot({ commandId: "cmd-r-validate", botId });
+    await waitUntil(() => statuses.filter((s) => s.status === "MONITORING").length >= 2, 15_000);
+    capture.entries.length = 0; // ne conserver que ce qui suit VALIDATE_BOT.
+
+    // Meme redirection self-inflicted que le Scenario O, observee cette fois
+    // par le runtime de monitoring (re)demarre PAR VALIDATE_BOT.
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("etat detecte = auth")), 30_000);
+    assert(
+      capture.entries.some((e) => e.message.includes("nouvelle tentative de connexion automatique")),
+      "R) Apres VALIDATE_BOT, les identifiants du START_BOT initial sont toujours disponibles en memoire: reconnexion automatique tentee"
+    );
+    assert(
+      !capture.entries.some((e) => e.message.includes("aucun identifiant en memoire pour cette session")),
+      "R) Jamais le message d'echec exact du bug reel ('aucun identifiant en memoire pour cette session') apres VALIDATE_BOT"
+    );
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")), 30_000);
+    assert(true, "R) Le monitoring (re)demarre par VALIDATE_BOT retrouve la page de rendez-vous apres reconnexion automatique, meme bot/Chrome/profil - jamais un nouveau START_BOT");
+    assertNoSecretsInLogs(capture.entries, "R) Aucun secret dans les logs apres VALIDATE_BOT");
+  } finally {
+    await manager.stopBot({ commandId: "cmd-r-stop", botId }).catch(() => undefined);
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+    await removeTestDataRoot(dataRoot);
+  }
+};
+
 const main = async (): Promise<void> => {
   log("BOOT", "=== Test REEL cible - Hotfix Agent 0.2.3 (recovery robuste du monitoring) ===");
 
@@ -1494,12 +1873,16 @@ const main = async (): Promise<void> => {
     await runScenarioL(browser);
     await runScenarioM(browser);
     await runScenarioN(browser);
+    await runScenarioP(browser);
+    await runScenarioQ(browser);
   } finally {
     if (browser) await browser.close().catch(() => undefined);
   }
 
   await runScenarioH();
   await runScenarioF();
+  await runScenarioO();
+  await runScenarioR();
 
   try {
     const { pool } = await import("../src/db.js");

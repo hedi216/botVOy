@@ -17,9 +17,9 @@ import { findAppointmentPage, isCloudflareBlockedPage, maskUrlForLog } from "./a
 import { acquireProfileLockForAccount, ProfileLease } from "./agentProfileManager.js";
 import { AgentCommandError, toAgentCommandError } from "./agentErrors.js";
 import { AgentEventReporter } from "./agentEventReporter.js";
-import { AgentLogFn } from "./agentLocalLogger.js";
+import { AgentLogFn, createBotLogger } from "./agentLocalLogger.js";
 import { validateMonitoringSettings } from "./agentMonitoringSettings.js";
-import { startMonitoring } from "./agentMonitoringRuntime.js";
+import { RuntimeCredentials, startMonitoring } from "./agentMonitoringRuntime.js";
 import { AgentBotHandle, AgentExtensionInstallLink, AgentRuntimeSettings, RuntimeStatusBotSnapshot } from "./types.js";
 
 // Delai maximum laisse a la boucle de surveillance pour repondre a
@@ -114,6 +114,15 @@ export class AgentBotManager {
   // equivalente est deja en cours" -> VALIDATION_ALREADY_RUNNING), meme
   // principe que this.starting/this.stopping.
   private readonly validating = new Set<string>();
+  // BUG CIBLE 0.2.4 (credentials perdus apres VALIDATE_BOT): stockage EN
+  // MEMOIRE UNIQUEMENT, jamais sur AgentBotHandle (invariant deja documente,
+  // cf. types.ts) ni sur disque/DB/logs/payload public - source UNIQUE que
+  // beginMonitoring() interroge desormais lui-meme (jamais un parametre
+  // fourni au cas par cas par l'appelant, qui divergeait entre le chemin
+  // automatique et VALIDATE_BOT). Detruit explicitement partout ou un bot
+  // quitte le registre (stopHandle/wireUnexpectedClosure/closeAllBotHandles) -
+  // jamais laisse trainer au-dela de la vie reelle du bot/process.
+  private readonly runtimeCredentials = new Map<string, RuntimeCredentials>();
   private shuttingDown = false;
 
   constructor(
@@ -150,7 +159,18 @@ export class AgentBotManager {
     // appel et a runAutoNavigation() uniquement (section 3 du hotfix 0.1.1).
     const login = params.login;
     const password = params.password;
-    const settingsSnapshot = validateMonitoringSettings(params.rawMonitoringSettings, this.log);
+
+    // BUG CIBLE 0.2.4 (nouveaux logs par bot): cree DES LE DEBUT de START_BOT
+    // (avant tout controle pouvant echouer, avant meme la validation des
+    // parametres de surveillance) - un echec de demarrage, ou un simple
+    // avertissement de bornage de parametres, doit lui aussi atterrir dans le
+    // fichier dedie a CETTE execution de bot. Le nom de fichier est fige a cet
+    // instant (heure locale de reception de START_BOT), jamais recalcule ensuite.
+    const startedAt = new Date();
+    const botLog = createBotLogger(this.settings, this.log, botName, startedAt).log;
+    botLog("info", `START_BOT recu (botId=${botId}${botName ? `, botName=${botName}` : ""}).`);
+
+    const settingsSnapshot = validateMonitoringSettings(params.rawMonitoringSettings, botLog);
 
     if (this.shuttingDown) {
       this.reporter.failed(commandId, "AGENT_SHUTTING_DOWN", "L'agent est en cours d'arret. Relancez RendezBot Agent.");
@@ -233,9 +253,26 @@ export class AgentBotManager {
         settingsSnapshot,
         monitoringRuntime: null,
         botName,
-        category
+        category,
+        // BUG CIBLE 0.2.4 (mauvais target URL): startUrl DEJA VALIDE (jamais
+        // about:blank), source unique de verite pour le monitoring/recovery
+        // de CE bot - cf. commentaire sur AgentBotHandle.recoveryTargetUrl
+        // (types.ts). Absent (undefined) uniquement si aucun startUrl valide
+        // n'a ete fourni (flux extension locale): beginMonitoring retombe
+        // alors sur this.settings.targetUrl, comportement inchange.
+        recoveryTargetUrl: validStartUrl,
+        log: botLog
       };
       this.bots.set(botId, handle);
+      // BUG CIBLE 0.2.4 (credentials perdus apres VALIDATE_BOT): stocke ICI,
+      // une seule fois, des que le bot est reellement enregistre - jamais sur
+      // un echec de demarrage (handle jamais cree dans ce cas, rien a
+      // associer). Lu ensuite par beginMonitoring() pour CE botId, que le
+      // declenchement soit automatique (runAutoNavigation) ou manuel
+      // (VALIDATE_BOT) - source UNIQUE, jamais un parametre divergent par appelant.
+      if (login && password) {
+        this.runtimeCredentials.set(botId, { login, password });
+      }
       this.wireUnexpectedClosure(handle);
       await this.openExtensionLinks(handle, params.extensionLinks ?? []);
 
@@ -255,17 +292,17 @@ export class AgentBotManager {
         started: true,
         computerName: this.settings.computerName
       });
-      this.log("success", `Bot ${botId} demarre (Chrome visible, profil verrouille). Connexion automatique en cours...`);
+      botLog("success", `Bot ${botId} demarre (Chrome visible, profil verrouille). Connexion automatique en cours...`);
 
       void this.runAutoNavigation(handle, hasLocalExtension, login, password, validStartUrl).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
-        this.log("error", `Bot ${botId}: demarrage automatique interrompu de maniere inattendue (${message}).`);
+        handle.log("error", `Bot ${botId}: demarrage automatique interrompu de maniere inattendue (${message}).`);
       });
     } catch (error) {
       lease?.release();
       this.leases.delete(botId);
       const commandError = toAgentCommandError(error, "BROWSER_LAUNCH_FAILED");
-      this.log("error", `Demarrage du bot ${botId} echoue (${commandError.code}): ${commandError.message}`);
+      botLog("error", `Demarrage du bot ${botId} echoue (${commandError.code}): ${commandError.message}`);
       this.reporter.botStatus(botId, commandId, "ERROR");
       this.reporter.failed(commandId, commandError.code, this.publicMessageFor(commandError));
     } finally {
@@ -326,11 +363,14 @@ export class AgentBotManager {
       this.leases.delete(botId);
       this.bots.delete(botId);
       this.stopping.delete(botId);
+      // BUG CIBLE 0.2.4: bot arrete -> credentials en memoire detruits (jamais
+      // conserves au-dela de la vie reelle du bot).
+      this.runtimeCredentials.delete(botId);
     }
 
     this.reporter.botStatus(botId, commandId, "STOPPED");
     this.reporter.completed(commandId, { botId, status: "STOPPED", stopped: true });
-    this.log("success", `Bot ${botId} arrete, Chrome ferme, profil libere.`);
+    handle.log("success", `Bot ${botId} arrete, Chrome ferme, profil libere.`);
   }
 
   // VALIDATE_BOT (Lot 3): verifie que la page ouverte par l'utilisateur est
@@ -376,7 +416,7 @@ export class AgentBotManager {
       const selection = await findAppointmentPage(pages, this.settings.targetMode);
 
       if (!selection.ok) {
-        this.log("warn", `VALIDATE_BOT ${botId}: ${selection.reason}`);
+        handle.log("warn", `VALIDATE_BOT ${botId}: ${selection.reason}`);
         this.reporter.botStatus(botId, commandId, "WAITING_FOR_USER");
         this.reporter.failed(
           commandId,
@@ -395,10 +435,10 @@ export class AgentBotManager {
       this.beginMonitoring(handle, commandId);
 
       this.reporter.completed(commandId, { botId, status: "MONITORING", validated: true });
-      this.log("success", `Bot ${botId} valide: page reconnue (${maskUrlForLog(selection.page.url())}), surveillance demarree.`);
+      handle.log("success", `Bot ${botId} valide: page reconnue (${maskUrlForLog(selection.page.url())}), surveillance demarree.`);
     } catch (error) {
       const commandError = toAgentCommandError(error, "PAGE_NOT_READY");
-      this.log("error", `VALIDATE_BOT ${botId} echoue (${commandError.code}): ${commandError.message}`);
+      handle.log("error", `VALIDATE_BOT ${botId} echoue (${commandError.code}): ${commandError.message}`);
       this.reporter.botStatus(botId, commandId, "WAITING_FOR_USER");
       this.reporter.failed(commandId, commandError.code, this.publicMessageFor(commandError));
     } finally {
@@ -413,12 +453,22 @@ export class AgentBotManager {
   // JAMAIS de commande elle-meme: chaque appelant garde la responsabilite de
   // son propre COMMAND_COMPLETED (ou aucun, si aucune commande n'est en
   // attente a ce moment-la).
-  // HOTFIX 0.2.3 (section 5): runtimeCredentials, si fourni, n'est JAMAIS
-  // assigne sur `handle` (deja documente comme ne devant jamais porter de
-  // credential) - transmis uniquement en parametre de fonction jusqu'a
-  // startMonitoring(), qui le conserve EN MEMOIRE pour la seule duree de vie
-  // de cette boucle de surveillance (cf. RuntimeCredentials, agentMonitoringRuntime.ts).
-  private beginMonitoring(handle: AgentBotHandle, commandId: string, runtimeCredentials?: { login: string; password: string }): void {
+  // BUG CIBLE 0.2.4 (mauvais target URL + credentials perdus apres
+  // VALIDATE_BOT): factorise desormais DEUX resolutions qui divergaient entre
+  // le chemin automatique et VALIDATE_BOT -
+  //   - targetUrl: handle.recoveryTargetUrl (startUrl DEJA VALIDE recu par
+  //     START_BOT) en priorite, jamais this.settings.targetUrl
+  //     (AGENT_TARGET_URL local, "about:blank" par defaut en installation
+  //     packaged) tant que ce champ est renseigne ;
+  //   - runtimeCredentials: relu depuis this.runtimeCredentials (memes
+  //     credentials que ceux stockes par startBot(), EN MEMOIRE UNIQUEMENT),
+  //     jamais un parametre fourni au cas par cas par l'appelant - VALIDATE_BOT
+  //     beneficie donc desormais des memes identifiants que le chemin automatique.
+  // Ni l'un ni l'autre n'est jamais assigne sur `handle` lui-meme au-dela de
+  // recoveryTargetUrl (deja documente comme non sensible, cf. types.ts): les
+  // credentials restent exclusivement dans this.runtimeCredentials/la
+  // fermeture de startMonitoring (cf. RuntimeCredentials, agentMonitoringRuntime.ts).
+  private beginMonitoring(handle: AgentBotHandle, commandId: string): void {
     const { botId } = handle;
     handle.monitoringPrepared = true;
     handle.currentStatus = "MONITORING";
@@ -431,12 +481,12 @@ export class AgentBotManager {
       page: handle.page,
       context: handle.context,
       settings: handle.settingsSnapshot,
-      targetUrl: this.settings.targetUrl,
+      targetUrl: handle.recoveryTargetUrl ?? this.settings.targetUrl,
       commandId,
       reporter: this.reporter,
-      log: this.log,
+      log: handle.log,
       isBotStillRegistered: () => this.bots.has(botId),
-      runtimeCredentials,
+      runtimeCredentials: this.runtimeCredentials.get(botId),
       workflowRecoveryRetryIntervalMs: this.settings.workflowRecoveryRetryIntervalMs,
       workflowRecoveryLongWaitMs: this.settings.workflowRecoveryLongWaitMs,
       humanValidationGraceMs: this.settings.humanValidationGraceMs
@@ -474,7 +524,7 @@ export class AgentBotManager {
     const { botId } = handle;
     const stillRunning = (): boolean => this.bots.has(botId) && !this.stopping.has(botId);
     const navLog = (level: Parameters<AgentLogFn>[0], message: string): void =>
-      this.log(level, `[Connexion auto ${botId}] ${message}`);
+      handle.log(level, `[Connexion auto ${botId}] ${message}`);
 
     // Hotfix 0.1.2 (point 4 du cahier des charges): quitte reellement
     // about:blank AVANT toute tentative de connexion automatique - jamais de
@@ -918,13 +968,12 @@ export class AgentBotManager {
 
       if (await attemptOnce()) {
         await this.closeExtraPages(handle.page);
-        // HOTFIX 0.2.3 (section 5): transmis EN MEMOIRE uniquement, jamais
-        // assigne sur handle (cf. beginMonitoring ci-dessus) - permet au
-        // recovery du monitoring de refaire fillLoginForm() si la session
-        // TLS expire pendant la surveillance. Absent si login/password
-        // n'ont pas ete fournis a START_BOT (flux extension locale).
-        this.beginMonitoring(handle, handle.startCommandId, login && password ? { login, password } : undefined);
-        this.log("success", `Bot ${botId}: page de rendez-vous atteinte automatiquement, surveillance demarree.`);
+        // BUG CIBLE 0.2.4: runtimeCredentials n'est plus passe au cas par cas
+        // ici - beginMonitoring() les relit lui-meme depuis this.runtimeCredentials
+        // (memes credentials, deja stockes dans startBot()), source UNIQUE
+        // partagee avec le chemin VALIDATE_BOT (jamais deux mecanismes divergents).
+        this.beginMonitoring(handle, handle.startCommandId);
+        handle.log("success", `Bot ${botId}: page de rendez-vous atteinte automatiquement, surveillance demarree.`);
         return;
       }
 
@@ -968,11 +1017,14 @@ export class AgentBotManager {
       if (this.stopping.has(handle.botId) || !this.bots.has(handle.botId)) {
         return;
       }
-      this.log("warn", `Bot ${handle.botId}: navigateur ferme ou deconnecte de maniere inattendue.`);
+      handle.log("warn", `Bot ${handle.botId}: navigateur ferme ou deconnecte de maniere inattendue.`);
       handle.monitoringRuntime?.abortController.abort();
       this.leases.get(handle.botId)?.release();
       this.leases.delete(handle.botId);
       this.bots.delete(handle.botId);
+      // BUG CIBLE 0.2.4: fermeture inattendue du navigateur -> credentials en
+      // memoire detruits (jamais conserves au-dela de la vie reelle du bot).
+      this.runtimeCredentials.delete(handle.botId);
       this.reporter.botStatus(handle.botId, handle.startCommandId, "STOPPED", { reason: "BROWSER_CLOSED" });
     };
 
@@ -1005,15 +1057,15 @@ export class AgentBotManager {
       const extensionPage = await handle.context.newPage();
       extensionPage.setDefaultTimeout(8_000);
       await extensionPage.goto(link.installUrl, { waitUntil: "domcontentloaded" })
-        .then(() => this.log("info", `Bot ${handle.botId}: lien extension ouvert (${link.name}, ${maskUrlForLog(link.installUrl)}).`))
+        .then(() => handle.log("info", `Bot ${handle.botId}: lien extension ouvert (${link.name}, ${maskUrlForLog(link.installUrl)}).`))
         .catch((error) => {
           const message = error instanceof Error ? error.message : String(error);
-          this.log("warn", `Bot ${handle.botId}: ouverture du lien extension "${link.name}" impossible (${message}).`);
+          handle.log("warn", `Bot ${handle.botId}: ouverture du lien extension "${link.name}" impossible (${message}).`);
         });
     }
 
     await handle.page.bringToFront().catch(() => undefined);
-    this.log("info", `Bot ${handle.botId}: ${validLinks.length} lien(s) d'extension ouvert(s). Installez manuellement si Chrome le demande, puis validez le bot.`);
+    handle.log("info", `Bot ${handle.botId}: ${validLinks.length} lien(s) d'extension ouvert(s). Installez manuellement si Chrome le demande, puis validez le bot.`);
   }
 
   private async closeExtraPages(keepPage: import("playwright").Page): Promise<void> {
@@ -1086,6 +1138,9 @@ export class AgentBotManager {
     }));
     this.bots.clear();
     this.leases.clear();
+    // BUG CIBLE 0.2.4: agent arrete/identite reinitialisee -> plus aucun
+    // credential ne doit survivre au-dela de cet instant.
+    this.runtimeCredentials.clear();
   }
 
   // BUG CIBLE 0.1.5 (agent inutilisable apres revocation/reappairage dans le

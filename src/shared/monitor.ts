@@ -742,7 +742,25 @@ export const monitorAppointments = async (
       continue;
     }
 
-    const unexpectedReason = await detectUnexpectedPageReason(activePage);
+    let unexpectedReason = await detectUnexpectedPageReason(activePage);
+    // BUG CIBLE 0.2.4 (URL arbitraire pendant le monitoring): apres les
+    // controles Cloudflare/CAPTCHA (detectHumanValidation ci-dessus) et les
+    // motifs specifiques deja connus (detectUnexpectedPageReason), une page
+    // devenue normale mais QUELCONQUE (ex. l'utilisateur remplace
+    // volontairement l'URL de Chrome par https://example.com/) ne matchait
+    // encore aucun des deux -> le cycle continuait a scanner cette page comme
+    // si elle etait appointment-booking. isAppointmentPageReady() (deja la
+    // reference partagee pour "cette page est exploitable comme page de
+    // rendez-vous", utilisee par VALIDATE_BOT et le refresh planifie) est
+    // donc consultee ici aussi: si elle repond non-prete ET qu'aucun motif
+    // specifique n'a deja ete detecte, la page est traitee comme "hors
+    // workflow" et reinjectee dans EXACTEMENT le meme chemin de recovery que
+    // les autres pages inattendues ci-dessous (recoverWorkflow ->
+    // classifyRecoveryState -> "unknown" si non reconnue -> retour borne vers
+    // recoveryTargetUrl) - jamais une deuxieme architecture de detection/recovery.
+    if (!unexpectedReason && !(await isAppointmentPageReady(activePage).catch(() => false))) {
+      unexpectedReason = `Page hors workflow detectee: ce n'est plus la page de rendez-vous appointment-booking exploitable. URL: ${activePage.url()}`;
+    }
     if (unexpectedReason) {
       const rateLimited = isRateLimitReason(unexpectedReason);
       if (rateLimited) {

@@ -1,6 +1,16 @@
 import { Page } from "playwright";
 import { HumanValidationResult } from "./types.js";
 
+// BUG CIBLE 0.2.4 (session expiree classee a tort comme validation humaine):
+// "session expired"/"session expiree"/"session expirée" ont ete retires de
+// cette liste - une session expiree n'est PAS un CAPTCHA/Cloudflare/controle
+// de securite et ne doit jamais mettre le bot en pause humaine
+// (pauseForHuman/WAITING_FOR_USER) quand une reconnexion automatique est
+// possible. Ce texte reste neanmoins detecte ailleurs (detectUnexpectedPageReason,
+// src/shared/monitor.ts) qui route deja vers le recovery workflow automatique
+// (classifyRecoveryState -> "auth" -> fillLoginForm si des credentials sont
+// en memoire). Les vraies detections CAPTCHA/Cloudflare/security check/human
+// verification ci-dessous restent strictement inchangees.
 const blockingTextPatterns = [
   /i'?m not a robot/i,
   /je ne suis pas un robot/i,
@@ -14,10 +24,7 @@ const blockingTextPatterns = [
   /too many requests/i,
   /access denied/i,
   /acces refuse/i,
-  /accès refusé/i,
-  /session expired/i,
-  /session expiree/i,
-  /session expirée/i
+  /accès refusé/i
 ];
 
 const challengeElementPattern = /hcaptcha|captcha|challenge|cloudflare/i;

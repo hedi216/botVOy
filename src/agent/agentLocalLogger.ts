@@ -78,7 +78,7 @@ const CONFIG_LEVEL_RANK: Record<AgentRuntimeSettings["logLevel"], number> = {
   error: 3
 };
 
-const rotateIfNeeded = (filePath: string, maxBytes: number, maxFiles: number): void => {
+export const rotateIfNeeded = (filePath: string, maxBytes: number, maxFiles: number): void => {
   if (!existsSync(filePath) || statSync(filePath).size < maxBytes) {
     return;
   }
@@ -129,4 +129,106 @@ export const createAgentLogger = (settings: AgentRuntimeSettings): AgentLogFn =>
       console.error(`[agentLocalLogger] Ecriture du log local impossible: ${detail}`);
     }
   };
+};
+
+// --------------------------------------------------------------------------
+// BUG CIBLE 0.2.4 (nouveaux logs par bot): un fichier DEDIE par EXECUTION de
+// bot (jamais un deuxieme pipeline de logging independant - reutilise
+// redactLogLine/rotateIfNeeded/getLogsDir ci-dessus, exactement comme
+// createAgentLogger). Format exact: nomdubot_DDMMYYYY_HHMMSS.log, heure
+// LOCALE du PC (jamais UTC) pour le nom de fichier uniquement - le contenu
+// garde les timestamps ISO existants (inchange).
+// --------------------------------------------------------------------------
+
+// Caracteres interdits sur Windows (< > : " / \ | ? *) + caracteres de
+// controle: remplaces par "_", jamais supprimes silencieusement au point de
+// vider la chaine (fallback "bot" ci-dessous si le resultat est vide).
+const WINDOWS_FORBIDDEN_FILENAME_CHARS = /[<>:"/\\|?*\u0000-\u001f]/g;
+const MAX_BOT_NAME_LENGTH_IN_FILENAME = 60;
+const FALLBACK_BOT_NAME = "bot";
+
+// Neutralise toute traversee de chemin ("../", segments ".."/"." isoles)
+// AVANT le remplacement caractere-par-caractere ci-dessous, qui ne
+// neutraliserait jamais ".." a lui seul (compose uniquement de caracteres
+// deja autorises). Slashes/backslashes deja retires ici aussi (jamais
+// seulement par WINDOWS_FORBIDDEN_FILENAME_CHARS ensuite, pour ne laisser
+// aucune fenetre ou un ".." reconstruit par concatenation redeviendrait actif).
+export const sanitizeBotNameForFilename = (raw: string | undefined): string => {
+  if (!raw) {
+    return FALLBACK_BOT_NAME;
+  }
+  const withoutTraversal = raw.replace(/\.\.+/g, "_").replace(/[\\/]/g, "_");
+  const sanitized = withoutTraversal
+    .replace(WINDOWS_FORBIDDEN_FILENAME_CHARS, "_")
+    .trim()
+    .replace(/\s+/g, "_")
+    .replace(/^\.+/, "_") // jamais un nom commencant par un point seul (fichier cache/edge case Windows).
+    .slice(0, MAX_BOT_NAME_LENGTH_IN_FILENAME);
+  return sanitized || FALLBACK_BOT_NAME;
+};
+
+const pad2 = (value: number): string => String(value).padStart(2, "0");
+
+// Heure LOCALE du PC (jamais UTC/ISO) - EXCLUSIVEMENT pour le nom de fichier,
+// jamais pour le contenu des lignes de log (deja horodate en ISO ci-dessus,
+// inchange).
+export const formatLocalTimestampForFilename = (date: Date): string =>
+  `${pad2(date.getDate())}${pad2(date.getMonth() + 1)}${date.getFullYear()}_${pad2(date.getHours())}${pad2(date.getMinutes())}${pad2(date.getSeconds())}`;
+
+// Collision exceptionnelle (meme botName sanitize + meme seconde precise):
+// suffixe numerique, jamais un ecrasement silencieux d'un fichier existant.
+export const buildBotLogFileName = (
+  botName: string | undefined,
+  startedAt: Date,
+  fileExistsInLogsDir: (candidateFileName: string) => boolean
+): string => {
+  const base = `${sanitizeBotNameForFilename(botName)}_${formatLocalTimestampForFilename(startedAt)}`;
+  let candidate = `${base}.log`;
+  let suffix = 2;
+  while (fileExistsInLogsDir(candidate)) {
+    candidate = `${base}_${suffix}.log`;
+    suffix += 1;
+  }
+  return candidate;
+};
+
+export type BotLogger = { log: AgentLogFn; fileName: string; filePath: string };
+
+// Tee vers le logger partage (baseLog, inchange - agent.log continue de
+// recevoir TOUTES les lignes comme avant) ET vers un fichier propre a CE bot.
+// Jamais de crash agent a cause de ce fichier dedie (meme garantie que
+// createAgentLogger): une erreur d'ecriture reste locale a cette fonction.
+export const createBotLogger = (
+  settings: AgentRuntimeSettings,
+  baseLog: AgentLogFn,
+  botName: string | undefined,
+  startedAt: Date
+): BotLogger => {
+  const logsDir = getLogsDir(settings);
+  const fileName = buildBotLogFileName(botName, startedAt, (candidate) => existsSync(path.join(logsDir, candidate)));
+  const filePath = path.join(logsDir, fileName);
+  const maxBytes = Math.max(1, settings.logMaxFileSizeMb) * 1024 * 1024;
+  const maxFiles = Math.max(1, settings.logMaxFiles);
+  const minRank = CONFIG_LEVEL_RANK[settings.logLevel];
+
+  const log: AgentLogFn = (level, message) => {
+    baseLog(level, message);
+
+    if (LOG_LEVEL_RANK[level] < minRank) {
+      return;
+    }
+
+    const safeMessage = redactLogLine(message);
+    const line = `[${new Date().toISOString()}] [${level.toUpperCase()}] ${safeMessage}`;
+
+    try {
+      rotateIfNeeded(filePath, maxBytes, maxFiles);
+      appendFileSync(filePath, `${line}\n`, "utf8");
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[agentLocalLogger] Ecriture du log du bot (${fileName}) impossible: ${detail}`);
+    }
+  };
+
+  return { log, fileName, filePath };
 };

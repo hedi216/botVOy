@@ -5,6 +5,7 @@
 
 import type { AgentMonitoringSettings } from "./agentMonitoringSettings.js";
 import type { MonitoringRuntimeHandle } from "./agentMonitoringRuntime.js";
+import type { AgentLogFn } from "./agentLocalLogger.js";
 
 export type AgentTargetMode = "production" | "fixture";
 
@@ -265,6 +266,27 @@ export type AgentBotHandle = {
   // long-lived (section 3 du hotfix: duree de vie minimale en memoire).
   botName?: string;
   category?: string;
+  // BUG CIBLE 0.2.4 (mauvais target URL): startUrl DEJA VALIDE (jamais
+  // about:blank, jamais un autre schema que http/https - cf.
+  // isValidAbsoluteStartUrl dans agentBotManager.ts) recu par CE bot via
+  // START_BOT.startUrl. Source UNIQUE de verite pour le monitoring/recovery de
+  // ce bot pendant toute sa duree de vie (runAutoNavigation -> beginMonitoring
+  // -> startMonitoring -> recoverWorkflow -> attemptReturnToTargetUrl),
+  // qu'il ait atteint MONITORING automatiquement OU via VALIDATE_BOT -
+  // jamais this.settings.targetUrl (AGENT_TARGET_URL local, "about:blank" par
+  // defaut en installation packaged) une fois ce champ renseigne. Absent
+  // uniquement si START_BOT n'a jamais fourni de startUrl valide (flux
+  // extension locale) - beginMonitoring retombe alors sur
+  // this.settings.targetUrl, comportement inchange pour ce cas. Jamais un
+  // secret (juste une URL non sensible, deja transmise dans le payload public
+  // START_BOT), jamais derive de l'URL courante du navigateur.
+  recoveryTargetUrl?: string;
+  // Logger DEDIE a ce bot (section "nouveaux logs par bot"): tee vers le
+  // fichier partage agent.log (via le AgentLogFn injecte au constructeur de
+  // AgentBotManager) ET vers un fichier propre a CETTE execution de bot (cf.
+  // createBotLogger, agentLocalLogger.ts). Jamais un secret ici (une simple
+  // fonction, deja soumise a la meme redaction que le logger partage).
+  log: AgentLogFn;
   // Lot 3: vrai seulement une fois VALIDATE_BOT reussi et la boucle
   // effectivement demarree (Lot 4).
   monitoringPrepared: boolean;
