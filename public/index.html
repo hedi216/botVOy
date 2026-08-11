@@ -71,6 +71,7 @@
           <button class="nav-item" data-page-target="maintenance">Maintenance</button>
           <button class="nav-item settings-nav" data-page-target="settings" hidden>Parametres</button>
           <button class="nav-item settings-nav" data-page-target="extensions" hidden>Extensions</button>
+          <button class="nav-item settings-nav" data-page-target="categories" hidden>Categories</button>
           <button class="nav-item agent-nav" data-page-target="agent" hidden>Agent local</button>
 
           <p class="admin-nav" hidden>ADMINISTRATION</p>
@@ -203,12 +204,6 @@
                   Categorie
                   <select id="botFormCategory" required>
                     <option value="" disabled selected>Choisir une categorie</option>
-                    <option value="Tourisme – privée – primo">Tourisme – privée – primo</option>
-                    <option value="Tourisme – privée – visé">Tourisme – privée – visé</option>
-                    <option value="Visite familiale – privée – primo">Visite familiale – privée – primo</option>
-                    <option value="Visite familiale – privée – visé">Visite familiale – privée – visé</option>
-                    <option value="Visite circulation">Visite circulation</option>
-                    <option value="Affaires et professionnel">Affaires et professionnel</option>
                   </select>
                 </label>
                 <label>
@@ -393,6 +388,38 @@
                   </tr>
                 </thead>
                 <tbody id="extensionTableBody"></tbody>
+              </table>
+            </section>
+          </section>
+
+          <section class="page" id="page-categories">
+            <section class="form-panel">
+              <h2>Ajouter une categorie</h2>
+              <p>Categories propres a cette agence, utilisees dans le formulaire de demarrage d'un bot. Independantes de celles des autres agences.</p>
+              <form id="categoryForm" class="create-user-form">
+                <label id="categoryAgencyLabel" class="admin-only" hidden>
+                  Agence
+                  <select id="categoryAgency"></select>
+                </label>
+                <label>
+                  Nom
+                  <input id="categoryName" placeholder="Tourisme" required>
+                </label>
+                <button class="primary" type="submit">Ajouter</button>
+              </form>
+              <p id="categoryMessage" class="form-message"></p>
+            </section>
+
+            <section class="table-panel">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Nom</th>
+                    <th>Creation</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="categoryTableBody"></tbody>
               </table>
             </section>
           </section>

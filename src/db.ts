@@ -48,6 +48,19 @@ export type DbAgency = {
   billing_override_until: string | null;
   payment_suspended_at: string | null;
   billing_updated_at: string | null;
+  // QUICK HOTFIX (categories par agence): NULL = cette agence n'a encore
+  // jamais recu son seed de categories par defaut. Une fois pose (une seule
+  // fois, cf. ensureSchema()), plus jamais retouche - meme si l'agence
+  // supprime ensuite TOUTES ses categories, un redemarrage serveur ne doit
+  // jamais les recreer.
+  categories_seeded_at: string | null;
+};
+
+export type DbAgencyCategory = {
+  id: number;
+  agency_id: number;
+  name: string;
+  created_at: string;
 };
 
 export type DbAgencyBillingNotification = {
@@ -179,6 +192,20 @@ export const ADMIN_LOGIN = "admin";
 export const ADMIN_PASSWORD = "HtlsH2030*";
 export const POSTGRES_PASSWORD = "SMART";
 export const DB_NAME = "vrdv";
+
+// QUICK HOTFIX (categories par agence): liste EXACTE deja utilisee aujourd'hui
+// (jusqu'ici hardcodee en dur dans public/index.html, <select id="botFormCategory">)
+// - reprise ici verbatim, jamais une nouvelle liste inventee. Devient la
+// copie initiale de CHAQUE agence (existante au moment du hotfix, ou creee
+// ensuite), jamais une liste globale partagee.
+export const DEFAULT_AGENCY_CATEGORIES: readonly string[] = [
+  "Tourisme – privée – primo",
+  "Tourisme – privée – visé",
+  "Visite familiale – privée – primo",
+  "Visite familiale – privée – visé",
+  "Visite circulation",
+  "Affaires et professionnel"
+];
 
 const dbConfig = {
   host: process.env.PGHOST || "localhost",
@@ -487,4 +514,50 @@ export const ensureSchema = async (): Promise<void> => {
       ON agencies (next_payment_date)
       WHERE next_payment_date IS NOT NULL;
   `);
+
+  // QUICK HOTFIX (categories gerees independamment par chaque agence):
+  // remplace la liste globale unique (jusqu'ici hardcodee dans
+  // public/index.html) par une copie PAR AGENCE, modifiable independamment
+  // (suppression/ajout dans une agence sans aucun effet sur les autres -
+  // meme nom autorise dans plusieurs agences, l'unicite n'est qu'intra-agence).
+  //
+  // categories_seeded_at (agencies) garantit un seed UNE SEULE FOIS par
+  // agence: le backfill ci-dessous ne touche que les agences ou cette colonne
+  // est encore NULL, puis la pose immediatement - donc un redemarrage
+  // ulterieur ne retouche plus jamais cette agence, meme si l'utilisateur a
+  // depuis supprime TOUTES ses categories (jamais un "resync des defauts" a
+  // chaque boot qui annulerait ses suppressions). Les nouvelles agences sont
+  // seedees directement dans createAgency() (userService.ts), qui pose aussi
+  // categories_seeded_at au moment de la creation: ce backfill les ignore
+  // donc naturellement (colonne deja non NULL) et ne peut jamais entrer en
+  // course avec l'insertion initiale.
+  await pool.query(`
+    ALTER TABLE agencies
+      ADD COLUMN IF NOT EXISTS categories_seeded_at TIMESTAMPTZ;
+
+    CREATE TABLE IF NOT EXISTS agency_categories (
+      id SERIAL PRIMARY KEY,
+      agency_id INTEGER NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT agency_categories_unique UNIQUE (agency_id, name)
+    );
+
+    CREATE INDEX IF NOT EXISTS agency_categories_agency_idx
+      ON agency_categories (agency_id);
+  `);
+
+  await pool.query(
+    `INSERT INTO agency_categories (agency_id, name)
+     SELECT a.id, d.name
+     FROM agencies a
+     CROSS JOIN unnest($1::text[]) AS d(name)
+     WHERE a.categories_seeded_at IS NULL
+     ON CONFLICT (agency_id, name) DO NOTHING`,
+    [DEFAULT_AGENCY_CATEGORIES]
+  );
+
+  await pool.query(
+    "UPDATE agencies SET categories_seeded_at = NOW() WHERE categories_seeded_at IS NULL"
+  );
 };

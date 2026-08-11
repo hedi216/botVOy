@@ -1,4 +1,4 @@
-import { ADMIN_LOGIN, ADMIN_PASSWORD, DbAgency, DbExtensionLink, DbUser, ensureDatabaseExists, ensureSchema, pool } from "./db.js";
+import { ADMIN_LOGIN, ADMIN_PASSWORD, DbAgency, DbAgencyCategory, DbExtensionLink, DbUser, DEFAULT_AGENCY_CATEGORIES, ensureDatabaseExists, ensureSchema, pool } from "./db.js";
 import { loadConfig } from "./config.js";
 import { hashPassword, verifyPassword } from "./password.js";
 import { randomBytes } from "node:crypto";
@@ -59,6 +59,13 @@ export type ExtensionLink = {
   isActive: boolean;
   createdAt: string;
   updatedAt: string | null;
+};
+
+export type AgencyCategory = {
+  id: number;
+  agencyId: number;
+  name: string;
+  createdAt: string;
 };
 
 const defaultMonitoringSettings = (): MonitoringSettings => {
@@ -232,7 +239,135 @@ export const createAgency = async (
     "INSERT INTO agencies (name, max_active_clients, notification_email) VALUES ($1, $2, $3) RETURNING *",
     [name, Math.min(maxActiveClients, 15), notificationEmail || null]
   );
-  return result.rows[0];
+  const agency = result.rows[0];
+
+  // QUICK HOTFIX (categories par agence): toute NOUVELLE agence recoit
+  // immediatement sa PROPRE copie des categories par defaut - independante de
+  // toute autre agence des cet instant (suppression/ajout ulterieur sans
+  // aucun effet croise). categories_seeded_at est pose ICI, dans la meme
+  // operation de creation, pour que le backfill boot-time (ensureSchema(),
+  // db.ts) ignore toujours cette agence (colonne deja non NULL) et ne puisse
+  // jamais entrer en course avec ce seed initial.
+  await pool.query(
+    `INSERT INTO agency_categories (agency_id, name)
+     SELECT $1::int, d.name FROM unnest($2::text[]) AS d(name)
+     ON CONFLICT (agency_id, name) DO NOTHING`,
+    [agency.id, DEFAULT_AGENCY_CATEGORIES]
+  );
+  const seeded = await pool.query<DbAgency>(
+    "UPDATE agencies SET categories_seeded_at = NOW() WHERE id = $1 RETURNING *",
+    [agency.id]
+  );
+
+  return seeded.rows[0];
+};
+
+// QUICK HOTFIX (categories par agence): resolution SERVEUR de l'agence
+// ciblee, jamais confiee au client - reutilise le meme contrat que les
+// extensions/parametres deja en place (getSettingsAgencyId ci-dessous,
+// deplace ici depuis server.ts pour rester testable sans demarrer tout le
+// serveur HTTP). Role 0 (admin global) peut agir sur l'agence de son choix
+// (`value`, fournie par la requete); role 1 (gestionnaire d'agence) est
+// TOUJOURS fixe a sa propre agence de session, jamais une valeur cliente;
+// role 2 n'a jamais le droit d'administrer (categories WRITE) -> null.
+export const getSettingsAgencyId = (user: DbUser, value?: unknown): number | null => {
+  if (![0, 1].includes(user.role)) {
+    return null;
+  }
+
+  if (user.role === 0) {
+    const agencyId = Number(value);
+    return agencyId ? agencyId : null;
+  }
+
+  return user.agency_id ? Number(user.agency_id) : null;
+};
+
+// QUICK HOTFIX (categories par agence): variante LECTURE, utilisee
+// uniquement par la liste des categories (GET) - role 2 a le droit
+// d'UTILISER les categories de sa propre agence (dropdown du formulaire Bot)
+// sans jamais pouvoir les administrer (create/delete restent sur
+// getSettingsAgencyId ci-dessus, role 0/1 seulement). Role 2 est TOUJOURS
+// fixe a sa propre agence de session, jamais une valeur cliente - identique
+// au traitement du role 1 dans getSettingsAgencyId.
+export const getCategoriesReadAgencyId = (user: DbUser, value?: unknown): number | null => {
+  if (user.role === 0) {
+    const agencyId = Number(value);
+    return agencyId ? agencyId : null;
+  }
+
+  return user.agency_id ? Number(user.agency_id) : null;
+};
+
+const agencyCategoryFromDb = (row: DbAgencyCategory): AgencyCategory => ({
+  id: row.id,
+  agencyId: row.agency_id,
+  name: row.name,
+  createdAt: row.created_at
+});
+
+export const listAgencyCategories = async (agencyId: number): Promise<AgencyCategory[]> => {
+  const result = await pool.query<DbAgencyCategory>(
+    "SELECT * FROM agency_categories WHERE agency_id = $1 ORDER BY name",
+    [agencyId]
+  );
+  return result.rows.map(agencyCategoryFromDb);
+};
+
+export const createAgencyCategory = async (agencyId: number, name: unknown): Promise<AgencyCategory> => {
+  const normalized = normalizeOptionalText(name, 160, "Le nom de la categorie");
+  if (!normalized) {
+    throw new Error("Le nom de la categorie est requis.");
+  }
+
+  try {
+    const result = await pool.query<DbAgencyCategory>(
+      "INSERT INTO agency_categories (agency_id, name) VALUES ($1, $2) RETURNING *",
+      [agencyId, normalized]
+    );
+    return agencyCategoryFromDb(result.rows[0]);
+  } catch (error) {
+    if ((error as { code?: string }).code === "23505") {
+      throw new Error("Cette categorie existe deja pour cette agence.");
+    }
+    throw error;
+  }
+};
+
+export const renameAgencyCategory = async (agencyId: number, categoryId: number, name: unknown): Promise<AgencyCategory> => {
+  const normalized = normalizeOptionalText(name, 160, "Le nom de la categorie");
+  if (!normalized) {
+    throw new Error("Le nom de la categorie est requis.");
+  }
+
+  try {
+    const result = await pool.query<DbAgencyCategory>(
+      "UPDATE agency_categories SET name = $3 WHERE agency_id = $1 AND id = $2 RETURNING *",
+      [agencyId, categoryId, normalized]
+    );
+    if (!result.rows[0]) {
+      throw new Error("Categorie introuvable.");
+    }
+    return agencyCategoryFromDb(result.rows[0]);
+  } catch (error) {
+    if ((error as { code?: string }).code === "23505") {
+      throw new Error("Cette categorie existe deja pour cette agence.");
+    }
+    throw error;
+  }
+};
+
+// Ne supprime jamais un bot/historique/log existant (deja stocke comme
+// simple string libre, jamais une foreign key vers cette table) - retire
+// uniquement ce choix des futurs demarrages de bot pour cette agence.
+export const deleteAgencyCategory = async (agencyId: number, categoryId: number): Promise<void> => {
+  const result = await pool.query(
+    "DELETE FROM agency_categories WHERE agency_id = $1 AND id = $2",
+    [agencyId, categoryId]
+  );
+  if (result.rowCount === 0) {
+    throw new Error("Categorie introuvable.");
+  }
 };
 
 export const getAgency = async (agencyId: number): Promise<DbAgency | null> => {

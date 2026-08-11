@@ -12,7 +12,8 @@ const state = {
   agencyMaxClients: null,
   sessions: [],
   prompts: {},
-  extensions: []
+  extensions: [],
+  categories: []
 };
 
 let dashboardPromptSessionId = null;
@@ -98,6 +99,12 @@ const els = {
   extensionActive: $("#extensionActive"),
   extensionMessage: $("#extensionMessage"),
   extensionTableBody: $("#extensionTableBody"),
+  categoryForm: $("#categoryForm"),
+  categoryAgencyLabel: $("#categoryAgencyLabel"),
+  categoryAgency: $("#categoryAgency"),
+  categoryName: $("#categoryName"),
+  categoryMessage: $("#categoryMessage"),
+  categoryTableBody: $("#categoryTableBody"),
   profileInitial: $("#profileInitial"),
   profileName: $("#profileName"),
   profileLogin: $("#profileLogin"),
@@ -126,6 +133,7 @@ const pageMeta = {
   maintenance: ["Maintenance", "Sessions Chrome et serveur web local."],
   settings: ["Parametres", "Orchestration et rythme de surveillance des bots."],
   extensions: ["Extensions", "Liens ouverts au demarrage des bots pour installation manuelle."],
+  categories: ["Categories", "Categories de bots propres a cette agence, independantes des autres."],
   users: ["User Management", "Gestion des comptes utilisateurs et activation."],
   agencies: ["Agences", "Limites clients et activation des agences."],
   profile: ["Profil", "Informations du compte et securite."],
@@ -335,6 +343,9 @@ const showPage = async (page) => {
   if (page === "extensions" && ![0, 1].includes(state.user?.role)) {
     page = "dashboard";
   }
+  if (page === "categories" && ![0, 1].includes(state.user?.role)) {
+    page = "dashboard";
+  }
 
   state.page = page;
   $$(".page").forEach((el) => el.classList.toggle("active", el.id === `page-${page}`));
@@ -356,6 +367,12 @@ const showPage = async (page) => {
   }
   if (page === "extensions") {
     await loadExtensions();
+  }
+  if (page === "categories") {
+    await loadCategories();
+  }
+  if (page === "bot") {
+    await loadBotFormCategoryOptions();
   }
 
   if (window.AgentUi && typeof window.AgentUi.onShowPage === "function") {
@@ -691,6 +708,115 @@ const renderExtensions = () => {
 
     row.append(actions);
     els.extensionTableBody.append(row);
+  }
+};
+
+const currentCategoryAgencyId = () => state.user?.role === 0 ? Number(els.categoryAgency.value) : undefined;
+
+const categoryAgencyQuery = () => {
+  const agencyId = currentCategoryAgencyId();
+  return agencyId ? `?agencyId=${encodeURIComponent(agencyId)}` : "";
+};
+
+// Page d'administration (role 0/1 uniquement, deja filtre par showPage()):
+// gere SES propres categories, jamais melangees a celles d'une autre agence.
+const loadCategories = async () => {
+  if (![0, 1].includes(state.user?.role)) {
+    return;
+  }
+
+  if (state.user.role === 0 && state.agencies.length === 0) {
+    await loadAgencies();
+  }
+
+  els.categoryAgencyLabel.hidden = state.user.role !== 0;
+  els.categoryAgency.replaceChildren();
+  if (state.user.role === 0) {
+    for (const agency of state.agencies) {
+      const option = document.createElement("option");
+      option.value = String(agency.id);
+      option.textContent = agency.name;
+      els.categoryAgency.append(option);
+    }
+  }
+
+  const { categories } = await requestJson(`/api/categories${categoryAgencyQuery()}`);
+  state.categories = categories || [];
+  renderCategories();
+};
+
+const renderCategories = () => {
+  els.categoryTableBody.replaceChildren();
+
+  if (state.categories.length === 0) {
+    const row = document.createElement("tr");
+    addCell(row, "Aucune categorie", "strong-cell");
+    addCell(row, "-");
+    addCell(row, "-");
+    els.categoryTableBody.append(row);
+    return;
+  }
+
+  for (const category of state.categories) {
+    const row = document.createElement("tr");
+    addCell(row, category.name, "strong-cell");
+    addCell(row, formatDate(category.createdAt));
+
+    const actions = document.createElement("td");
+    actions.className = "action-cell";
+
+    const rename = document.createElement("button");
+    rename.className = "outline";
+    rename.dataset.categoryAction = "rename";
+    rename.dataset.categoryId = String(category.id);
+    rename.dataset.name = category.name;
+    rename.textContent = "Modifier";
+    actions.append(rename);
+
+    const remove = document.createElement("button");
+    remove.className = "outline danger-text";
+    remove.dataset.categoryAction = "delete";
+    remove.dataset.categoryId = String(category.id);
+    remove.dataset.name = category.name;
+    remove.textContent = "Supprimer";
+    actions.append(remove);
+
+    row.append(actions);
+    els.categoryTableBody.append(row);
+  }
+};
+
+// Dropdown "Categorie" du formulaire Bot: accessible aux 3 roles (role 2
+// UTILISE les categories de SA propre agence sans jamais les administrer) -
+// toujours l'agence de l'utilisateur connecte, jamais un melange entre
+// agences.
+const loadBotFormCategoryOptions = async () => {
+  const previousValue = els.botFormCategory.value;
+  let categories = [];
+  try {
+    ({ categories } = await requestJson("/api/categories"));
+  } catch {
+    categories = [];
+  }
+
+  els.botFormCategory.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.disabled = true;
+  placeholder.textContent = "Choisir une categorie";
+  els.botFormCategory.append(placeholder);
+
+  for (const category of categories) {
+    const option = document.createElement("option");
+    option.value = category.name;
+    option.textContent = category.name;
+    els.botFormCategory.append(option);
+  }
+
+  if (categories.some((category) => category.name === previousValue)) {
+    els.botFormCategory.value = previousValue;
+  } else {
+    placeholder.selected = true;
   }
 };
 
@@ -1159,6 +1285,79 @@ els.extensionForm.addEventListener("submit", async (event) => {
   }
 });
 
+els.categoryForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  els.categoryMessage.textContent = "";
+  els.categoryMessage.className = "form-message";
+
+  try {
+    await requestJson("/api/categories", {
+      method: "POST",
+      body: JSON.stringify({
+        agencyId: currentCategoryAgencyId(),
+        name: els.categoryName.value.trim()
+      })
+    });
+    els.categoryForm.reset();
+    els.categoryMessage.textContent = "Categorie ajoutee.";
+    els.categoryMessage.classList.add("success");
+    await loadCategories();
+  } catch (error) {
+    els.categoryMessage.textContent = error.message;
+    els.categoryMessage.classList.add("error");
+  }
+});
+
+els.categoryTableBody.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-category-action]");
+  if (!button) {
+    return;
+  }
+
+  const action = button.dataset.categoryAction;
+  const categoryId = button.dataset.categoryId;
+  els.categoryMessage.textContent = "";
+  els.categoryMessage.className = "form-message";
+
+  try {
+    if (action === "delete") {
+      const name = button.dataset.name;
+      const confirmation = window.confirm(`Supprimer la categorie "${name}" ? Les bots deja demarres avec cette categorie ne sont jamais affectes.`);
+      if (!confirmation) {
+        return;
+      }
+
+      await requestJson(`/api/categories/${categoryId}${categoryAgencyQuery()}`, {
+        method: "DELETE"
+      });
+      els.categoryMessage.textContent = "Categorie supprimee.";
+      els.categoryMessage.classList.add("success");
+    }
+
+    if (action === "rename") {
+      const name = window.prompt("Nom de la categorie", button.dataset.name || "");
+      if (name === null) {
+        return;
+      }
+
+      await requestJson(`/api/categories/${categoryId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          agencyId: currentCategoryAgencyId(),
+          name
+        })
+      });
+      els.categoryMessage.textContent = "Categorie modifiee.";
+      els.categoryMessage.classList.add("success");
+    }
+
+    await loadCategories();
+  } catch (error) {
+    els.categoryMessage.textContent = error.message;
+    els.categoryMessage.classList.add("error");
+  }
+});
+
 els.extensionTableBody.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-extension-action]");
   if (!button) {
@@ -1229,6 +1428,10 @@ els.extensionTableBody.addEventListener("click", async (event) => {
 
 els.extensionAgency.addEventListener("change", () => {
   void loadExtensions();
+});
+
+els.categoryAgency.addEventListener("change", () => {
+  void loadCategories();
 });
 
 els.settingsAgency.addEventListener("change", () => {

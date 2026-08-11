@@ -26,16 +26,22 @@ import {
   authenticateUser,
   changeOwnPassword,
   createAgency,
+  createAgencyCategory,
   createUser,
   createExtensionLink,
+  deleteAgencyCategory,
   deleteExtensionLink,
   getAgency,
   getAgencyMonitoringSettings,
   getAgencySettings,
+  getCategoriesReadAgencyId,
+  getSettingsAgencyId,
   initUserModule,
   listAgencies,
+  listAgencyCategories,
   listExtensionLinks,
   listUsersForRequester,
+  renameAgencyCategory,
   resetUserPassword,
   updateAgency,
   updateAgencyMonitoringSettings,
@@ -427,19 +433,6 @@ app.patch("/api/monitoring-settings", requireAuth, async (req: AuthenticatedRequ
   });
 });
 
-const getSettingsAgencyId = (user: DbUser, value?: unknown): number | null => {
-  if (![0, 1].includes(user.role)) {
-    return null;
-  }
-
-  if (user.role === 0) {
-    const agencyId = Number(value);
-    return agencyId ? agencyId : null;
-  }
-
-  return user.agency_id ? Number(user.agency_id) : null;
-};
-
 // Centralise la resolution de l'agence pour les routes qui agissent "pour son
 // agence" (revocation, actions sur un agent...): lit body/query de facon
 // defensive (req.body peut etre undefined si la requete n'a pas de payload
@@ -525,6 +518,85 @@ app.delete("/api/extensions/:id", requireAuth, async (req: AuthenticatedRequest,
 
   await deleteExtensionLink(agencyId, Number(req.params.id));
   res.json({ ok: true });
+});
+
+// QUICK HOTFIX (categories gerees independamment par chaque agence): GET est
+// accessible aux 3 roles (role 2 UTILISE les categories - dropdown du
+// formulaire Bot - sans jamais les administrer) via getCategoriesReadAgencyId;
+// POST/PATCH/DELETE restent reserves a role 0/1 via getSettingsAgencyId,
+// exactement comme les extensions ci-dessus. agencyId est TOUJOURS resolu
+// cote serveur depuis la session (role 1/2 ne peut jamais agir sur une autre
+// agence, meme en envoyant un agencyId different dans le corps/la requete -
+// seul role 0 peut cibler une agence explicite).
+app.get("/api/categories", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getCategoriesReadAgencyId(req.user!, req.query.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Agence requise." });
+    return;
+  }
+
+  res.json({ categories: await listAgencyCategories(agencyId) });
+});
+
+app.post("/api/categories", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const body = req.body as { agencyId?: number; name?: string };
+  const agencyId = getSettingsAgencyId(req.user!, body.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
+    return;
+  }
+
+  try {
+    res.json({ category: await createAgencyCategory(agencyId, body.name) });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "Erreur serveur." });
+  }
+});
+
+app.patch("/api/categories/:id", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const body = req.body as { agencyId?: number; name?: string };
+  const agencyId = getSettingsAgencyId(req.user!, body.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
+    return;
+  }
+
+  try {
+    res.json({ category: await renameAgencyCategory(agencyId, Number(req.params.id), body.name) });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "Erreur serveur." });
+  }
+});
+
+app.delete("/api/categories/:id", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const agencyId = getSettingsAgencyId(req.user!, req.query.agencyId);
+
+  if (!agencyId) {
+    res.status(403).json({ error: "Admin ou niveau 1 agence requis." });
+    return;
+  }
+
+  if (!(await requireAgencyBillingAccess(req, res, agencyId))) {
+    return;
+  }
+
+  try {
+    await deleteAgencyCategory(agencyId, Number(req.params.id));
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "Erreur serveur." });
+  }
 });
 
 app.patch("/api/recording-extension/settings", requireAuth, async (req: AuthenticatedRequest, res) => {
@@ -1432,6 +1504,26 @@ io.on("connection", (socket) => {
       emitOwnedLog(socket, owner, makeEvent("error", PAYMENT_SUSPENDED_MESSAGE));
       socket.emit("bot-status", { status: "error", code: PAYMENT_SUSPENDED_CODE, billing: billingCheck.state });
       return;
+    }
+
+    // QUICK HOTFIX (categories par agence): le dropdown frontend est
+    // desormais dynamique (chargement depuis /api/categories), mais rien
+    // n'empeche un client de forger un payload socket "start-bot" arbitraire
+    // (DevTools, replay...). Un `category` non vide DOIT donc exister dans
+    // agency_categories POUR L'AGENCE DE LA SESSION (jamais une valeur
+    // cliente pour l'agence - identique au contrat des routes /api/categories).
+    // Une categorie supprimee depuis, ou appartenant a une autre agence, est
+    // refusee ici. Categorie vide: comportement historique inchange (aucune
+    // validation, jamais rendue obligatoire par ce hotfix). Concerne
+    // uniquement ce NOUVEAU demarrage - aucun bot/historique existant n'est
+    // jamais touche.
+    if (category && user.agency_id) {
+      const allowedCategories = await listAgencyCategories(user.agency_id);
+      if (!allowedCategories.some((allowed) => allowed.name === category)) {
+        emitOwnedLog(socket, owner, makeEvent("error", "Categorie invalide, supprimee, ou appartenant a une autre agence."));
+        socket.emit("bot-status", { status: "error", code: "CATEGORY_INVALID" });
+        return;
+      }
     }
 
     // Mode agent: plus de refus systematique (Phase 2) mais un vrai dispatch.
