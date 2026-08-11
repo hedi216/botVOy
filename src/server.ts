@@ -67,6 +67,7 @@ import {
   BOT_STATUS_VALUES,
   PublicAgentCommand,
   clearTerminalCommandsForAgency,
+  countActiveAgentBotsForAgency,
   deleteCommandForAgency,
   dispatchAgentCommand,
   failNonTerminalOnRevoke,
@@ -76,6 +77,7 @@ import {
   listAgentBotsForAgency,
   listAgentCommandsForAgency,
   registerAgentBot,
+  removeAgentBot,
   toPublicAgentCommand,
   toPublicAgentCommandDetail
 } from "./agentCommandService.js";
@@ -1056,9 +1058,20 @@ const sessionSnapshotsForUser = (user?: DbUser | null) => [...sessions.entries()
 const countAgencySessions = (agencyId: number | null): number =>
   [...sessionOwners.values()].filter((owner) => owner.agencyId === agencyId).length;
 
+// HOTFIX CIBLE (compteur bots actifs par agence): en mode Agent (mode de
+// fonctionnement ACTUEL), la seule source de verite pour "bots actifs de
+// cette agence" est le registre agentBots (countActiveAgentBotsForAgency) -
+// jamais plus countAgencySessions()/sessionOwners (registre legacy_vm
+// exclusivement, toujours a 0 pour un deploiement Agent, cause exacte du
+// bug "0/15" alors que des bots tournent reellement). Le chemin legacy_vm
+// (BOT_EXECUTION_MODE != "agent") garde son calcul historique inchange,
+// volontairement isole derriere cette meme branche existante - jamais deux
+// definitions melangees pour la meme agence.
 const emitMaintenanceToSocket = async (socket: Socket, user?: DbUser | null): Promise<void> => {
   const agency = user?.agency_id ? await getAgency(user.agency_id).catch(() => null) : null;
-  const agencyActiveCount = user?.agency_id ? countAgencySessions(user.agency_id) : sessions.size;
+  const agencyActiveCount = user?.agency_id
+    ? (featureFlags.botExecutionMode === "agent" ? countActiveAgentBotsForAgency(user.agency_id) : countAgencySessions(user.agency_id))
+    : sessions.size;
   const agencyMaxClients = agency?.max_active_clients ?? maxClients;
 
   socket.emit("maintenance", {
@@ -1123,6 +1136,16 @@ const emitAgentCommandStatusToAuthorizedSockets = (agencyId: number, publicComma
       socket.emit("agent-command-status", publicCommand);
     }
   }
+
+  // HOTFIX CIBLE (compteur bots actifs par agence, section 7 - temps reel):
+  // point de passage UNIQUE de tout changement de statut de commande Agent
+  // (START_BOT/STOP_BOT/BOT_STATUS remonte par l'agent, via le meme
+  // onCommandChange deja cable dans registerAgentNamespace ci-dessous et
+  // dans le handler start-bot) - n'importe lequel peut faire varier
+  // AgentBotRecord.active, donc on rediffuse systematiquement le compteur
+  // existant plutot que d'essayer de determiner au cas par cas lequel
+  // compte reellement (jamais un calcul divergent, cf. emitMaintenanceToSocket).
+  emitMaintenance();
 };
 
 // Relie les statuts de bot remontes par un agent au systeme de logs existant
@@ -1542,7 +1565,18 @@ io.on("connection", (socket) => {
       // deconnecte entre-temps, contrainte SQL, etc.): une erreur ici ne doit
       // jamais devenir une rejection non geree susceptible d'arreter tout le
       // process serveur, seulement un echec de ce demarrage precis.
+      // botId declare ICI (avant le try): le bloc catch doit pouvoir liberer
+      // la reservation (removeAgentBot) meme si l'erreur survient apres son
+      // enregistrement, sans jamais laisser une place fantome bloquee.
+      let botId: string | undefined;
       try {
+        const agency = await getAgency(agencyId);
+        if (!agency) {
+          emitOwnedLog(socket, owner, makeEvent("error", "Agence introuvable."));
+          socket.emit("bot-status", { status: "error", code: "AGENT_NOT_CONNECTED" });
+          return;
+        }
+
         const requestedAgentId = payload?.agentId ? Number(payload.agentId) : undefined;
         const selection = await selectAgentForCommand(agencyId, requestedAgentId);
 
@@ -1556,7 +1590,23 @@ io.on("connection", (socket) => {
           return;
         }
 
-        const botId = generateBotId();
+        // HOTFIX CIBLE (limite agence, section 8/9 du cahier des charges):
+        // controle FINAL du quota - AUCUN await entre cette lecture et
+        // registerAgentBot() juste en dessous. Deux "start-bot" presque
+        // simultanes a 14/15 s'executent chacun jusqu'ici via leurs propres
+        // await (selectAgentForCommand ci-dessus) de facon entrelacee, mais
+        // ce bloc lui-meme est synchrone: quel que soit l'ordre d'arrivee,
+        // le second a atteindre CE point verra forcement le compte deja
+        // incremente par le premier (meme Map en memoire, jamais une lecture
+        // perimee) - jamais deux acceptations pour la meme 15e place.
+        const activeNow = countActiveAgentBotsForAgency(agencyId);
+        if (activeNow >= agency.max_active_clients) {
+          emitOwnedLog(socket, owner, makeEvent("error", `Limite agence atteinte : ${agency.max_active_clients}/${agency.max_active_clients} bots actifs.`));
+          socket.emit("bot-status", { status: "error", code: "AGENCY_BOT_LIMIT_REACHED" });
+          return;
+        }
+
+        botId = generateBotId();
         registerAgentBot({
           botId,
           agentId: selection.agentId,
@@ -1570,6 +1620,9 @@ io.on("connection", (socket) => {
           active: true,
           updatedAt: new Date().toISOString()
         });
+        // La reservation ci-dessus est deja visible de tout START_BOT
+        // concurrent suivant (countActiveAgentBotsForAgency la relit a
+        // chaud) - tout ce qui suit peut de nouveau attendre normalement.
 
         const clientRequestId = typeof payload?.clientRequestId === "string" && payload.clientRequestId.trim()
           ? payload.clientRequestId.trim().slice(0, 100)
@@ -1620,12 +1673,33 @@ io.on("connection", (socket) => {
           }
         );
 
-        emitOwnedLog(socket, owner, makeEvent(
-          "info",
-          alreadyExisted
-            ? `Commande de demarrage deja enregistree pour ce bot (id ${command.command_id.slice(0, 8)}).`
-            : `Commande de demarrage envoyee a l'agent (id ${command.command_id.slice(0, 8)}).`
-        ));
+        // HOTFIX CIBLE (section 9 - jamais de place fantome): deux cas ou
+        // AUCUN bot reel ne pourra jamais exister pour ce botId precis, donc
+        // la reservation ci-dessus doit etre liberee immediatement plutot
+        // que de bloquer une place indefiniment:
+        //  - alreadyExisted: la commande reutilisee (meme clientRequestId,
+        //    double-clic/retry reseau) porte l'ANCIEN bot_id d'une requete
+        //    precedente, jamais celui genere ici - ce nouvel enregistrement
+        //    n'est donc lie a aucune commande reelle ;
+        //  - command.status === "failed" (ex. AGENT_DISCONNECTED): l'agent
+        //    n'a jamais recu la commande, aucun BOT_STATUS ne viendra donc
+        //    jamais liberer ce botId via updateAgentBotStatus.
+        if (alreadyExisted) {
+          removeAgentBot(botId);
+          emitOwnedLog(socket, owner, makeEvent("info", `Commande de demarrage deja enregistree pour ce bot (id ${command.command_id.slice(0, 8)}).`));
+          emitMaintenance();
+          return;
+        }
+
+        if (command.status === "failed") {
+          removeAgentBot(botId);
+          emitOwnedLog(socket, owner, makeEvent("error", `Envoi de la commande a l'agent impossible: ${command.error_message ?? command.error_code ?? "agent deconnecte"}.`));
+          socket.emit("bot-status", { status: "error", code: "DISPATCH_FAILED" });
+          emitMaintenance();
+          return;
+        }
+
+        emitOwnedLog(socket, owner, makeEvent("info", `Commande de demarrage envoyee a l'agent (id ${command.command_id.slice(0, 8)}).`));
         // Pas d'emission "agent-command-status" explicite ici: le callback
         // onChange de dispatchAgentCommand a deja diffuse chaque transition
         // (PENDING puis SENT) a tous les sockets autorises de l'agence, y
@@ -1634,6 +1708,14 @@ io.on("connection", (socket) => {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         logger.error(`Echec du dispatch START_BOT: ${message}`);
+        // HOTFIX CIBLE (section 9): si la reservation a deja ete faite
+        // (botId defini) avant que cette erreur ne survienne, elle doit
+        // etre liberee - jamais une place fantome conservee suite a une
+        // erreur inattendue (DB, reseau...) survenue apres registerAgentBot().
+        if (botId) {
+          removeAgentBot(botId);
+          emitMaintenance();
+        }
         emitOwnedLog(socket, owner, makeEvent("error", "Erreur interne lors de l'envoi de la commande a l'agent."));
         socket.emit("bot-status", { status: "error", code: "DISPATCH_ERROR" });
       }

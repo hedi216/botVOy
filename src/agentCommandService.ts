@@ -146,6 +146,19 @@ export const getAgentBot = (botId: string): AgentBotRecord | undefined => agentB
 export const listAgentBotsForAgency = (agencyId: number): AgentBotRecord[] =>
   [...agentBots.values()].filter((bot) => bot.agencyId === agencyId);
 
+// HOTFIX CIBLE (compteur/quota bots actifs par agence): source UNIQUE pour
+// le compteur diffuse au frontend (evenement "maintenance") ET la
+// verification de quota avant START_BOT - jamais un second calcul
+// divergent. Reutilise directement la notion runtime EXISTANTE
+// (AgentBotRecord.active, deja maintenue par registerAgentBot/
+// updateAgentBotStatus ci-dessus): jamais basee sur botStatus directement
+// ni sur le statut de LA COMMANDE (command.status ne reflete que le cycle
+// de vie de la commande de dispatch, jamais si le bot tourne encore -
+// exemple reel: command.status=FAILED alors que botStatus=WAITING_FOR_USER,
+// le bot est toujours vivant).
+export const countActiveAgentBotsForAgency = (agencyId: number): number =>
+  listAgentBotsForAgency(agencyId).filter((bot) => bot.active).length;
+
 export const updateAgentBotStatus = (botId: string, status: BotStatusValue): AgentBotRecord | undefined => {
   const bot = agentBots.get(botId);
   if (!bot) {

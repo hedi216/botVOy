@@ -51,6 +51,7 @@ const els = {
   botFormLogin: $("#botFormLogin"),
   botFormPassword: $("#botFormPassword"),
   botActiveCount: $("#botActiveCount"),
+  botQuotaMessage: $("#botQuotaMessage"),
   botSearch: $("#botSearch"),
   botTableBody: $("#botTableBody"),
   clearLogs: $("#clearLogs"),
@@ -1563,6 +1564,15 @@ const updateStartBotAvailability = () => {
   const agentOk = !(window.AgentUi && typeof window.AgentUi.canStartBot === "function") || window.AgentUi.canStartBot();
   els.startBot.disabled = !quotaOk;
   els.startBot.classList.toggle("agent-blocked", quotaOk && !agentOk);
+  // Le serveur reste seul juge (agencyActiveCount/agencyMaxClients viennent
+  // deja de l'evenement "maintenance", jamais recalcules depuis le tableau
+  // HTML): ce message est purement informatif, le vrai refus a
+  // START_BOT reste toujours applique cote serveur meme si ce texte
+  // n'apparaissait pas.
+  els.botQuotaMessage.hidden = quotaOk;
+  if (!quotaOk) {
+    els.botQuotaMessage.textContent = `Limite de bots actifs atteinte (${state.agencyActiveCount}/${state.agencyMaxClients}).`;
+  }
 };
 
 els.botForm.addEventListener("submit", (event) => {
