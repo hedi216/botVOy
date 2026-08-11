@@ -51,6 +51,7 @@ import { AgentLogLevel } from "../src/agent/agentLocalLogger.js";
 import { AgentMonitoringSettings, DEFAULT_AGENT_MONITORING_SETTINGS } from "../src/agent/agentMonitoringSettings.js";
 import { AgentRuntimeSettings } from "../src/agent/types.js";
 import { detectHumanValidation } from "../src/shared/humanValidation.js";
+import { appointmentBookingPathPattern } from "../src/shared/loginFlow.js";
 import { monitorAppointments } from "../src/shared/monitor.js";
 import { releaseScanTurn, waitForScanTurn } from "../src/shared/orchestrator.js";
 import { AppConfig } from "../src/shared/types.js";
@@ -390,6 +391,10 @@ const ARBITRARY_UNRELATED_PAGE_HTML = `<!DOCTYPE html><html><body>
 <p>Ceci est une page web tout a fait normale, sans aucun rapport avec TLScontact.</p>
 </body></html>`;
 
+// BUG CIBLE 0.2.4 (cooldown interruptible, section 2, Tests A/D): routes
+// additionnelles reutilisant des balisages DEJA valides ailleurs dans ce
+// fichier (LOGGED_OUT_LANDING_HTML, cloudflareBlockedHtml) - jamais une
+// deuxieme fixture divergente pour ces memes marqueurs.
 const startArbitraryUrlFixture = (): Promise<FixtureSite> => new Promise((resolve, reject) => {
   const requestLog: string[] = [];
 
@@ -400,6 +405,8 @@ const startArbitraryUrlFixture = (): Promise<FixtureSite> => new Promise((resolv
 
     if (url.startsWith("/workflow/appointment-booking/")) { res.end(APPOINTMENT_READY_HTML); return; }
     if (url.startsWith("/unknown")) { res.end(ARBITRARY_UNRELATED_PAGE_HTML); return; }
+    if (url === "/fr-fr" || url === "/fr-fr/") { res.end(LOGGED_OUT_LANDING_HTML); return; }
+    if (url.startsWith("/cloudflare-challenge")) { res.end(cloudflareBlockedHtml()); return; }
     res.statusCode = 404;
     res.end("Not found (fixture).");
   });
@@ -635,6 +642,21 @@ const runScenarioC = async (browser: Browser): Promise<void> => {
       capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")),
       "C) Le recovery complet aboutit a la page de rendez-vous (travel-groups -> application-summary -> service-level -> appointment-booking)"
     );
+    // BUG CIBLE 0.2.4 (Test I): travel-groups -> service-level -> appointment
+    // doit tenir dans LA MEME tentative externe (progression interne),
+    // jamais un retry externe intermediaire ni un long wait.
+    assert(
+      capture.entries.some((e) => /Recovery progression: travel-groups -> (application-summary|service-level)\.?/.test(e.message)),
+      "C) La transition travel-groups -> l'etape suivante est journalisee comme une progression interne (jamais un nouvel essai externe)"
+    );
+    assert(
+      !capture.entries.some((e) => /Reprise workflow 2\/4/.test(e.message)),
+      "C) Une seule tentative externe a suffi (I): jamais de 2e tentative numerotee pour cette chaine"
+    );
+    assert(
+      !capture.entries.some((e) => /tentatives sans page reconnue/.test(e.message)),
+      "C) Aucun long wait declenche: la chaine complete progresse sans jamais epuiser 3 tentatives externes"
+    );
     assertNoSecretsInLogs(capture.entries, "C) Aucun secret dans les logs");
   } finally {
     await context.close();
@@ -771,6 +793,15 @@ const runScenarioE = async (browser: Browser): Promise<void> => {
     assert(
       !capture.entries.some((e) => /Intervention humaine potentiellement requise/.test(e.message)),
       "E) Pas de 4e minute de grace supplementaire (alertAndPause) apres l'echec deja terminal du recovery"
+    );
+    // BUG CIBLE 0.2.4 (Test K): le long wait de WORKFLOW_RECOVERY_LONG_WAIT_MS
+    // (raccourci UNIQUEMENT dans ce test) reste bien declenche apres 3 VRAIS
+    // echecs consecutifs (etat "unknown" qui reste "unknown" a chaque
+    // tentative) - jamais supprime par la correction "progression interne",
+    // qui ne concerne QUE les etats qui progressent reellement.
+    assert(
+      capture.entries.some((e) => /tentatives sans page reconnue\. Attente de/.test(e.message)),
+      "K) Le long wait est toujours declenche apres 3 vrais echecs consecutifs (jamais supprime par la correction 'progression interne')"
     );
     assertNoSecretsInLogs(capture.entries, "E) Aucun secret dans les logs");
   } finally {
@@ -1652,6 +1683,20 @@ const runScenarioO = async (): Promise<void> => {
 
     await waitUntil(() => capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")), 30_000);
     assert(true, "O) Apres le retour vers le vrai startUrl, le parcours complet (home->login->service-level->appointment-booking) reprend et aboutit, meme bot/Chrome/profil/monitoring - jamais un nouveau START_BOT");
+
+    // BUG CIBLE 0.2.4 (Test G): la chaine complete logged-out-landing ->
+    // target -> home -> auth -> service-level -> appointment-booking doit
+    // tenir dans UNE SEULE tentative externe (progression interne), sans
+    // jamais declencher le long wait ni une intervention humaine.
+    assert(
+      !capture.entries.some((e) => /Reprise workflow 2\/4/.test(e.message)),
+      "G) Une seule tentative externe a suffi pour toute la chaine (logged-out-landing->target->home->auth->service-level->appointment)"
+    );
+    assert(
+      !capture.entries.some((e) => /tentatives sans page reconnue/.test(e.message)),
+      "G) Aucun long wait de 5 minutes declenche (aucune etape n'a ete traitee comme un echec)"
+    );
+    assert(!statuses.some((s) => s.status === "WAITING_FOR_USER"), "G) Aucune intervention humaine (WAITING_FOR_USER) necessaire sur ce parcours");
     assertNoSecretsInLogs(capture.entries, "O) Aucun secret dans les logs");
   } finally {
     await manager.stopBot({ commandId: "cmd-o-stop", botId }).catch(() => undefined);
@@ -1850,6 +1895,788 @@ const runScenarioR = async (): Promise<void> => {
   }
 };
 
+// ===================== CORRECTIF FINAL CIBLE (recovery plus reactif et multi-etapes) =====================
+// Scenarios S-Z/AA: cooldown entre cycles interruptible (Tests A-F) et
+// recovery multi-etapes (Tests G-N, partiellement couverts en etendant les
+// Scenarios C/E/O ci-dessus plutot que de dupliquer des fixtures quasi
+// identiques - cf. rapport final pour la correspondance complete).
+
+// ----- Scenario S (Test A): cooldown interrompu par une sortie vers /fr-fr -----
+
+const runScenarioS = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario S (CORRECTIF FINAL 0.2.4, Test A): cooldown interrompu par une sortie de appointment-booking vers /fr-fr ===");
+  const fixture = await startArbitraryUrlFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture();
+    const recoverWorkflowCalls: Array<string | undefined> = [];
+
+    const config: AppConfig = {
+      targetUrl: `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`,
+      connectToExistingChrome: false,
+      chromeDebugUrl: "",
+      refreshIntervalMs: 1_000,
+      headless: true,
+      slowMoMs: 0,
+      debugKeepBrowserOpen: false,
+      // BUG DE TEST CORRIGE: maxRefreshAttempts=1 empechait la boucle de
+      // jamais revenir en tete apres l'interruption (le seul cycle autorise
+      // etait deja consomme) - 0 = illimite, borne ici par le Promise.race
+      // ci-dessous, jamais par ce compteur.
+      maxRefreshAttempts: 0,
+      scanMonthCount: 1,
+      maxParallelScansPerDomain: 1,
+      monthClickMinDelayMs: 100,
+      monthClickMaxDelayMs: 200,
+      // Cooldown simule LONG (30s) - la reactivite attendue vient
+      // exclusivement de l'interruption, jamais d'une reduction du cooldown
+      // lui-meme (cadence de scan inchangee, cf. contrainte explicite).
+      botCycleCooldownMinMs: 30_000,
+      botCycleCooldownMaxMs: 30_000,
+      refreshEveryCycles: 0,
+      rateLimitCooldownMinutes: 1
+    };
+
+    const startedAt = Date.now();
+    const monitorPromise = monitorAppointments(page, config, {
+      log: capture.log,
+      waitForUser: async () => undefined,
+      recoverWorkflow: async (reason) => { recoverWorkflowCalls.push(reason); return null; }
+    });
+
+    // Point de synchronisation deterministe: attend que le cooldown ait
+    // reellement demarre (jamais un delai arbitraire devine).
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Attente avant nouveau cycle")), 10_000);
+    await sleep(1_000);
+    // L'UTILISATEUR force volontairement Chrome vers l'accueil TLS
+    // deconnecte PENDANT la pause - jamais un clic/une action du code sous test.
+    await page.goto(`${fixture.baseUrl}/fr-fr`, { waitUntil: "domcontentloaded" });
+
+    await Promise.race([
+      monitorPromise,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("timeout monitorPromise (Scenario S)")), 20_000))
+    ]);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert(elapsedMs < 15_000, `A/S) Le cooldown de 30s configure est interrompu bien avant son terme (recu: ${elapsedMs}ms, jamais proche de 30000ms)`);
+    assert(
+      capture.entries.some((e) => e.message.includes("Attente entre cycles interrompue: la page a quitte appointment-booking.")),
+      "A/S) Le message d'interruption exact est journalise UNE fois (jamais de spam pendant le polling)"
+    );
+    assert(recoverWorkflowCalls.length >= 1, "A/S) recoverWorkflow() est bien appele apres l'interruption (retour en tete de boucle, jamais declenche par le watcher lui-meme)");
+    assertNoSecretsInLogs(capture.entries, "A/S) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ----- Scenario T (Test B): cooldown interrompu par une URL arbitraire (fixture /unknown) -----
+
+const runScenarioT = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario T (CORRECTIF FINAL 0.2.4, Test B): cooldown interrompu par une URL arbitraire (/unknown) ===");
+  const fixture = await startArbitraryUrlFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture();
+    const recoverWorkflowCalls: Array<string | undefined> = [];
+
+    const config: AppConfig = {
+      targetUrl: `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`,
+      connectToExistingChrome: false,
+      chromeDebugUrl: "",
+      refreshIntervalMs: 1_000,
+      headless: true,
+      slowMoMs: 0,
+      debugKeepBrowserOpen: false,
+      // BUG DE TEST CORRIGE: idem Scenario S - 0 = illimite, borne par le
+      // Promise.race ci-dessous, jamais par ce compteur.
+      maxRefreshAttempts: 0,
+      scanMonthCount: 1,
+      maxParallelScansPerDomain: 1,
+      monthClickMinDelayMs: 100,
+      monthClickMaxDelayMs: 200,
+      botCycleCooldownMinMs: 30_000,
+      botCycleCooldownMaxMs: 30_000,
+      refreshEveryCycles: 0,
+      rateLimitCooldownMinutes: 1
+    };
+
+    const startedAt = Date.now();
+    const monitorPromise = monitorAppointments(page, config, {
+      log: capture.log,
+      waitForUser: async () => undefined,
+      recoverWorkflow: async (reason) => { recoverWorkflowCalls.push(reason); return null; }
+    });
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Attente avant nouveau cycle")), 10_000);
+    await sleep(1_000);
+    await page.goto(`${fixture.baseUrl}/unknown`, { waitUntil: "domcontentloaded" });
+
+    await Promise.race([
+      monitorPromise,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("timeout monitorPromise (Scenario T)")), 20_000))
+    ]);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert(elapsedMs < 15_000, `B/T) Le cooldown est interrompu bien avant son terme pour une URL arbitraire normale (recu: ${elapsedMs}ms)`);
+    assert(
+      capture.entries.some((e) => e.message.includes("Attente entre cycles interrompue: la page a quitte appointment-booking.")),
+      "B/T) Le message d'interruption exact est journalise"
+    );
+    assert(recoverWorkflowCalls.length >= 1, "B/T) recoverWorkflow() est appele (unknown -> target -> recovery), jamais un simple redemarrage de cooldown");
+    assertNoSecretsInLogs(capture.entries, "B/T) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ----- Scenario U (Tests C+F): cooldown NORMAL (page reste sur appointment-booking) -----
+// Regroupe deliberement C (attente complete respectee, aucun recovery) et F
+// (aucune navigation/requete supplementaire du watcher lui-meme): meme mise
+// en place exacte, deux angles d'assertion sur le MEME scenario.
+
+const runScenarioU = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario U (CORRECTIF FINAL 0.2.4, Tests C+F): cooldown normal - page reste sur appointment-booking, watcher sans effet de bord ===");
+  const fixture = await startArbitraryUrlFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture();
+    let recoverWorkflowCalls = 0;
+    const requestCountBeforeCooldown = fixture.requestLog.length;
+
+    const config: AppConfig = {
+      targetUrl: `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`,
+      connectToExistingChrome: false,
+      chromeDebugUrl: "",
+      refreshIntervalMs: 1_000,
+      headless: true,
+      slowMoMs: 0,
+      debugKeepBrowserOpen: false,
+      maxRefreshAttempts: 1,
+      scanMonthCount: 1,
+      maxParallelScansPerDomain: 1,
+      monthClickMinDelayMs: 100,
+      monthClickMaxDelayMs: 200,
+      // Cooldown COURT ici uniquement pour garder le test rapide (jamais une
+      // reduction du cooldown de PRODUCTION, qui reste totalement inchange) -
+      // la page ne quitte jamais appointment-booking dans ce scenario.
+      botCycleCooldownMinMs: 5_000,
+      botCycleCooldownMaxMs: 5_000,
+      refreshEveryCycles: 0,
+      rateLimitCooldownMinutes: 1
+    };
+
+    const startedAt = Date.now();
+    const monitorPromise = monitorAppointments(page, config, {
+      log: capture.log,
+      waitForUser: async () => undefined,
+      recoverWorkflow: async () => { recoverWorkflowCalls += 1; return null; }
+    });
+
+    await Promise.race([
+      monitorPromise,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("timeout monitorPromise (Scenario U)")), 15_000))
+    ]);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert(elapsedMs >= 4_500, `C/U) Le cooldown complet (5000ms) est respecte quand la page reste sur appointment-booking (recu: ${elapsedMs}ms)`);
+    assert(recoverWorkflowCalls === 0, "C/U) Aucun recovery declenche: la page n'a jamais quitte appointment-booking");
+    assert(
+      !capture.entries.some((e) => e.message.includes("Attente entre cycles interrompue")),
+      "C/U) Aucune interruption journalisee (le cooldown s'est deroule normalement jusqu'au bout)"
+    );
+    const requestCountAfterCooldown = fixture.requestLog.length;
+    assert(
+      requestCountAfterCooldown === requestCountBeforeCooldown,
+      `F/U) Le watcher de cooldown n'emet AUCUNE requete HTTP supplementaire (inspection locale de page.url() uniquement) (avant: ${requestCountBeforeCooldown}, apres: ${requestCountAfterCooldown})`
+    );
+    assertNoSecretsInLogs(capture.entries, "C/U) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ----- Scenario V (Test D): cooldown interrompu par un blocage Cloudflare/CAPTCHA -----
+
+const runScenarioV = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario V (CORRECTIF FINAL 0.2.4, Test D): cooldown interrompu par un blocage Cloudflare/CAPTCHA -> chemin de validation humaine existant ===");
+  const fixture = await startArbitraryUrlFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const abortController = new AbortController();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture();
+
+    const config: AppConfig = {
+      targetUrl: `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`,
+      connectToExistingChrome: false,
+      chromeDebugUrl: "",
+      refreshIntervalMs: 1_000,
+      headless: true,
+      slowMoMs: 0,
+      debugKeepBrowserOpen: false,
+      // BUG DE TEST CORRIGE: idem Scenario S/T - 0 = illimite, borne par
+      // l'abort explicite + Promise.race ci-dessous, jamais par ce compteur.
+      maxRefreshAttempts: 0,
+      scanMonthCount: 1,
+      maxParallelScansPerDomain: 1,
+      monthClickMinDelayMs: 100,
+      monthClickMaxDelayMs: 200,
+      botCycleCooldownMinMs: 20_000,
+      botCycleCooldownMaxMs: 20_000,
+      refreshEveryCycles: 0,
+      rateLimitCooldownMinutes: 1
+    };
+
+    const monitorPromise = monitorAppointments(page, config, {
+      log: capture.log,
+      waitForUser: async () => undefined,
+      recoverWorkflow: async () => null,
+      signal: abortController.signal
+    });
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Attente avant nouveau cycle")), 10_000);
+    await sleep(1_000);
+    await page.goto(`${fixture.baseUrl}/cloudflare-challenge`, { waitUntil: "domcontentloaded" });
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Attente entre cycles interrompue")), 10_000);
+    assert(
+      capture.entries.some((e) => e.message.includes("Attente entre cycles interrompue: la page a quitte appointment-booking.")),
+      "D/V) La pause entre cycles est bien interrompue par le blocage Cloudflare/CAPTCHA"
+    );
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Intervention humaine potentiellement requise")), 15_000);
+    assert(
+      capture.entries.some((e) => e.message.includes("Intervention humaine potentiellement requise")),
+      "D/V) Apres l'interruption, la boucle principale reprend et le chemin de validation humaine EXISTANT (detectHumanValidation/pauseForHuman, inchange) est bien declenche"
+    );
+    assert(
+      !capture.entries.some((e) => /contourn/i.test(e.message)),
+      "D/V) Aucun contournement CAPTCHA/Cloudflare n'est jamais tente"
+    );
+
+    abortController.abort();
+    await Promise.race([monitorPromise, sleep(20_000)]);
+    assertNoSecretsInLogs(capture.entries, "D/V) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ----- Scenario W (Test E): STOP/abort pendant le cooldown -> sortie rapide -----
+
+const runScenarioW = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario W (CORRECTIF FINAL 0.2.4, Test E): STOP/abort pendant le cooldown -> sortie rapide (comportement existant, inchange) ===");
+  const fixture = await startArbitraryUrlFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const abortController = new AbortController();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture();
+
+    const config: AppConfig = {
+      targetUrl: `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`,
+      connectToExistingChrome: false,
+      chromeDebugUrl: "",
+      refreshIntervalMs: 1_000,
+      headless: true,
+      slowMoMs: 0,
+      debugKeepBrowserOpen: false,
+      maxRefreshAttempts: 1,
+      scanMonthCount: 1,
+      maxParallelScansPerDomain: 1,
+      monthClickMinDelayMs: 100,
+      monthClickMaxDelayMs: 200,
+      botCycleCooldownMinMs: 30_000,
+      botCycleCooldownMaxMs: 30_000,
+      refreshEveryCycles: 0,
+      rateLimitCooldownMinutes: 1
+    };
+
+    const startedAt = Date.now();
+    const monitorPromise = monitorAppointments(page, config, {
+      log: capture.log,
+      waitForUser: async () => undefined,
+      recoverWorkflow: async () => null,
+      signal: abortController.signal
+    });
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Attente avant nouveau cycle")), 10_000);
+    await sleep(500);
+    abortController.abort();
+
+    await Promise.race([
+      monitorPromise,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("timeout monitorPromise (Scenario W)")), 10_000))
+    ]);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert(elapsedMs < 8_000, `E/W) L'abort pendant le cooldown de 30s produit une sortie rapide (recu: ${elapsedMs}ms)`);
+    assertNoSecretsInLogs(capture.entries, "E/W) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ----- Fixtures dediees au recovery multi-etapes (Tests H/J/L) -----
+
+// Test H: simule une session TLS ENCORE VALIDE - /fr-fr/login redirige
+// DIRECTEMENT vers travel-groups (302), sans jamais afficher de formulaire de
+// connexion, reproduisant fidelement le cas reel confirme (section 8).
+const startHomeToTravelGroupsDirectFixture = (): Promise<FixtureSite> => new Promise((resolve, reject) => {
+  const requestLog: string[] = [];
+  const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
+    const url = req.url ?? "/";
+    requestLog.push(url);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+
+    if (url.startsWith("/fr-fr/country/")) { res.end(COUNTRY_HOME_HTML); return; }
+    if (url.startsWith("/fr-fr/login")) { res.statusCode = 302; res.setHeader("Location", "/fr-fr/travel-groups"); res.end(); return; }
+    if (url.startsWith("/fr-fr/travel-groups")) { res.end(TRAVEL_GROUPS_HTML); return; }
+    if (url.startsWith("/workflow/application-summary")) { res.end(APPLICATION_SUMMARY_HTML); return; }
+    if (url.startsWith("/workflow/service-level")) { res.end(SERVICE_LEVEL_HTML); return; }
+    if (url.startsWith("/workflow/appointment-booking/")) { res.end(APPOINTMENT_READY_HTML); return; }
+    res.statusCode = 404;
+    res.end("Not found (fixture).");
+  });
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address() as AddressInfo;
+    resolve({ server, baseUrl: `http://127.0.0.1:${address.port}`, requestLog, appointmentReloadCount: () => 0 });
+  });
+});
+
+// Test J: page travel-groups CASSEE - aucun element "Selectionner" nulle
+// part, donc aucune action ne peut jamais faire progresser cette page
+// (echec REEL, jamais une progression).
+const BROKEN_TRAVEL_GROUPS_HTML = `<!DOCTYPE html><html><body>
+<h1>Gestionnaire des demandes</h1>
+<p>Aucune action disponible ici (fixture de test: etat volontairement bloque).</p>
+</body></html>`;
+
+const startStuckTravelGroupsFixture = (): Promise<FixtureSite> => new Promise((resolve, reject) => {
+  const requestLog: string[] = [];
+  const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
+    requestLog.push(req.url ?? "/");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.end(BROKEN_TRAVEL_GROUPS_HTML);
+  });
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address() as AddressInfo;
+    resolve({ server, baseUrl: `http://127.0.0.1:${address.port}`, requestLog, appointmentReloadCount: () => 0 });
+  });
+});
+
+// Test L: page de depart totalement arbitraire ("unknown"), puis targetUrl
+// pointe vers la page pays ("home", RECONNUE mais pas encore pret) - prouve
+// que unknown -> home est traitee comme une progression interne, jamais un
+// second retry externe.
+const startUnknownToHomeChainFixture = (): Promise<FixtureSite> => new Promise((resolve, reject) => {
+  const requestLog: string[] = [];
+  const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
+    const url = req.url ?? "/";
+    requestLog.push(url);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+
+    if (url.startsWith("/random-unrelated-page")) { res.end(ARBITRARY_UNRELATED_PAGE_HTML); return; }
+    if (url.startsWith("/fr-fr/country/")) { res.end(COUNTRY_HOME_HTML); return; }
+    if (url.startsWith("/fr-fr/login")) { res.statusCode = 302; res.setHeader("Location", "/fr-fr/travel-groups"); res.end(); return; }
+    if (url.startsWith("/fr-fr/travel-groups")) { res.end(TRAVEL_GROUPS_HTML); return; }
+    if (url.startsWith("/workflow/application-summary")) { res.end(APPLICATION_SUMMARY_HTML); return; }
+    if (url.startsWith("/workflow/service-level")) { res.end(SERVICE_LEVEL_HTML); return; }
+    if (url.startsWith("/workflow/appointment-booking/")) { res.end(APPOINTMENT_READY_HTML); return; }
+    res.statusCode = 404;
+    res.end("Not found (fixture).");
+  });
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address() as AddressInfo;
+    resolve({ server, baseUrl: `http://127.0.0.1:${address.port}`, requestLog, appointmentReloadCount: () => 0 });
+  });
+});
+
+// ----- Scenario Y (Test H): home -> travel-groups DIRECT (session TLS encore valide) -----
+
+const runScenarioY = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario Y (CORRECTIF FINAL 0.2.4, Test H): home -> travel-groups DIRECT (session TLS encore valide, login court-circuite) ===");
+  const fixture = await startHomeToTravelGroupsDirectFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/fr-fr/country/tn/vac/tnTUN2fr`, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture();
+    const { reporter, statuses } = makeFakeReporter();
+
+    const handle = startMonitoring({
+      botId: "bot-scenario-y",
+      page,
+      context,
+      settings: FAST_SETTINGS,
+      targetUrl: `${fixture.baseUrl}/fr-fr/country/tn/vac/tnTUN2fr`,
+      commandId: "cmd-y",
+      reporter,
+      log: capture.log,
+      workflowRecoveryRetryIntervalMs: 500,
+      workflowRecoveryLongWaitMs: 1_000,
+      isBotStillRegistered: () => true
+    });
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")), 30_000);
+    handle.abortController.abort();
+    await handle.loopPromise;
+
+    assert(capture.entries.some((e) => e.message.includes("etat detecte = home")), "H/Y) L'etat 'home' (page pays) est correctement classifie au depart");
+    assert(
+      capture.entries.some((e) => /Recovery progression: home -> travel-groups\.?/.test(e.message)),
+      "H/Y) La progression home -> travel-groups est reconnue DIRECTEMENT (session TLS encore valide), jamais un 'echec de navigation /login'"
+    );
+    assert(
+      !capture.entries.some((e) => e.message.includes("Menu compte introuvable")),
+      "H/Y) Le code ne continue jamais inutilement a chercher le menu 'Se connecter' une fois la progression reelle detectee (correctif loginFlow.ts, section 8)"
+    );
+    assert(
+      capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")),
+      "H/Y) Le monitoring aboutit a la page de rendez-vous"
+    );
+    assert(
+      !capture.entries.some((e) => /Reprise workflow 2\/4/.test(e.message)),
+      "H/Y) Une seule tentative externe a suffi (home->travel-groups->application-summary->service-level->appointment, toutes en transitions internes)"
+    );
+    assert(statuses.every((s) => s.status !== "WAITING_FOR_USER" && s.status !== "ERROR"), "H/Y) Aucune intervention humaine necessaire");
+    assertNoSecretsInLogs(capture.entries, "H/Y) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ----- Scenario Z (Test J): etat REELLEMENT inchange apres action -> vrai echec, retry externe consomme -----
+
+const runScenarioZ = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario Z (CORRECTIF FINAL 0.2.4, Test J): etat inchange apres action -> vrai echec, tentative externe reellement consommee ===");
+  const fixture = await startStuckTravelGroupsFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/fr-fr/travel-groups`, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture();
+    const { reporter } = makeFakeReporter();
+
+    const handle = startMonitoring({
+      botId: "bot-scenario-z",
+      page,
+      context,
+      settings: FAST_SETTINGS,
+      targetUrl: `${fixture.baseUrl}/fr-fr/travel-groups`,
+      commandId: "cmd-z",
+      reporter,
+      log: capture.log,
+      workflowRecoveryRetryIntervalMs: 500,
+      workflowRecoveryLongWaitMs: 800,
+      isBotStillRegistered: () => true
+    });
+
+    await waitUntil(() => capture.entries.filter((e) => /Reprise workflow \d\/4/.test(e.message)).length >= 2, 20_000);
+    handle.abortController.abort();
+    await handle.loopPromise;
+
+    const attemptCount = capture.entries.filter((e) => /Reprise workflow \d\/4/.test(e.message)).length;
+    assert(attemptCount >= 2, `J/Z) Un etat reellement inchange apres action consomme bien PLUSIEURS tentatives externes distinctes (recu: ${attemptCount})`);
+    assert(
+      capture.entries.some((e) => e.message.includes("Recovery sans progression: etat toujours travel-groups.")),
+      "J/Z) Le motif exact d'echec REEL (etat inchange) est journalise"
+    );
+    assert(
+      !capture.entries.some((e) => /Recovery progression:/.test(e.message)),
+      "J/Z) Aucune progression n'est jamais faussement rapportee pour cet etat reellement bloque"
+    );
+    assertNoSecretsInLogs(capture.entries, "J/Z) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ----- Scenario AA (Test L): unknown -> retour targetUrl -> etat reconnu (home, pas pret) = progression -----
+
+const runScenarioAA = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario AA (CORRECTIF FINAL 0.2.4, Test L): unknown -> target -> etat reconnu (home, pas encore pret) -> progression, pas de retry supplementaire ===");
+  const fixture = await startUnknownToHomeChainFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    await page.goto(`${fixture.baseUrl}/random-unrelated-page`, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture();
+    const { reporter, statuses } = makeFakeReporter();
+
+    const handle = startMonitoring({
+      botId: "bot-scenario-aa",
+      page,
+      context,
+      settings: FAST_SETTINGS,
+      targetUrl: `${fixture.baseUrl}/fr-fr/country/tn/vac/tnTUN2fr`,
+      commandId: "cmd-aa",
+      reporter,
+      log: capture.log,
+      workflowRecoveryRetryIntervalMs: 500,
+      workflowRecoveryLongWaitMs: 1_000,
+      isBotStillRegistered: () => true
+    });
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")), 30_000);
+    handle.abortController.abort();
+    await handle.loopPromise;
+
+    assert(capture.entries.some((e) => e.message.includes("etat detecte = unknown")), "L/AA) L'etat de depart (page arbitraire) est bien classifie 'unknown'");
+    assert(
+      capture.entries.some((e) => /Recovery progression: unknown -> home\.?/.test(e.message)),
+      "L/AA) Apres le retour vers targetUrl, l'etat 'home' (reconnu mais pas encore pret) est traite comme une PROGRESSION, jamais une nouvelle tentative externe"
+    );
+    assert(
+      capture.entries.some((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement")),
+      "L/AA) Le monitoring aboutit a la page de rendez-vous"
+    );
+    assert(
+      !capture.entries.some((e) => /Reprise workflow 2\/4/.test(e.message)),
+      "L/AA) Une seule tentative externe a suffi (unknown->home->travel-groups->application-summary->service-level->appointment, toutes en transitions internes)"
+    );
+    assert(statuses.every((s) => s.status !== "WAITING_FOR_USER" && s.status !== "ERROR"), "L/AA) Aucune intervention humaine necessaire");
+    assertNoSecretsInLogs(capture.entries, "L/AA) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ----- Scenario AB (audit suite): URL INCHANGEE pendant le cooldown, mais le
+// contenu devient un blocage CAPTCHA/Cloudflare (cas reel signale: TLS peut
+// afficher un overlay/remplacer le contenu SANS jamais naviguer) -----
+
+const runScenarioAB = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario AB (AUDIT 0.2.4): cooldown interrompu par un blocage CAPTCHA/Cloudflare AVEC URL IDENTIQUE (mutation DOM locale, jamais de navigation) ===");
+  const fixture = await startArbitraryUrlFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const abortController = new AbortController();
+
+  try {
+    const appointmentUrl = `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`;
+    await page.goto(appointmentUrl, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture();
+
+    const config: AppConfig = {
+      targetUrl: appointmentUrl,
+      connectToExistingChrome: false,
+      chromeDebugUrl: "",
+      refreshIntervalMs: 1_000,
+      headless: true,
+      slowMoMs: 0,
+      debugKeepBrowserOpen: false,
+      maxRefreshAttempts: 0,
+      scanMonthCount: 1,
+      maxParallelScansPerDomain: 1,
+      monthClickMinDelayMs: 100,
+      monthClickMaxDelayMs: 200,
+      botCycleCooldownMinMs: 20_000,
+      botCycleCooldownMaxMs: 20_000,
+      refreshEveryCycles: 0,
+      rateLimitCooldownMinutes: 1
+    };
+
+    const monitorPromise = monitorAppointments(page, config, {
+      log: capture.log,
+      waitForUser: async () => undefined,
+      recoverWorkflow: async () => null,
+      signal: abortController.signal
+    });
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Attente avant nouveau cycle")), 10_000);
+    await sleep(1_000);
+    const requestCountBeforeMutation = fixture.requestLog.length;
+    const urlBeforeMutation = page.url();
+
+    // Mutation DOM LOCALE uniquement (jamais page.goto/reload) - reproduit un
+    // overlay CAPTCHA/Cloudflare affiche par TLS sans jamais changer l'URL.
+    await page.evaluate(() => {
+      document.title = "Just a moment...";
+      document.body.innerHTML = "<p>Vérification humaine requise avant de continuer.</p>";
+    });
+
+    assert(page.url() === urlBeforeMutation, "AUDIT/AB) L'URL n'a pas change apres la mutation DOM (jamais de navigation)");
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Attente entre cycles interrompue")), 20_000);
+    assert(
+      capture.entries.some((e) => e.message.includes("Attente entre cycles interrompue: contenu appointment-booking devenu inexploitable")),
+      "AUDIT/AB) La pause entre cycles est interrompue par le blocage CAPTCHA/Cloudflare MEME SANS changement d'URL (inspection DOM locale)"
+    );
+    assert(
+      appointmentBookingPathPattern.test(page.url()),
+      "AUDIT/AB) L'URL est toujours celle d'appointment-booking au moment de l'interruption (preuve que ce n'est PAS le chemin URL-only qui a declenche)"
+    );
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Intervention humaine potentiellement requise")), 15_000);
+    assert(
+      capture.entries.some((e) => e.message.includes("Intervention humaine potentiellement requise")),
+      "AUDIT/AB) Apres l'interruption, la boucle principale reprend et le chemin de validation humaine EXISTANT (detectHumanValidation/pauseForHuman, inchange) est bien declenche"
+    );
+    assert(
+      !capture.entries.some((e) => /contourn/i.test(e.message)),
+      "AUDIT/AB) Aucun contournement CAPTCHA/Cloudflare n'est jamais tente"
+    );
+
+    const requestCountAfterDetection = fixture.requestLog.length;
+    assert(
+      requestCountAfterDetection === requestCountBeforeMutation,
+      `AUDIT/AB) Le watcher de cooldown (inspection DOM locale, jamais de navigation) n'emet AUCUNE requete HTTP supplementaire (avant: ${requestCountBeforeMutation}, apres: ${requestCountAfterDetection})`
+    );
+
+    abortController.abort();
+    await Promise.race([monitorPromise, sleep(20_000)]);
+    assertNoSecretsInLogs(capture.entries, "AUDIT/AB) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
+// ----- Scenario AC (audit suite): URL INCHANGEE pendant le cooldown, mais le
+// contenu appointment-booking devient non pret/invalide (ni CAPTCHA/Cloudflare,
+// ni motif d'erreur connu de detectUnexpectedPageReason - juste plus aucun
+// marqueur "page de rendez-vous exploitable") -----
+
+const runScenarioAC = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== Scenario AC (AUDIT 0.2.4): cooldown interrompu par un contenu appointment-booking devenu invalide, URL IDENTIQUE (mutation DOM locale) ===");
+  const fixture = await startArbitraryUrlFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const abortController = new AbortController();
+  let recoverWorkflowCalls = 0;
+
+  try {
+    const appointmentUrl = `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`;
+    await page.goto(appointmentUrl, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture();
+
+    const config: AppConfig = {
+      targetUrl: appointmentUrl,
+      connectToExistingChrome: false,
+      chromeDebugUrl: "",
+      refreshIntervalMs: 1_000,
+      headless: true,
+      slowMoMs: 0,
+      debugKeepBrowserOpen: false,
+      maxRefreshAttempts: 0,
+      scanMonthCount: 1,
+      maxParallelScansPerDomain: 1,
+      monthClickMinDelayMs: 100,
+      monthClickMaxDelayMs: 200,
+      botCycleCooldownMinMs: 20_000,
+      botCycleCooldownMaxMs: 20_000,
+      refreshEveryCycles: 0,
+      rateLimitCooldownMinutes: 1
+    };
+
+    const monitorPromise = monitorAppointments(page, config, {
+      log: capture.log,
+      waitForUser: async () => undefined,
+      recoverWorkflow: async () => {
+        recoverWorkflowCalls += 1;
+        return null;
+      },
+      signal: abortController.signal
+    });
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Attente avant nouveau cycle")), 10_000);
+    await sleep(1_000);
+    const requestCountBeforeMutation = fixture.requestLog.length;
+    const urlBeforeMutation = page.url();
+
+    // Mutation DOM LOCALE uniquement: plus aucun marqueur "page de rendez-vous
+    // exploitable" (isAppointmentPageReady), mais aucun motif CAPTCHA/Cloudflare
+    // ni aucun motif connu de detectUnexpectedPageReason non plus - distingue
+    // ce cas de AB (chemin de validation humaine) du cas L/AA (unknown->target).
+    await page.evaluate(() => {
+      document.body.innerHTML = "<h1>Une erreur est survenue.</h1><p>Merci de reessayer plus tard.</p>";
+    });
+
+    assert(page.url() === urlBeforeMutation, "AUDIT/AC) L'URL n'a pas change apres la mutation DOM (jamais de navigation)");
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes("Attente entre cycles interrompue")), 20_000);
+    assert(
+      capture.entries.some((e) => e.message.includes("Attente entre cycles interrompue: contenu appointment-booking devenu inexploitable")),
+      "AUDIT/AC) La pause entre cycles est interrompue par un contenu appointment-booking devenu invalide, MEME SANS changement d'URL"
+    );
+    assert(
+      appointmentBookingPathPattern.test(page.url()),
+      "AUDIT/AC) L'URL est toujours celle d'appointment-booking au moment de l'interruption"
+    );
+
+    // Le texte exact "Page hors workflow detectee" (unexpectedReason) n'est
+    // jamais imprime verbatim ici: c'est une valeur interne passee a
+    // recoverWorkflow (cf. commentaire identique au Scenario P plus haut),
+    // jamais journalisee par monitorAppointments lui-meme sur ce chemin. La
+    // preuve observable equivalente est recoverWorkflowCalls > 0: la boucle
+    // est bien revenue en tete et a bien sollicite le chemin de detection/
+    // recovery EXISTANT (isAppointmentPageReady -> recoverWorkflow), jamais
+    // un deuxieme mecanisme invente pour ce cas.
+    await waitUntil(() => recoverWorkflowCalls > 0, 15_000);
+    assert(recoverWorkflowCalls > 0, "AUDIT/AC) Apres l'interruption, la boucle principale reprend et sollicite le chemin de detection/recovery EXISTANT (isAppointmentPageReady/recoverWorkflow, inchange)");
+    assert(
+      !capture.entries.some((e) => e.message.includes("Intervention humaine potentiellement requise")),
+      "AUDIT/AC) Ce cas (contenu invalide generique) ne passe PAS par le chemin de validation humaine (detectHumanValidation) - distinct du cas AB (CAPTCHA/Cloudflare)"
+    );
+    assert(
+      !capture.entries.some((e) => /contourn/i.test(e.message)),
+      "AUDIT/AC) Aucun contournement n'est jamais tente"
+    );
+
+    const requestCountAfterDetection = fixture.requestLog.length;
+    assert(
+      requestCountAfterDetection === requestCountBeforeMutation,
+      `AUDIT/AC) Le watcher de cooldown (inspection DOM locale, jamais de navigation) n'emet AUCUNE requete HTTP supplementaire (avant: ${requestCountBeforeMutation}, apres: ${requestCountAfterDetection})`
+    );
+
+    abortController.abort();
+    await Promise.race([monitorPromise, sleep(20_000)]);
+    assertNoSecretsInLogs(capture.entries, "AUDIT/AC) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    fixture.server.closeAllConnections?.();
+    await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
+  }
+};
+
 const main = async (): Promise<void> => {
   log("BOOT", "=== Test REEL cible - Hotfix Agent 0.2.3 (recovery robuste du monitoring) ===");
 
@@ -1875,6 +2702,16 @@ const main = async (): Promise<void> => {
     await runScenarioN(browser);
     await runScenarioP(browser);
     await runScenarioQ(browser);
+    await runScenarioS(browser);
+    await runScenarioT(browser);
+    await runScenarioU(browser);
+    await runScenarioV(browser);
+    await runScenarioW(browser);
+    await runScenarioY(browser);
+    await runScenarioZ(browser);
+    await runScenarioAA(browser);
+    await runScenarioAB(browser);
+    await runScenarioAC(browser);
   } finally {
     if (browser) await browser.close().catch(() => undefined);
   }

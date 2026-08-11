@@ -4,7 +4,7 @@ import { Page } from "playwright";
 import { detectAppointmentAvailability, findBestCandidateElement, findReserveAppointmentButton, isAppointmentPageReady } from "./detectors.js";
 import { detectHumanValidation } from "./humanValidation.js";
 import { highlightElement } from "./highlight.js";
-import { isTlsLoggedOutLandingPage } from "./loginFlow.js";
+import { appointmentBookingPathPattern, isTlsLoggedOutLandingPage } from "./loginFlow.js";
 import { logger } from "../logger.js";
 import {
   applyRateLimitCooldown,
@@ -1068,15 +1068,71 @@ export const monitorAppointments = async (
       resolved.log("info", `Refresh ignore ce cycle. Prochain refresh planifie tous les ${config.refreshEveryCycles || 0} cycle(s).`);
     }
 
-    await waitRandomDelay(
+    // BUG CIBLE 0.2.4 (recovery plus reactif - point 1/2): la cadence de scan
+    // elle-meme reste EXACTEMENT inchangee (memes bornes min/max) - seule
+    // cette pause IDLE devient interruptible. recoverWorkflow n'est JAMAIS
+    // appele ici: une seule source de recovery reste en tete de boucle
+    // (ci-dessus), cette pause se contente de rendre la main plus tot pour
+    // que cette meme logique s'execute plus vite au prochain tour.
+    //
+    // AUDIT CIBLE 0.2.4 (suite - cas reel signale: URL INCHANGEE mais contenu
+    // devenu CAPTCHA/Cloudflare/session expiree/appointment-booking non
+    // exploitable): une verification d'URL seule ne peut jamais detecter ce
+    // cas (TLS peut afficher un overlay ou remplacer le contenu SANS jamais
+    // naviguer). lastContentCheckAt/isCooldownInterrupted() ci-dessous
+    // ajoutent une inspection DOM LOCALE (aucune navigation/reload/clic/
+    // requete TLS supplementaire - reutilise exactement detectHumanValidation
+    // et isAppointmentPageReady, deja les detecteurs de reference partages,
+    // jamais une logique de detection dupliquee ici ou dans orchestrator.ts).
+    // Cette inspection est plus couteuse qu'une simple lecture d'URL: elle
+    // n'est donc rejouee qu'au rythme de HUMAN_RECHECK_INTERVAL_MS (la meme
+    // fenetre de sondage silencieux deja utilisee par waitForConditionToClear
+    // ci-dessus - jamais une seconde cadence divergente), alors que la
+    // verification d'URL/page fermee, elle, reste sondee a chaque tick
+    // (INTERRUPT_CHECK_INTERVAL_MS, orchestrator.ts) comme avant.
+    let lastCooldownContentCheckAt = 0;
+    const isCooldownInterrupted = async (): Promise<boolean> => {
+      if (activePage.isClosed() || !appointmentBookingPathPattern.test(activePage.url())) {
+        return true;
+      }
+
+      const now = Date.now();
+      if (now - lastCooldownContentCheckAt < HUMAN_RECHECK_INTERVAL_MS) {
+        return false;
+      }
+      lastCooldownContentCheckAt = now;
+
+      const validation = await detectHumanValidation(activePage).catch(() => ({ detected: false }) as const);
+      if (validation.detected) {
+        return true;
+      }
+
+      return !(await isAppointmentPageReady(activePage).catch(() => true));
+    };
+
+    const cooldownResult = await waitRandomDelay(
       config.botCycleCooldownMinMs,
       config.botCycleCooldownMaxMs,
       resolved.log,
       "Attente avant nouveau cycle",
       groupKey,
       resolved.botName,
-      resolved.signal
+      resolved.signal,
+      isCooldownInterrupted
     );
+    if (cooldownResult.interrupted) {
+      // Message distinct pour le cas AUDIT (URL identique, contenu devenu
+      // inexploitable) - le message historique "la page a quitte
+      // appointment-booking" est conserve A L'IDENTIQUE pour le cas ou l'URL
+      // a reellement change (deja teste par les Scenarios U/V existants).
+      const stillOnAppointmentUrl = !activePage.isClosed() && appointmentBookingPathPattern.test(activePage.url());
+      resolved.log(
+        "warn",
+        stillOnAppointmentUrl
+          ? "Attente entre cycles interrompue: contenu appointment-booking devenu inexploitable (CAPTCHA/Cloudflare/session/erreur) sans changement d'URL."
+          : "Attente entre cycles interrompue: la page a quitte appointment-booking."
+      );
+    }
   }
 
   resolved.log("warn", "Nombre maximum de tentatives atteint.");

@@ -219,6 +219,14 @@ export const randomBetween = (min: number, max: number): number => {
   return Math.floor(safeMin + Math.random() * (safeMax - safeMin + 1));
 };
 
+// BUG CIBLE 0.2.4 (recovery plus reactif - pause entre cycles interruptible):
+// cadence de sondage LEGERE d'interruptCheck ci-dessous - jamais un log a
+// cette cadence (uniquement un appel synchrone fourni par l'appelant, jamais
+// de navigation/reload/clic/requete reseau ici).
+const INTERRUPT_CHECK_INTERVAL_MS = 1_500;
+
+export type WaitRandomDelayResult = { interrupted: boolean };
+
 export const waitRandomDelay = async (
   min: number,
   max: number,
@@ -228,10 +236,22 @@ export const waitRandomDelay = async (
   botName?: string,
   // Lot 4: annulation cooperative (STOP_BOT). Optionnel, sans effet si
   // absent: comportement inchange pour le chemin legacy_vm existant.
-  signal?: AbortSignal
-): Promise<void> => {
+  signal?: AbortSignal,
+  // BUG CIBLE 0.2.4 (audit suite): verification LEGERE optionnelle,
+  // interrogee toutes les INTERRUPT_CHECK_INTERVAL_MS. Peut etre SYNCHRONE
+  // (ex. lecture de page.url()) OU retourner une Promise<boolean> - un
+  // appelant qui a besoin d'une inspection DOM locale (ex. detecter un
+  // CAPTCHA/Cloudflare affiche SANS changement d'URL) peut donc fournir une
+  // fonction async, sans jamais dupliquer cette logique de detection ici:
+  // ce watcher reste generique (il attend juste le booleen resolu), jamais
+  // de navigation/reload/clic/requete TLS supplementaire de son propre chef.
+  // Absent par defaut: comportement 100% inchange pour tous les autres
+  // appelants (delai entre changements de mois, etc.) - seul l'appel dedie
+  // au cooldown entre cycles de monitor.ts fournit cette fonction.
+  interruptCheck?: () => boolean | Promise<boolean>
+): Promise<WaitRandomDelayResult> => {
   if (signal?.aborted) {
-    return;
+    return { interrupted: false };
   }
 
   const delayMs = randomBetween(min, max);
@@ -243,17 +263,21 @@ export const waitRandomDelay = async (
       const signalVersion = getState(wakeOnAppointmentDomain).appointmentSignalVersion;
       const state = getState(wakeOnAppointmentDomain);
 
-      const wokeBySignal = await new Promise<boolean>((resolve) => {
+      const wakeReason = await new Promise<"timeout" | "coverage" | "abort" | "appointment-signal" | "interrupt-check">((resolve) => {
         let settled = false;
+        let interruptTimer: NodeJS.Timeout | undefined;
         const cleanup = () => {
           clearTimeout(timer);
+          if (interruptTimer) {
+            clearInterval(interruptTimer);
+          }
           if (botName) {
             state.coverageSleepers.delete(botName);
           }
           signal?.removeEventListener("abort", onAbort);
         };
 
-        const finish = (value: boolean) => {
+        const finish = (value: "timeout" | "coverage" | "abort" | "appointment-signal" | "interrupt-check") => {
           if (settled) {
             return;
           }
@@ -264,15 +288,15 @@ export const waitRandomDelay = async (
         };
 
         const wakeCoverage = () => {
-          finish(false);
+          finish("coverage");
         };
 
         const onAbort = () => {
-          finish(false);
+          finish("abort");
         };
 
         const timer = setTimeout(() => {
-          finish(false);
+          finish("timeout");
         }, delayMs);
 
         if (signal) {
@@ -287,19 +311,46 @@ export const waitRandomDelay = async (
         void waitForAppointmentSignalOrTimeout(wakeOnAppointmentDomain, signalVersion, delayMs)
           .then((appointmentSignal) => {
             if (appointmentSignal) {
-              finish(true);
+              finish("appointment-signal");
             }
           });
+
+        if (interruptCheck) {
+          // "checkInFlight" evite d'empiler des appels si interruptCheck()
+          // (potentiellement async - inspection DOM) met plus de temps que
+          // INTERRUPT_CHECK_INTERVAL_MS a resoudre: le tick suivant est alors
+          // simplement ignore, jamais mis en file - toujours un seul appel a
+          // la fois, jamais deux inspections DOM concurrentes sur la meme page.
+          let checkInFlight = false;
+          interruptTimer = setInterval(() => {
+            if (checkInFlight || settled) {
+              return;
+            }
+            checkInFlight = true;
+            Promise.resolve(interruptCheck())
+              .then((shouldInterrupt) => {
+                checkInFlight = false;
+                if (shouldInterrupt) {
+                  finish("interrupt-check");
+                }
+              })
+              .catch(() => {
+                checkInFlight = false;
+              });
+          }, INTERRUPT_CHECK_INTERVAL_MS);
+        }
       });
 
-      if (wokeBySignal) {
+      if (wakeReason === "appointment-signal") {
         log?.("warn", `${label} interrompue: un autre bot a detecte un creneau sur ${wakeOnAppointmentDomain}.`);
       }
-      return;
+      return { interrupted: wakeReason === "interrupt-check" };
     }
 
     await abortableSleep(delayMs, signal);
   }
+
+  return { interrupted: false };
 };
 
 // IMPORTANT (contrat d'annulation, Lot 4): cette fonction RESOUT

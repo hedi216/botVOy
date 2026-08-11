@@ -65,6 +65,16 @@ const isSafeNavigationBase = (rawUrl: string): boolean => {
 // avant de declarer un succes - sinon on se rabat sur les chemins de clic
 // direct ci-dessous, qui simulent un vrai geste utilisateur.
 const CONFIRM_LOGIN_REACHED_TIMEOUT_MS = 4_000;
+// BUG CIBLE 0.2.4 (section 8: home -> travel-groups direct sans login si la
+// session TLS est encore valide): une navigation vers /fr-fr/login peut tout
+// a fait etre redirigee IMMEDIATEMENT par TLS vers une etape PLUS AVANCEE du
+// parcours (travel-groups, application-summary, service-level, page pays,
+// voire directement appointment-booking) plutot que vers login/auth - c'est
+// une PROGRESSION reelle, jamais un echec de navigation qui devrait
+// declencher le repli sur le clic direct du lien (defaut reel confirme: le
+// code loguait "navigation /login sans effet reel" alors que travel-groups
+// EST une progression). Motifs deja exportes plus bas dans CE MEME fichier
+// (jamais une seconde logique de classification divergente/importee).
 const hasReachedLoginOrAuth = async (page: Page): Promise<boolean> => {
   const deadline = Date.now() + CONFIRM_LOGIN_REACHED_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -72,7 +82,15 @@ const hasReachedLoginOrAuth = async (page: Page): Promise<boolean> => {
       return false;
     }
     const url = page.url();
-    if (loginPathPattern.test(url) || authPagePattern.test(url)) {
+    if (
+      loginPathPattern.test(url)
+      || authPagePattern.test(url)
+      || travelGroupsPagePattern.test(url)
+      || applicationSummaryPagePattern.test(url)
+      || serviceLevelPagePattern.test(url)
+      || homeCountryPagePattern.test(url)
+      || appointmentBookingPathPattern.test(url)
+    ) {
       return true;
     }
     if (await hasVisibleLoginForm(page)) {

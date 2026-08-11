@@ -196,18 +196,6 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
       ?? null;
   };
 
-  const waitForReadyAppointment = async (timeoutMs: number): Promise<Page | null> => {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline && !signal.aborted) {
-      const ready = await recoverCurrentPage();
-      if (ready) {
-        return ready;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-    return recoverCurrentPage();
-  };
-
   // HOTFIX 0.2.3 (section 4 - recovery niveau 2, pilote par etat reel):
   // remplace l'ancienne sequence aveugle (goto(targetUrl) INCONDITIONNEL puis
   // select -> book -> continue, rejouee entierement a chaque tentative meme
@@ -266,7 +254,14 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
   // simple nom d'etat interpole) - preserve exactement le libelle deja
   // existant pour "logged-out-landing" (deja verifie par un test anterieur),
   // "unknown" recoit sa propre description distincte.
-  const attemptReturnToTargetUrl = async (page: Page, description: string): Promise<Page | null> => {
+  // BUG CIBLE 0.2.4 (recovery multi-etapes, section 3): decoupe l'ancien
+  // attemptReturnToTargetUrl en une action PURE de navigation (ci-dessous,
+  // jamais d'attente propre) et une attente generique de progression/etat
+  // pret partagee par tous les etats (waitForProgressOrReady, plus bas) -
+  // memes libelles de log EXACTS que la version precedente (deja verifies
+  // par des tests anterieurs, jamais renommes). `description` reste la
+  // phrase COMPLETE decrivant l'etat detecte (jamais un simple nom d'etat).
+  const navigateToRecoveryTargetUrl = async (page: Page, description: string): Promise<boolean> => {
     let validTargetUrl: URL | null = null;
     try {
       const parsed = new URL(targetUrl);
@@ -279,7 +274,7 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
 
     if (!validTargetUrl) {
       agentLog("warn", `${description}, mais targetUrl invalide/non http(s): retour impossible.`);
-      return null;
+      return false;
     }
 
     agentLog(
@@ -291,58 +286,53 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       agentLog("warn", `Retour vers targetUrl impossible (${description}): ${message}`);
-      return null;
+      return false;
     }
-    // Jamais d'action en aveugle enchainee ici: on attend brievement, puis on
-    // laisse le state-driven recovery existant reevaluer l'etat REEL
-    // (potentiellement deja avance si la session TLS etait encore valide -
-    // CAS E du correctif: fillLoginForm() n'est jamais utilise ici, seulement
-    // si "auth" est reellement (re)classifie a la prochaine tentative).
-    return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+    return true;
   };
 
-  const recoverWorkflowOnce = async (attempt: number, reason?: string): Promise<Page | null> => {
-    const ready = await recoverCurrentPage();
-    if (ready) {
-      return ready;
-    }
+  // BUG CIBLE 0.2.4 (recovery multi-etapes, section 5.A "progression
+  // interne"): plafond de TRANSITIONS RECONNUES enchainees dans UNE SEULE
+  // tentative externe numerotee - jamais une boucle infinie. Une chaine
+  // reelle complete (logged-out-landing -> target -> home -> auth ->
+  // travel-groups -> application-summary/service-level -> appointment-
+  // booking) tient en 6 transitions au plus: cette marge reste tres
+  // largement suffisante sans jamais pouvoir degenerer en boucle sans fin.
+  const MAX_INTERNAL_RECOVERY_TRANSITIONS = 10;
 
-    const page = pickWorkflowPage();
-    if (!page || page.isClosed()) {
-      return null;
-    }
-
-    const state = await classifyRecoveryState(page);
-    agentLog(
-      "info",
-      `Reprise workflow ${attempt}/${WORKFLOW_RECOVERY_FINAL_ATTEMPT}${reason ? " apres page inattendue" : ""}: `
-      + `etat detecte = ${state} (${maskUrlForLog(page.url())}).`
-    );
-
+  // Une seule action, celle pertinente pour l'etat REELLEMENT classifie -
+  // reprend exactement les memes actions/libelles qu'avant (jamais une
+  // logique divergente), uniquement decouplees de l'attente qui suit
+  // (waitForProgressOrReady, desormais generique et partagee par tous les
+  // etats). canContinue=false signifie que cette tentative externe doit
+  // s'arreter immediatement (aucun identifiant disponible pour "auth",
+  // Cloudflare/captcha detecte) - jamais un cas ou une progression interne
+  // supplementaire serait encore possible.
+  const performRecoveryStateAction = async (state: RecoveryState, page: Page): Promise<{ canContinue: boolean }> => {
     switch (state) {
       case "travel-groups":
         await clickSelectTravelGroup(page, agentLog).catch(() => false);
-        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+        return { canContinue: true };
 
       case "application-summary":
         await clickBookNewAppointment(page, agentLog).catch(() => false);
-        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+        return { canContinue: true };
 
       case "logged-out-landing":
-        return attemptReturnToTargetUrl(page, "Accueil TLS deconnecte (logged-out-landing) detecte pendant la reprise");
+        return { canContinue: await navigateToRecoveryTargetUrl(page, "Accueil TLS deconnecte (logged-out-landing) detecte pendant la reprise") };
 
       case "service-level":
         await clickContinueServiceLevel(page, agentLog).catch(() => false);
-        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+        return { canContinue: true };
 
       case "home":
         await clickSeConnecter(page, agentLog).catch(() => false);
-        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+        return { canContinue: true };
 
       case "auth":
         if (!runtimeCredentialsRef) {
           agentLog("warn", "Page de connexion detectee pendant la reprise, mais aucun identifiant en memoire pour cette session: reconnexion automatique impossible.");
-          return null;
+          return { canContinue: false };
         }
         // fillLoginForm() attend deja, sans jamais la contourner, une
         // resolution CAPTCHA manuelle si presente (waitForRecaptchaResolution,
@@ -350,29 +340,120 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
         // captcha necessaire ici (section 6 du hotfix: CAPTCHA reste 100% manuel).
         agentLog("info", "Page de connexion detectee pendant la reprise: nouvelle tentative de connexion automatique (identifiants en memoire, jamais journalises).");
         await fillLoginForm(page, runtimeCredentialsRef.login, runtimeCredentialsRef.password, agentLog).catch(() => false);
-        return waitForReadyAppointment(WORKFLOW_STEP_SETTLE_MS);
+        return { canContinue: true };
 
       case "cloudflare":
-        // Section 6/8: ne jamais contourner Cloudflare/un captcha - aucune
-        // action automatique ici. La reprise automatique se fait naturellement
-        // a la PROCHAINE tentative (10s/10s/10s/5min) si le blocage a disparu.
+        // Section 6/8/10: ne jamais contourner Cloudflare/un captcha - aucune
+        // action automatique ici, aucune tentative numerotee consommee pour
+        // ce seul constat au niveau interne. La reprise se fait naturellement
+        // a la PROCHAINE tentative externe (waitOutHumanValidationBeforeAttempt
+        // ci-dessous, inchange) si le blocage a disparu.
         agentLog("warn", "Blocage Cloudflare/validation humaine detecte pendant la reprise: aucune action automatique, attente d'une resolution (humaine ou naturelle).");
-        return null;
+        return { canContinue: false };
 
       case "unknown":
       default:
-        // CORRECTIF CIBLE (refresh temporel 20 min, CAS D): Section 4.H
-        // interdisait tout CLIC au hasard sur un etat non reconnu - toujours
-        // vrai ici (aucun clic tente sur la page inconnue elle-meme). Mais une
-        // navigation vers targetUrl, DEJA connu/fourni au monitoring, n'est
-        // pas un clic au hasard: on tente donc desormais UNE reprise bornee
-        // vers targetUrl (meme mecanisme, meme plafond que logged-out-landing)
-        // plutot que de ne rien faire - jamais une boucle separee/infinie
-        // (bornee par le meme WORKFLOW_RECOVERY_FINAL_ATTEMPT que tout le
-        // reste de ce recovery).
+        // Section 4.H/8 (correctif precedent): interdit tout CLIC au hasard
+        // sur un etat non reconnu - toujours vrai ici (aucun clic tente sur
+        // la page inconnue elle-meme). Mais une navigation vers targetUrl,
+        // DEJA connu/fourni au monitoring, n'est pas un clic au hasard.
         agentLog("warn", `Etat de page non reconnu pendant la reprise (${maskUrlForLog(page.url())}): tentative bornee de retour vers targetUrl.`);
-        return attemptReturnToTargetUrl(page, "Etat de page non reconnu (unknown) detecte pendant la reprise");
+        return { canContinue: await navigateToRecoveryTargetUrl(page, "Etat de page non reconnu (unknown) detecte pendant la reprise") };
     }
+  };
+
+  // BUG CIBLE 0.2.4 (recovery multi-etapes, section 6): remplace l'ancienne
+  // attente qui ne verifiait QUE la destination finale
+  // (waitForReadyAppointment: "max 8s" mais en pratique "toujours 8s si pas
+  // pret") par un sondage rapide qui detecte AUSSI une progression vers un
+  // etat reconnu DIFFERENT, pas seulement l'arrivee finale sur
+  // appointment-booking - "max WORKFLOW_STEP_SETTLE_MS" ne signifie jamais
+  // "toujours dormir WORKFLOW_STEP_SETTLE_MS". Une transition vers
+  // "cloudflare" est une progression comme une autre au sens de cette
+  // fonction (etat reconnu different): c'est performRecoveryStateAction
+  // ci-dessus qui l'arrete ensuite immediatement (canContinue=false), sans
+  // jamais consommer de tentative supplementaire ni rien contourner.
+  const RECOVERY_STEP_POLL_INTERVAL_MS = 500;
+
+  const waitForProgressOrReady = async (
+    page: Page,
+    previousState: RecoveryState,
+    timeoutMs: number
+  ): Promise<{ kind: "ready"; page: Page } | { kind: "progressed"; state: RecoveryState } | { kind: "no-change" }> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal.aborted || page.isClosed()) {
+        return { kind: "no-change" };
+      }
+
+      const ready = await recoverCurrentPage();
+      if (ready) {
+        return { kind: "ready", page: ready };
+      }
+
+      const currentState = await classifyRecoveryState(page);
+      if (currentState !== previousState && currentState !== "unknown") {
+        return { kind: "progressed", state: currentState };
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, RECOVERY_STEP_POLL_INTERVAL_MS));
+    }
+    return { kind: "no-change" };
+  };
+
+  // BUG CIBLE 0.2.4 (recovery multi-etapes, section 3/5): UNE tentative
+  // externe numerotee enchaine desormais toutes les transitions reconnues
+  // qu'elle rencontre (section 5.A - jamais de retry/attente externe pour
+  // une simple progression de workflow), et ne retourne null (= echec REEL
+  // de cette tentative, consomme un retry externe existant, inchange) QUE
+  // si aucune progression n'a ete observee: action technique en echec, page
+  // fermee, etat inchange, "unknown" qui reste "unknown", Cloudflare/captcha
+  // detecte, ou limite de transitions internes atteinte sans jamais
+  // atteindre la page de rendez-vous (jamais une boucle infinie).
+  const recoverWorkflowOnce = async (attempt: number, reason?: string): Promise<Page | null> => {
+    const readyAtStart = await recoverCurrentPage();
+    if (readyAtStart) {
+      return readyAtStart;
+    }
+
+    const initialPage = pickWorkflowPage();
+    if (!initialPage || initialPage.isClosed()) {
+      return null;
+    }
+
+    const page = initialPage;
+    let state = await classifyRecoveryState(page);
+
+    for (let step = 1; step <= MAX_INTERNAL_RECOVERY_TRANSITIONS; step += 1) {
+      agentLog(
+        "info",
+        `Reprise workflow ${attempt}/${WORKFLOW_RECOVERY_FINAL_ATTEMPT}${reason ? " apres page inattendue" : ""} `
+        + `(transition interne ${step}/${MAX_INTERNAL_RECOVERY_TRANSITIONS}): etat detecte = ${state} (${maskUrlForLog(page.url())}).`
+      );
+
+      const actionOutcome = await performRecoveryStateAction(state, page);
+      if (!actionOutcome.canContinue) {
+        return null;
+      }
+
+      const stepOutcome = await waitForProgressOrReady(page, state, WORKFLOW_STEP_SETTLE_MS);
+      if (stepOutcome.kind === "ready") {
+        return stepOutcome.page;
+      }
+      if (stepOutcome.kind === "progressed") {
+        if (stepOutcome.state !== "cloudflare") {
+          agentLog("success", `Recovery progression: ${state} -> ${stepOutcome.state}.`);
+        }
+        state = stepOutcome.state;
+        continue;
+      }
+
+      agentLog("warn", `Recovery sans progression: etat toujours ${state}.`);
+      return null;
+    }
+
+    agentLog("warn", `Limite de ${MAX_INTERNAL_RECOVERY_TRANSITIONS} transitions internes atteinte sans atteindre la page de rendez-vous pendant cette tentative.`);
+    return null;
   };
 
   const resolvedRetryIntervalMs = params.workflowRecoveryRetryIntervalMs ?? WORKFLOW_RECOVERY_RETRY_INTERVAL_MS;
