@@ -27,7 +27,7 @@ const stripTechnicalNoise = (message: string): string => message
   .split("Call log:")[0]
   .trim();
 
-type NotificationCategory = "appointment-detected" | "appointment-reserved" | "human-blocked" | "workflow-recovery-failed";
+type NotificationCategory = "appointment-detected" | "appointment-reserved" | "human-blocked" | "workflow-recovery-failed" | "login-captcha-stuck";
 
 const normalizeMessage = (message: string): string => message
   .normalize("NFD")
@@ -35,7 +35,10 @@ const normalizeMessage = (message: string): string => message
   .replace(/[’']/g, "'")
   .toLowerCase();
 
-const classifyNotification = (message: string): NotificationCategory | null => {
+// Exportee UNIQUEMENT pour etre testee directement (meme precedent que
+// isAllowedAppointmentBookingRedirect, src/shared/loginFlow.ts) - jamais
+// utilisee ailleurs dans le code applicatif que ce module.
+export const classifyNotification = (message: string): NotificationCategory | null => {
   const text = normalizeMessage(message);
 
   if (text.trim() === "alerte_utilisateur") {
@@ -62,6 +65,21 @@ const classifyNotification = (message: string): NotificationCategory | null => {
   // (DEDUPE_MS) pour ne jamais spammer plusieurs emails pour le meme episode.
   if (text.includes("workflow_recovery_failed")) {
     return "workflow-recovery-failed";
+  }
+
+  // CORRECTIF CIBLE (login/captcha bloque trop longtemps apres recovery):
+  // message reel construit par agentGateway.ts pour ce statut ("[Agent]
+  // Statut du bot: WAITING_FOR_USER {"reason":"LOGIN_CAPTCHA_STUCK"}").
+  // Verifiee AVANT la liste generique ci-dessous (qui matcherait sinon sur
+  // "captcha" et classerait a tort en "human-blocked"): meme raisonnement
+  // que workflow_recovery_failed juste au-dessus - la strategie bornee (2x3
+  // min + reload unique) a deja ete integralement consommee cote agent
+  // avant l'emission de ce statut, donc AUCUNE grace HUMAN_BLOCK_GRACE_MS
+  // supplementaire n'est due ici (sinon: 3+3 min deja attendues + encore 4
+  // min de grace email, exactement ce que ce correctif interdit). Reste
+  // soumise au dedoublonnage normal (DEDUPE_MS) comme toute notification.
+  if (text.includes("login_captcha_stuck")) {
+    return "login-captcha-stuck";
   }
 
   if (
@@ -107,6 +125,10 @@ const notificationSubject = (category: NotificationCategory): string => {
     return "[RendezBot] Recuperation automatique impossible - Intervention requise";
   }
 
+  if (category === "login-captcha-stuck") {
+    return "[RendezBot] CAPTCHA en attente - Intervention requise";
+  }
+
   return "[RendezBot] Intervention humaine requise";
 };
 
@@ -132,6 +154,10 @@ const notificationTitle = (category: NotificationCategory, botName?: string): st
     return `Recuperation automatique impossible${suffix}`;
   }
 
+  if (category === "login-captcha-stuck") {
+    return `CAPTCHA en attente - Intervention requise${suffix}`;
+  }
+
   return `Action requise${suffix}`;
 };
 
@@ -146,6 +172,10 @@ const notificationMessage = (category: NotificationCategory, message: string, bo
 
   if (category === "workflow-recovery-failed") {
     return `Le bot "${botName}" n'a pas pu se retablir automatiquement apres une erreur TLS (refresh puis recuperation complete du parcours epuises). Le navigateur reste ouvert: intervenez manuellement puis validez pour reprendre.`;
+  }
+
+  if (category === "login-captcha-stuck") {
+    return `Le bot "${botName}" est toujours bloque sur la validation CAPTCHA de la page de connexion apres une tentative automatique de recuperation. Ouvrez le navigateur du bot, terminez la validation, puis laissez RendezBot reprendre le workflow.`;
   }
 
   if (category === "appointment-detected") {

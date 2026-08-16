@@ -67,6 +67,18 @@ const LOGGED_OUT_LANDING_GOTO_TIMEOUT_MS = 20_000;
 // agence), mais n'est plus consulte comme declencheur ici.
 const AGENT_CONTROL_REFRESH_INTERVAL_MS = 20 * 60 * 1000;
 
+// CORRECTIF CIBLE (login/captcha bloque trop longtemps apres recovery):
+// strategie bornee et claire, jamais une seule attente de 15 min (ancien
+// comportement de waitForRecaptchaResolution, src/shared/loginFlow.ts).
+// Premiere fenetre d'attente humaine sur la page login/auth rencontree
+// pendant le recovery - au-dela, UNE SEULE tentative de recuperation simple
+// (reload de la meme page, jamais un goto arbitraire) avant une seconde
+// fenetre identique. Aucun contournement/solver CAPTCHA: seule la duree de
+// l'attente automatique change, jamais la resolution elle-meme (toujours
+// humaine, cf. waitForRecaptchaResolution).
+const LOGIN_CAPTCHA_FIRST_WAIT_MS = 3 * 60 * 1000;
+const LOGIN_CAPTCHA_SECOND_WAIT_MS = 3 * 60 * 1000;
+
 export type MonitoringRuntimeStatus = {
   rateLimited: boolean;
   lastSlotDetectedAt: string | null;
@@ -122,6 +134,12 @@ export type StartMonitoringParams = {
   // AGENT_CONTROL_REFRESH_INTERVAL_MS ci-dessus) - jamais d'attente reelle de
   // 20 minutes dans les tests.
   controlRefreshIntervalMs?: number;
+  // CORRECTIF CIBLE (login/captcha bloque trop longtemps apres recovery):
+  // overrides TEST UNIQUEMENT (jamais en production reelle, retombent alors
+  // sur LOGIN_CAPTCHA_FIRST_WAIT_MS/LOGIN_CAPTCHA_SECOND_WAIT_MS ci-dessus) -
+  // jamais 2x3 minutes d'attente reelle dans les tests.
+  loginCaptchaFirstWaitMs?: number;
+  loginCaptchaSecondWaitMs?: number;
 };
 
 export type MonitoringRuntimeHandle = {
@@ -151,10 +169,18 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
   // d'emettre WORKFLOW_RECOVERY_FAILED par-dessus une notification humaine
   // deja emise pour le meme episode.
   let humanValidationTimeoutEmitted = false;
+  // CORRECTIF CIBLE (login/captcha bloque trop longtemps apres recovery):
+  // meme principe que humanValidationTimeoutEmitted ci-dessus - la strategie
+  // bornee (2x3 min + reload unique) a deja ete integralement consommee
+  // quand ce flag passe a true, jamais une notification WORKFLOW_RECOVERY_FAILED
+  // par-dessus (deja alertable directement, aucune grace supplementaire due).
+  let loginCaptchaStuckEmitted = false;
   // Reference locale UNIQUE a ce credential (cf. RuntimeCredentials
   // ci-dessus) - explicitement videe dans le .finally() de la boucle, jamais
   // conservee au-dela de la duree de vie de cette surveillance.
   let runtimeCredentialsRef = params.runtimeCredentials;
+  const resolvedLoginCaptchaFirstWaitMs = params.loginCaptchaFirstWaitMs ?? LOGIN_CAPTCHA_FIRST_WAIT_MS;
+  const resolvedLoginCaptchaSecondWaitMs = params.loginCaptchaSecondWaitMs ?? LOGIN_CAPTCHA_SECOND_WAIT_MS;
 
   const clearRateLimitTimer = (): void => {
     if (rateLimitResumeTimer) {
@@ -329,18 +355,99 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
         await clickSeConnecter(page, agentLog).catch(() => false);
         return { canContinue: true };
 
-      case "auth":
+      case "auth": {
         if (!runtimeCredentialsRef) {
           agentLog("warn", "Page de connexion detectee pendant la reprise, mais aucun identifiant en memoire pour cette session: reconnexion automatique impossible.");
           return { canContinue: false };
         }
-        // fillLoginForm() attend deja, sans jamais la contourner, une
-        // resolution CAPTCHA manuelle si presente (waitForRecaptchaResolution,
-        // jusqu'a 15 min) - reutilise tel quel, aucune nouvelle logique
-        // captcha necessaire ici (section 6 du hotfix: CAPTCHA reste 100% manuel).
+        // CORRECTIF CIBLE (login/captcha bloque trop longtemps apres
+        // recovery): fillLoginForm() n'attend plus qu'une seule fenetre
+        // bornee (jusqu'a resolvedLoginCaptchaFirstWaitMs, jamais 15 min) et
+        // ne soumet JAMAIS le formulaire si le captcha reste non resolu -
+        // reutilise tel quel (aucune nouvelle logique de detection captcha),
+        // uniquement orchestre ici pour la strategie en 2 fenetres + 1 reload
+        // (CAPTCHA reste 100% manuel, section 6 du hotfix inchangee).
         agentLog("info", "Page de connexion detectee pendant la reprise: nouvelle tentative de connexion automatique (identifiants en memoire, jamais journalises).");
-        await fillLoginForm(page, runtimeCredentialsRef.login, runtimeCredentialsRef.password, agentLog).catch(() => false);
-        return { canContinue: true };
+        const firstAttempt = await fillLoginForm(page, runtimeCredentialsRef.login, runtimeCredentialsRef.password, agentLog, {
+          signal,
+          maxCaptchaWaitMs: resolvedLoginCaptchaFirstWaitMs
+        }).catch(() => ({ submitted: false, captchaOutcome: "not-reached" as const }));
+
+        if (firstAttempt.captchaOutcome === "aborted") {
+          return { canContinue: false };
+        }
+        if (firstAttempt.captchaOutcome !== "timed-out") {
+          // Soumis, page deja changee pendant l'attente, ou echec non lie au
+          // captcha (champ introuvable...): comportement normal existant,
+          // la reclassification standard (waitForProgressOrReady) prend
+          // le relais - jamais de reload ici.
+          return { canContinue: true };
+        }
+
+        // Premiere fenetre (jusqu'a resolvedLoginCaptchaFirstWaitMs) epuisee,
+        // captcha toujours bloquant - UNE SEULE tentative de recuperation
+        // simple: reload de la MEME page login/auth (jamais un goto vers une
+        // URL arbitraire, jamais une boucle de reload).
+        agentLog(
+          "warn",
+          `Captcha toujours present apres ${Math.round(resolvedLoginCaptchaFirstWaitMs / 1000)}s. `
+          + "Refresh unique de la page de connexion avant seconde attente."
+        );
+        if (signal.aborted) {
+          return { canContinue: false };
+        }
+        try {
+          await page.reload({ waitUntil: "domcontentloaded", timeout: LOGGED_OUT_LANDING_GOTO_TIMEOUT_MS });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          agentLog("warn", `Reload de la page de connexion en echec technique: ${message}. Reclassification malgre tout.`);
+        }
+
+        if (page.isClosed() || signal.aborted) {
+          return { canContinue: false };
+        }
+
+        const stateAfterReload = await classifyRecoveryState(page);
+        if (stateAfterReload !== "auth") {
+          // CAS A: le workflow a progresse (ou un autre etat reconnu/inconnu
+          // est atteint) - reprend le recovery normal existant via la
+          // reclassification standard, jamais une logique dupliquee ici.
+          agentLog("info", `Apres reload de la page de connexion: nouvel etat detecte = ${stateAfterReload}.`);
+          return { canContinue: true };
+        }
+
+        // CAS B/C: toujours sur login/auth - le formulaire doit etre rempli
+        // a nouveau (page rechargee, champs vides), puis seconde fenetre
+        // d'attente du captcha (memes helpers, jamais une soumission tant
+        // qu'il reste non resolu).
+        const secondAttempt = await fillLoginForm(page, runtimeCredentialsRef.login, runtimeCredentialsRef.password, agentLog, {
+          signal,
+          maxCaptchaWaitMs: resolvedLoginCaptchaSecondWaitMs
+        }).catch(() => ({ submitted: false, captchaOutcome: "not-reached" as const }));
+
+        if (secondAttempt.captchaOutcome === "aborted") {
+          return { canContinue: false };
+        }
+        if (secondAttempt.captchaOutcome !== "timed-out") {
+          return { canContinue: true };
+        }
+
+        // Deux fenetres de 3 min + un reload deja consommes: le captcha
+        // reste reellement bloquant - etat FINAL pour cet episode, jamais un
+        // troisieme essai automatique (Chrome reste ouvert, intervention
+        // humaine requise). Emis directement ici (meme pattern que
+        // waitOutHumanValidationBeforeAttempt/HUMAN_VALIDATION_TIMEOUT
+        // ci-dessous): l'attente a deja ete integralement consommee, jamais
+        // une grace supplementaire avant cette notification.
+        agentLog(
+          "error",
+          `Captcha toujours present apres la seconde attente de ${Math.round(resolvedLoginCaptchaSecondWaitMs / 1000)}s. `
+          + "Intervention utilisateur requise (LOGIN_CAPTCHA_STUCK)."
+        );
+        loginCaptchaStuckEmitted = true;
+        reporter.botStatus(botId, commandId, WAITING_FOR_USER_STATUS, { reason: "LOGIN_CAPTCHA_STUCK" });
+        return { canContinue: false };
+      }
 
       case "cloudflare":
         // Section 6/8/10: ne jamais contourner Cloudflare/un captcha - aucune
@@ -540,6 +647,14 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
       if (recovered) {
         return recovered;
       }
+      if (loginCaptchaStuckEmitted) {
+        // CORRECTIF CIBLE (login/captcha bloque trop longtemps apres
+        // recovery): la strategie bornee (2x3 min + reload unique) a deja
+        // ete integralement consommee et notifiee (WAITING_FOR_USER,
+        // LOGIN_CAPTCHA_STUCK) - jamais un nouvel essai numerote qui
+        // relancerait la meme attente depuis le debut.
+        return null;
+      }
 
       if (attempt < WORKFLOW_RECOVERY_ATTEMPTS_BEFORE_LONG_WAIT) {
         await new Promise((resolve) => setTimeout(resolve, resolvedRetryIntervalMs));
@@ -629,11 +744,12 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
   // d'URL/detail potentiellement sensible transmis au serveur, uniquement ce
   // code stable.
   const onWorkflowRecoveryFailed = (): void => {
-    if (humanValidationTimeoutEmitted) {
-      // Deja notifie ci-dessus avec la raison specifique HUMAN_VALIDATION_TIMEOUT:
-      // WORKFLOW_RECOVERY_FAILED reste reserve aux vraies tentatives
-      // automatiques ayant echoue APRES disparition/absence de blocage humain
-      // - jamais emis par-dessus une notification humaine deja envoyee.
+    if (humanValidationTimeoutEmitted || loginCaptchaStuckEmitted) {
+      // Deja notifie ci-dessus avec une raison specifique
+      // (HUMAN_VALIDATION_TIMEOUT ou LOGIN_CAPTCHA_STUCK): WORKFLOW_RECOVERY_FAILED
+      // reste reserve aux vraies tentatives automatiques ayant echoue en
+      // dehors de ces cas deja notifies - jamais emis par-dessus une
+      // notification specifique deja envoyee pour le meme episode.
       return;
     }
     workflowRecoveryFailedEmitted = true;
@@ -680,10 +796,10 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
         return;
       }
 
-      if (workflowRecoveryFailedEmitted || humanValidationTimeoutEmitted) {
-        // Deja notifie explicitement ci-dessus (WORKFLOW_RECOVERY_FAILED ou
-        // HUMAN_VALIDATION_TIMEOUT): ne jamais emettre PAGE_CLOSED par-dessus
-        // (section 10 - une seule alerte par episode).
+      if (workflowRecoveryFailedEmitted || humanValidationTimeoutEmitted || loginCaptchaStuckEmitted) {
+        // Deja notifie explicitement ci-dessus (WORKFLOW_RECOVERY_FAILED,
+        // HUMAN_VALIDATION_TIMEOUT ou LOGIN_CAPTCHA_STUCK): ne jamais emettre
+        // PAGE_CLOSED par-dessus (section 10 - une seule alerte par episode).
         return;
       }
 

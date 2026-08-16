@@ -553,6 +553,7 @@ export class BotSession {
     }
 
     return fillLoginForm(this.page, this.credentials.login, this.credentials.password, (level, message) => this.log(level, message))
+      .then((result) => result.submitted)
       .catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
         this.log("warn", `Remplissage automatique du formulaire de connexion impossible: ${message}`);

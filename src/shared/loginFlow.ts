@@ -189,7 +189,13 @@ const fillFirstVisible = async (page: Page, selector: string, value: string, tim
 
 const RECAPTCHA_POLL_INTERVAL_MS = 2_000;
 const RECAPTCHA_HEARTBEAT_MS = 30_000;
-const RECAPTCHA_MAX_WAIT_MS = 15 * 60 * 1000;
+// CORRECTIF CIBLE (login/captcha bloque trop longtemps apres recovery): reduit
+// de 15 min a 3 min - une seule fenetre d'attente ne doit plus jamais laisser
+// le bot silencieusement bloque aussi longtemps. La strategie bornee complete
+// (fenetre + reload unique + seconde fenetre + WAITING_FOR_USER) est
+// orchestree par l'appelant (agentMonitoringRuntime.ts) via maxWaitMs
+// ci-dessous - cette constante ne reste que le defaut de CETTE fonction.
+const RECAPTCHA_MAX_WAIT_MS = 3 * 60 * 1000;
 
 const isRecaptchaSolved = (page: Page): Promise<boolean> => page.evaluate(() => {
   const field = document.querySelector('textarea[name="g-recaptcha-response"]') as HTMLTextAreaElement | null;
@@ -204,27 +210,65 @@ const isRecaptchaPresent = (page: Page): Promise<boolean> => page.locator(
   'iframe[src*="recaptcha"]:not([src*="size=invisible"])'
 ).first().count().then((count) => count > 0).catch(() => false);
 
+// CORRECTIF CIBLE (login/captcha bloque trop longtemps apres recovery):
+// resultat EXPLICITE de l'attente - jamais un simple retour void qui laissait
+// l'appelant traiter un timeout comme une fin normale (defaut reel confirme:
+// fillLoginForm() soumettait quand meme le formulaire apres l'ancien timeout
+// de 15 min, alors que le captcha n'avait jamais ete confirme resolu).
+// "page-changed": la page a quitte login/auth pendant l'attente (progression
+// reelle du workflow, ex. session retablie autrement) - jamais a traiter
+// comme un captcha resolu, mais jamais non plus comme un blocage.
+export type RecaptchaWaitOutcome = "resolved" | "timed-out" | "aborted" | "page-changed";
+
+export type WaitForRecaptchaOptions = {
+  signal?: AbortSignal;
+  // Override TEST UNIQUEMENT (jamais en production sans configuration
+  // explicite) - defaut RECAPTCHA_MAX_WAIT_MS sinon.
+  maxWaitMs?: number;
+};
+
 // Un autre bot (ou un humain) resout le reCAPTCHA pendant ce temps. On ne clique
 // 'Se connecter' qu'une fois le jeton g-recaptcha-response rempli par Google — c'est
 // le signal fiable, verifiable cote serveur, que la resolution est bonne. Pas de clic
-// a l'aveugle avant ca, et pas d'abandon premature: on poll longtemps (15 min).
-const waitForRecaptchaResolution = async (page: Page, log: LogFn): Promise<void> => {
+// a l'aveugle avant ca, et pas d'abandon premature - mais desormais borne
+// (RECAPTCHA_MAX_WAIT_MS par defaut, jamais 15 min): au-dela, l'appelant
+// decide de la suite (reload unique puis seconde fenetre, cf.
+// agentMonitoringRuntime.ts), jamais cette fonction elle-meme qui ne fait
+// jamais plus d'une fenetre d'attente.
+export const waitForRecaptchaResolution = async (
+  page: Page,
+  log: LogFn,
+  options?: WaitForRecaptchaOptions
+): Promise<RecaptchaWaitOutcome> => {
   if (!(await isRecaptchaPresent(page)) || (await isRecaptchaSolved(page))) {
-    return;
+    return "resolved";
   }
 
-  log("info", "Captcha detecte sur la page de connexion. Attente de sa resolution avant de cliquer 'Se connecter'.");
-  const deadline = Date.now() + RECAPTCHA_MAX_WAIT_MS;
-  let lastHeartbeat = Date.now();
+  const maxWaitMs = options?.maxWaitMs ?? RECAPTCHA_MAX_WAIT_MS;
+  const signal = options?.signal;
+  const startedAt = Date.now();
+  const deadline = startedAt + maxWaitMs;
+  let lastHeartbeat = startedAt;
+
+  log("info", `Captcha bloquant detecte sur la page de connexion. Attente de resolution humaine (jusqu'a ${Math.round(maxWaitMs / 1000)}s).`);
 
   while (Date.now() < deadline) {
-    if (page.isClosed()) {
-      return;
+    if (signal?.aborted || page.isClosed()) {
+      return "aborted";
+    }
+
+    // Pendant l'attente, si la page a reellement quitte login/auth (ex.
+    // progression du workflow constatee autrement), on arrete immediatement
+    // l'attente captcha - jamais un blocage sur une page qui n'est plus la
+    // notre a surveiller (reutilise isAuthPage, deja le meme signal que
+    // fillLoginForm/hasVisibleLoginForm ci-dessous).
+    if (!(await isAuthPage(page))) {
+      return "page-changed";
     }
 
     if (await isRecaptchaSolved(page)) {
-      log("success", "Captcha resolu. Poursuite de la connexion.");
-      return;
+      log("success", `Captcha resolu apres ${Math.round((Date.now() - startedAt) / 1000)}s. Reprise de la connexion.`);
+      return "resolved";
     }
 
     if (Date.now() - lastHeartbeat > RECAPTCHA_HEARTBEAT_MS) {
@@ -235,7 +279,8 @@ const waitForRecaptchaResolution = async (page: Page, log: LogFn): Promise<void>
     await new Promise((resolve) => setTimeout(resolve, RECAPTCHA_POLL_INTERVAL_MS));
   }
 
-  log("warn", "Captcha non resolu apres 15 minutes d'attente. Connexion manuelle requise.");
+  log("warn", `Captcha toujours present apres ${Math.round(maxWaitMs / 1000)}s.`);
+  return "timed-out";
 };
 
 const cloudflareQueuePattern = /file d.?attente/i;
@@ -279,11 +324,35 @@ const waitForCloudflareQueue = async (page: Page, log: LogFn): Promise<void> => 
   log("warn", "File d'attente Cloudflare toujours active apres 15 minutes. Connexion manuelle requise.");
 };
 
-export const fillLoginForm = async (page: Page, login: string, password: string, log: LogFn): Promise<boolean> => {
+// CORRECTIF CIBLE (login/captcha bloque trop longtemps apres recovery):
+// resultat EXPLICITE (jamais un simple boolean qui masquait POURQUOI le
+// formulaire n'a pas ete soumis) - "not-reached" couvre tout echec AVANT
+// meme la verification du captcha (champ introuvable, Cloudflare, page
+// fermee): distinct de "timed-out" (captcha reellement bloquant, non
+// resolu), seul cas que l'appelant (agentMonitoringRuntime.ts) doit traiter
+// specifiquement (reload unique + seconde fenetre).
+export type FillLoginFormResult = {
+  submitted: boolean;
+  captchaOutcome: RecaptchaWaitOutcome | "not-reached";
+};
+
+export type FillLoginFormOptions = {
+  signal?: AbortSignal;
+  // Override TEST UNIQUEMENT, transmis tel quel a waitForRecaptchaResolution.
+  maxCaptchaWaitMs?: number;
+};
+
+export const fillLoginForm = async (
+  page: Page,
+  login: string,
+  password: string,
+  log: LogFn,
+  options?: FillLoginFormOptions
+): Promise<FillLoginFormResult> => {
   await waitForCloudflareQueue(page, log);
 
   if (page.isClosed()) {
-    return false;
+    return { submitted: false, captchaOutcome: "not-reached" };
   }
 
   const usernameFilled = await fillFirstVisible(page, "#username", login, 5_000).catch(() => false)
@@ -291,7 +360,7 @@ export const fillLoginForm = async (page: Page, login: string, password: string,
 
   if (!usernameFilled) {
     log("warn", "Champ identifiant introuvable sur la page de connexion. Connexion manuelle requise.");
-    return false;
+    return { submitted: false, captchaOutcome: "not-reached" };
   }
 
   const passwordFilled = await fillFirstVisible(page, "#password", password, 3_000).catch(() => false)
@@ -299,13 +368,26 @@ export const fillLoginForm = async (page: Page, login: string, password: string,
 
   if (!passwordFilled) {
     log("warn", "Champ mot de passe introuvable sur la page de connexion. Connexion manuelle requise.");
-    return false;
+    return { submitted: false, captchaOutcome: "not-reached" };
   }
 
-  await waitForRecaptchaResolution(page, log);
+  const captchaOutcome = await waitForRecaptchaResolution(page, log, {
+    signal: options?.signal,
+    maxWaitMs: options?.maxCaptchaWaitMs
+  });
 
   if (page.isClosed()) {
-    return false;
+    return { submitted: false, captchaOutcome };
+  }
+
+  // REGLE OBLIGATOIRE (correctif cible): jamais de clic submit tant que le
+  // captcha bloquant n'est pas confirme resolu - un timeout/abandon/
+  // changement de page N'EST PAS une fin normale equivalente a "resolu".
+  // Avant ce correctif, un simple timeout ici etait traite comme si la
+  // fonction avait normalement termine, et le clic submit partait quand
+  // meme (defaut reel confirme: nouveau CAPTCHA immediatement apres).
+  if (captchaOutcome !== "resolved") {
+    return { submitted: false, captchaOutcome };
   }
 
   const submitButton = page.locator("#btn-login:visible, #kc-login:visible")
@@ -315,7 +397,7 @@ export const fillLoginForm = async (page: Page, login: string, password: string,
 
   if (await clickLocatorIfVisible(submitButton, 5_000).catch(() => false)) {
     log("success", "Formulaire de connexion rempli et soumis automatiquement.");
-    return true;
+    return { submitted: true, captchaOutcome };
   }
 
   // Repli robuste si le bouton n'est pas identifiable avec certitude: la touche
@@ -329,11 +411,11 @@ export const fillLoginForm = async (page: Page, login: string, password: string,
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     log("warn", `Soumission via Entree impossible: ${message}. Connexion manuelle requise.`);
-    return false;
+    return { submitted: false, captchaOutcome };
   }
 
   log("success", "Formulaire de connexion soumis via la touche Entree.");
-  return true;
+  return { submitted: true, captchaOutcome };
 };
 
 const selectTravelGroupTextPattern = /^s[ée]lectionner$/i;
