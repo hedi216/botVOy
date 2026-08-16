@@ -23,6 +23,7 @@ import {
   getCommandForAgent,
   getLatestCommandForBot,
   isValidBotStatus,
+  listAgentBotsForAgent,
   markAcknowledged,
   markCompleted,
   markFailedByAgent,
@@ -604,6 +605,34 @@ export const registerAgentNamespace = (
           updateAgentBotStatus(botId, status as BotStatusValue);
           touchedBotIds.add(botId);
           onBotLog(history.agencyId, botId, history.botName, "info", `Bot resynchronise apres reconnexion/redemarrage serveur (statut: ${status}).`);
+        }
+
+        // CORRECTIF CIBLE (bots fantomes apres reboot/coupure Agent):
+        // reconciliation INVERSE - la boucle ci-dessus ne traite que les bots
+        // PRESENTS dans l'inventaire recu (mise a jour/reconstruction/
+        // conflit). Un AgentBotRecord pas encore STOPPED mais appartenant
+        // EXACTEMENT a CET agentId (jamais un autre agent de la meme agence)
+        // et ABSENT de cet inventaire n'a plus de runtime reel: cet agent
+        // vient de fournir un inventaire FAISANT AUTORITE pour lui-meme (y
+        // compris un inventaire VIDE, qui est une information valide - "cet
+        // agent n'a actuellement aucun bot runtime" - jamais interprete comme
+        // une absence d'information). Reutilise updateAgentBotStatus() /
+        // touchedBotIds existants: meme mecanisme de diffusion que le reste
+        // de ce handler, jamais un nouveau STOP_BOT dispatche (rien ne reste
+        // a arreter cote agent, qui a deja perdu ce runtime).
+        const reportedBotIds = new Set(
+          rawBots
+            .filter((rawBot): rawBot is Record<string, unknown> => Boolean(rawBot) && typeof rawBot === "object")
+            .map((rawBot) => clampString(rawBot.botId, 100))
+            .filter((botId) => botId.length > 0)
+        );
+        for (const bot of listAgentBotsForAgent(agentId)) {
+          if (bot.botStatus === "STOPPED" || reportedBotIds.has(bot.botId)) {
+            continue;
+          }
+          updateAgentBotStatus(bot.botId, "STOPPED");
+          touchedBotIds.add(bot.botId);
+          logger.warn(`Reconciliation Agent ${agentId}: bot ${bot.botId} absent de l'inventaire runtime actuel -> STOPPED.`);
         }
 
         // Diffuse l'objet public a jour de chaque bot touche, pour que

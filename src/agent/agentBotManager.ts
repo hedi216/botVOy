@@ -326,7 +326,18 @@ export class AgentBotManager {
       // deja arrete (ou jamais connu de cette instance d'agent, ex. apres
       // redemarrage) ne doit jamais faire echouer l'utilisateur qui clique
       // "Arreter" une seconde fois. On complete directement, sans erreur.
+      //
+      // CORRECTIF CIBLE (convergence STOP_BOT / bots fantomes): ce chemin ne
+      // completait JUSQU'ICI que la COMMANDE (COMMAND_COMPLETED), sans jamais
+      // emettre le BOT_STATUS STOPPED correspondant - contrairement au chemin
+      // normal ci-dessous (stopHandle) qui emet toujours les deux. Cote
+      // serveur, AgentBotRecord.botStatus/active ne convergeaient donc jamais
+      // vers STOPPED/false pour ce cas precis (bouton "Arreter" restant
+      // affiche, bot reste compte comme actif). Meme ordre que stopHandle
+      // (botStatus AVANT completed): un STOP_BOT sur un bot deja absent doit
+      // converger EXACTEMENT comme un STOP_BOT reussi.
       this.log("warn", `STOP_BOT recu pour un botId inconnu de cet agent: ${botId} (traite comme deja arrete).`);
+      this.reporter.botStatus(botId, commandId, "STOPPED", { alreadyStopped: true });
       this.reporter.completed(commandId, { botId, status: "STOPPED", stopped: true, alreadyStopped: true });
       return;
     }

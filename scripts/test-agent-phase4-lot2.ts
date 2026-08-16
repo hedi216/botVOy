@@ -248,6 +248,11 @@ const runSuiteA = async (): Promise<void> => {
     await manager.stopBot({ commandId: "cmd-stop-unknown", botId: "bot-does-not-exist" });
     const unknownCompletion = findCompletion(events, "cmd-stop-unknown") as Record<string, unknown> | undefined;
     assert(unknownCompletion?.alreadyStopped === true, "STOP_BOT sur un botId inconnu est idempotent (COMPLETED, alreadyStopped=true), pas une erreur");
+    // CORRECTIF CIBLE (convergence STOP_BOT / bots fantomes): ce chemin doit
+    // aussi emettre BOT_STATUS STOPPED (jamais seulement COMMAND_COMPLETED) -
+    // sans cela, AgentBotRecord.botStatus/active ne convergent jamais cote
+    // serveur pour un STOP_BOT sur un bot deja absent localement.
+    assert(hasBotStatus(events, "bot-does-not-exist", "STOPPED"), "STOP_BOT idempotent emet aussi BOT_STATUS STOPPED (convergence serveur AgentBotRecord.active/botStatus)");
 
     // nettoyage: fermer bot-b aussi et verifier plus aucun orphelin
     await manager.stopBot({ commandId: "cmd-stop-b", botId: "bot-b" });

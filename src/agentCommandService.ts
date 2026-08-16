@@ -146,6 +146,14 @@ export const getAgentBot = (botId: string): AgentBotRecord | undefined => agentB
 export const listAgentBotsForAgency = (agencyId: number): AgentBotRecord[] =>
   [...agentBots.values()].filter((bot) => bot.agencyId === agencyId);
 
+// CORRECTIF CIBLE (bots fantomes apres reboot/coupure Agent): source pour la
+// reconciliation AGENT_RUNTIME_STATUS (agentGateway.ts) - tous les
+// AgentBotRecord actuellement rattaches a CET agentId precis, jamais une
+// agence entiere (un Agent ne doit jamais pouvoir, via son propre inventaire
+// runtime, affecter les bots d'un AUTRE agent de la meme agence).
+export const listAgentBotsForAgent = (agentId: number): AgentBotRecord[] =>
+  [...agentBots.values()].filter((bot) => bot.agentId === agentId);
+
 // HOTFIX CIBLE (compteur/quota bots actifs par agence): source UNIQUE pour
 // le compteur diffuse au frontend (evenement "maintenance") ET la
 // verification de quota avant START_BOT - jamais un second calcul
