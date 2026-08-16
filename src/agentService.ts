@@ -289,9 +289,16 @@ export const computeLiveStatus = (
   return "CONNECTED";
 };
 
+// CHANTIER CIBLE (suppression visuelle des Agents revoques): exclut
+// desormais les Agents archives (archived_at IS NOT NULL) - source UNIQUE
+// des listes normales (page Agents, selectAgentForCommand) et donc de tout
+// ce qui en depend (un Agent archive ne peut plus jamais etre propose/
+// selectionne pour une nouvelle commande, ni affiche). Ne filtre PAS
+// getAgentById() (utilise par l'authentification et l'historique, qui
+// doivent toujours pouvoir resoudre un ancien agentId).
 export const listAgentsForAgency = async (agencyId: number): Promise<DbAgent[]> => {
   const result = await pool.query<DbAgent>(
-    "SELECT * FROM agents WHERE agency_id = $1 ORDER BY id",
+    "SELECT * FROM agents WHERE agency_id = $1 AND archived_at IS NULL ORDER BY id",
     [agencyId]
   );
   return result.rows;
@@ -331,4 +338,52 @@ export const revokeAgent = async (agencyId: number, agentId: number): Promise<Db
   }
 
   return result.rows[0];
+};
+
+// CHANTIER CIBLE (suppression visuelle des Agents revoques): SOFT-DELETE
+// uniquement (archived_at), jamais un DELETE physique - agent_commands.agent_id
+// REFERENCES agents(id) ON DELETE CASCADE supprimerait sinon tout
+// l'historique de commandes de cet agent, ce que ce chantier doit
+// explicitement preserver. Un Agent DOIT deja etre status='revoked' avant
+// d'etre archivable (jamais un raccourci "archive == revoke implicite": les
+// deux actions ont des intentions distinctes, cf. route DELETE /api/agents/:id
+// dans server.ts qui verifie separement l'absence de bot encore actif).
+export type ArchiveAgentResult =
+  | { ok: true; agent: DbAgent }
+  | { ok: false; reason: "NOT_FOUND" }
+  | { ok: false; reason: "NOT_REVOKED" };
+
+export const archiveAgent = async (agencyId: number, agentId: number): Promise<ArchiveAgentResult> => {
+  // Idempotence (double-clic/requete rejouee): un Agent deja archive n'est
+  // jamais une erreur - meme convention que revokeAgent (deja idempotent en
+  // succes), jamais une exception SQL brute ni une restauration implicite.
+  const result = await pool.query<DbAgent>(
+    `UPDATE agents
+     SET archived_at = NOW(), updated_at = NOW()
+     WHERE id = $1 AND agency_id = $2 AND status = 'revoked' AND archived_at IS NULL
+     RETURNING *`,
+    [agentId, agencyId]
+  );
+
+  if (result.rows[0]) {
+    return { ok: true, agent: result.rows[0] };
+  }
+
+  // La clause WHERE ci-dessus n'a rien modifie: distingue "introuvable pour
+  // cette agence" (id/agencyId invalide) de "pas encore revoque" ou "deja
+  // archive" (idempotent) via une lecture separee - jamais de distinction
+  // entre "n'existe pas" et "appartient a une autre agence" (meme principe
+  // que renameAgent/revokeAgent, aucune enumeration d'agentId possible).
+  const existing = await pool.query<DbAgent>(
+    "SELECT * FROM agents WHERE id = $1 AND agency_id = $2",
+    [agentId, agencyId]
+  );
+  const agent = existing.rows[0];
+  if (!agent) {
+    return { ok: false, reason: "NOT_FOUND" };
+  }
+  if (agent.archived_at) {
+    return { ok: true, agent };
+  }
+  return { ok: false, reason: "NOT_REVOKED" };
 };

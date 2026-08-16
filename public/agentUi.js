@@ -450,6 +450,33 @@
     }
   };
 
+  // CHANTIER CIBLE (suppression visuelle des Agents revoques): "Supprimer"
+  // cote interface - le serveur archive (soft-delete), jamais un DELETE
+  // physique, mais ce detail d'implementation n'a pas besoin d'etre expose
+  // ici (l'utilisateur voit simplement la ligne disparaitre).
+  const handleDelete = async (agent) => {
+    const confirmed = window.confirm(
+      `Supprimer "${agent.name}" de la liste ?\n\n`
+      + "Cet ordinateur est deja revoque et ne pourra plus etre utilise avec cet appairage. "
+      + "L'historique RendezBot sera conserve."
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      const body = {};
+      const agencyId = currentAdminAgencyId();
+      if (agencyId) {
+        body.agencyId = agencyId;
+      }
+      await APP.requestJson(`/api/agents/${agent.agentId}`, { method: "DELETE", body: JSON.stringify(body) });
+      await CTX.refreshAgents();
+    } catch (error) {
+      window.alert(error.message);
+    }
+  };
+
   const renderAgentLocalPage = async () => {
     await populateAgencySelectForAdmin();
 
@@ -552,6 +579,15 @@
         revokeBtn.textContent = "Revoquer";
         revokeBtn.addEventListener("click", () => handleRevoke(agent));
         actions.append(revokeBtn);
+      }
+
+      if (isManager() && agent.status === "REVOKED") {
+        const deleteBtn = document.createElement("button");
+        deleteBtn.className = "outline danger-text";
+        deleteBtn.type = "button";
+        deleteBtn.textContent = "Supprimer";
+        deleteBtn.addEventListener("click", () => handleDelete(agent));
+        actions.append(deleteBtn);
       }
 
       row.append(actions);

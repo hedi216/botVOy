@@ -54,7 +54,7 @@ import { sendAppAlert } from "./appAlertService.js";
 import { loadAgentCommandConfig, loadAgentGatewayConfig, loadAgentReleaseConfig, loadPhase2FeatureFlags, resolveAgentTlsStartUrl } from "./config.js";
 import { getAgentReleaseMetadata, resolveAgentReleaseDownload } from "./agentReleaseService.js";
 import { requirePositiveInt, requireValidPort } from "./envValidation.js";
-import { createPairingCode, listAgentsForAgency, renameAgent, revokeAgent } from "./agentService.js";
+import { createPairingCode, getAgentById, listAgentsForAgency, renameAgent, revokeAgent } from "./agentService.js";
 import {
   AgentSnapshot,
   disconnectAgentSocket,
@@ -72,6 +72,7 @@ import {
   dispatchAgentCommand,
   failNonTerminalOnRevoke,
   generateBotId,
+  archiveAgentIfNoActiveBots,
   getAgentBot,
   getCommandForAgency,
   getLatestCommandForBot,
@@ -1000,6 +1001,50 @@ app.post("/api/agents/:id/revoke", requireAuth, requireAgencyManager, async (req
     emitAgentStatusToAuthorizedSockets(agencyId, snapshot);
   }
   res.json({ agent: snapshot });
+});
+
+// CHANTIER CIBLE (suppression visuelle des Agents revoques): "Supprimer"
+// cote interface = archivage (soft-delete) cote serveur - jamais un DELETE
+// physique (cascaderait sur agent_commands, cf. commentaire DbAgent.archived_at,
+// db.ts). Un Agent DOIT deja etre revoque: jamais un raccourci implicite
+// revoke+archive ici, ce sont deux intentions/actions utilisateur distinctes.
+app.delete("/api/agents/:id", requireAuth, requireAgencyManager, async (req: AuthenticatedRequest, res) => {
+  const agencyId = requireAgencyId(req, res);
+  if (agencyId === null) {
+    return;
+  }
+
+  const agentId = Number(req.params.id);
+
+  // Verifie l'appartenance AVANT toute autre chose (meme reponse 404 pour
+  // "n'existe pas" et "appartient a une autre agence", cf. revoke/rename):
+  // jamais reveler via un 409 "bot actif" qu'un agentId d'une AUTRE agence
+  // possede un runtime actif.
+  const agent = await getAgentById(agentId);
+  if (!agent || agent.agency_id !== agencyId) {
+    res.status(404).json({ error: "Agent introuvable." });
+    return;
+  }
+
+  // archiveAgentIfNoActiveBots() combine la verification defensive du
+  // registre AgentBotRecord (jamais masquer un Agent avec un runtime encore
+  // actif, meme si le revoke le garantit deja normalement) et l'archivage
+  // DB lui-meme - directement testable en process (agentCommandService.ts).
+  const result = await archiveAgentIfNoActiveBots(agencyId, agentId);
+  if (!result.ok) {
+    if (result.reason === "NOT_FOUND") {
+      res.status(404).json({ error: "Agent introuvable." });
+      return;
+    }
+    if (result.reason === "BOT_ACTIVE") {
+      res.status(409).json({ error: "Cet agent possede encore un bot actif: impossible de le supprimer." });
+      return;
+    }
+    res.status(409).json({ error: "L'agent doit etre revoque avant d'etre supprime." });
+    return;
+  }
+
+  res.json({ ok: true });
 });
 
 app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

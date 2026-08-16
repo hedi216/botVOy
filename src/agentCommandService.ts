@@ -3,6 +3,7 @@ import { Socket } from "socket.io";
 import { AgentCommandConfig } from "./config.js";
 import { AgentCommandStatus, AgentCommandType, DbAgentCommand, pool } from "./db.js";
 import { logger } from "./logger.js";
+import { archiveAgent, ArchiveAgentResult } from "./agentService.js";
 
 // Une erreur ici (DB, ou callback onChange fourni par l'appelant) ne doit
 // jamais devenir une rejection non geree: elle arreterait tout le process
@@ -204,6 +205,24 @@ export const stopAllBotsForAgent = (agentId: number): string[] => {
     touched.push(bot.botId);
   }
   return touched;
+};
+
+// CHANTIER CIBLE (suppression visuelle des Agents revoques): encapsule la
+// regle metier COMPLETE de la route DELETE /api/agents/:id (server.ts) dans
+// une fonction unique, directement testable EN PROCESS (sans HTTP/serveur
+// spawn) - meme principe deja etabli par deleteCommandForAgency ci-dessus
+// (combine deja verification DB + registre AgentBotRecord). Le revoke
+// garantit normalement deja bots STOPPED/active=false (chantier precedent),
+// mais cette verification reste defensive: un AgentBotRecord actif
+// anormalement present pour cet agentId bloque toujours l'archivage, jamais
+// masque un Agent qui possederait encore un runtime actif.
+export type ArchiveAgentSafetyResult = ArchiveAgentResult | { ok: false; reason: "BOT_ACTIVE" };
+
+export const archiveAgentIfNoActiveBots = async (agencyId: number, agentId: number): Promise<ArchiveAgentSafetyResult> => {
+  if (listAgentBotsForAgent(agentId).some((bot) => bot.active)) {
+    return { ok: false, reason: "BOT_ACTIVE" };
+  }
+  return archiveAgent(agencyId, agentId);
 };
 
 // -------- Lecture/ecriture DB (chaque mutation est ecrite pour etre

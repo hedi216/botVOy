@@ -133,6 +133,13 @@ export type DbAgent = {
   revoked_at: string | null;
   created_at: string;
   updated_at: string;
+  // CHANTIER CIBLE (suppression visuelle des Agents revoques): soft-delete
+  // - NULL par defaut (toutes les lignes existantes restent visibles comme
+  // aujourd'hui). Renseigne UNIQUEMENT depuis un Agent deja status='revoked'
+  // (cf. archiveAgent(), agentService.ts) - jamais un DELETE physique
+  // (agent_commands.agent_id REFERENCES agents(id) ON DELETE CASCADE
+  // supprimerait sinon tout l'historique de commandes de cet agent).
+  archived_at: string | null;
 };
 
 export type DbAgentPairingCode = {
@@ -416,6 +423,16 @@ export const ensureSchema = async (): Promise<void> => {
       ON agent_pairing_codes (expires_at)
       WHERE used_at IS NULL AND revoked_at IS NULL;
     CREATE INDEX IF NOT EXISTS agent_commands_agent_idx ON agent_commands (agent_id, status);
+  `);
+
+  // CHANTIER CIBLE (suppression visuelle des Agents revoques): idempotente
+  // comme toutes les migrations ci-dessus - toute ligne existante recoit
+  // implicitement archived_at=NULL (defaut d'une colonne nullable sans
+  // DEFAULT), donc reste visible exactement comme avant ce chantier tant
+  // qu'aucune suppression manuelle n'est demandee.
+  await pool.query(`
+    ALTER TABLE agents
+      ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
   `);
 
   // Migration non destructive pour les bases Phase 1 ou` agent_commands existait
