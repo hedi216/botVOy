@@ -1372,6 +1372,20 @@ const dispatchOwnedAgentCommand = async (
     return;
   }
 
+  // HOTFIX CIBLE (disponibilite des actions distantes): garde manquant
+  // aligne sur dispatchValidateBotCommand ci-dessous - un agent techniquement
+  // connecte mais pas encore synchronise (AGENT_RUNTIME_STATUS pas encore
+  // traite, cf. isAgentReadyForCommands) ne doit jamais recevoir de NOUVELLE
+  // commande. Le cas agent totalement deconnecte reste gere par le repli
+  // existant de dispatchAgentCommand (AGENT_DISCONNECTED, immediat) - ce
+  // garde ferme uniquement la fenetre "connecte mais pas pret" que STOP_BOT
+  // ignorait jusqu'ici.
+  if (getConnectedAgentSocket(bot.agentId) && !isAgentReadyForCommands(bot.agentId)) {
+    socket.emit("bot-status", { botId, status: "error", code: "AGENT_SYNCING" });
+    emitOwnedLog(socket, owner, makeEvent("error", "Agent connecte - synchronisation en cours. Reessayez dans un instant."));
+    return;
+  }
+
   const normalizedClientRequestId = typeof clientRequestId === "string" && clientRequestId.trim()
     ? clientRequestId.trim().slice(0, 100)
     : null;

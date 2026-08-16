@@ -961,6 +961,45 @@
     CANCELLED: "Annulee"
   };
 
+  // HOTFIX CIBLE (disponibilite des actions distantes): messages affiches a
+  // proximite des boutons desactives - jamais un remplacement du detail
+  // runtime existant (commandStatusMessage), uniquement une precision sur la
+  // disponibilite de l'ACTION elle-meme.
+  const AGENT_UNAVAILABLE_MESSAGE = {
+    OFFLINE: "Agent hors ligne - action disponible apres reconnexion.",
+    SYNCING: "Agent en cours de synchronisation.",
+    VERSION_INCOMPATIBLE: "Mise a jour de l'Agent requise.",
+    UNAVAILABLE: "Agent indisponible."
+  };
+
+  // HOTFIX CIBLE (disponibilite des actions distantes): determine si l'Agent
+  // PROPRIETAIRE de CE bot precis (command.agentId - jamais le premier agent
+  // connecte de l'agence, jamais CTX.getState().globalStatus qui n'est
+  // qu'un agregat) peut actuellement recevoir une NOUVELLE commande.
+  // Meme contrat que le garde backend (isAgentReadyForCommands,
+  // agentGateway.ts): CONNECTED seul ne suffit pas, readyForCommands doit
+  // aussi etre vrai (sinon l'agent est encore en synchronisation apres
+  // reconnexion). Fail closed: un agent absent du dernier etat connu, ou
+  // REVOKED, n'est jamais suppose actionnable.
+  const getOwningAgentAvailability = (command) => {
+    const agent = CTX.getState().agents.find((candidate) => candidate.agentId === command.agentId);
+    if (!agent || agent.status === "REVOKED") {
+      return { actionable: false, reason: "UNAVAILABLE" };
+    }
+    if (agent.status === "OFFLINE") {
+      return { actionable: false, reason: "OFFLINE" };
+    }
+    if (agent.status === "VERSION_INCOMPATIBLE") {
+      return { actionable: false, reason: "VERSION_INCOMPATIBLE" };
+    }
+    // Seule valeur restante de AgentLiveStatus ici: "CONNECTED". readyForCommands
+    // distingue une synchronisation encore en cours d'un agent reellement pret.
+    if (!agent.readyForCommands) {
+      return { actionable: false, reason: "SYNCING" };
+    }
+    return { actionable: true, reason: null };
+  };
+
   const renderAgentCommandsPanel = () => {
     if (!agentEls.commandsPanel) {
       return;
@@ -995,11 +1034,22 @@
 
       const actions = document.createElement("td");
       actions.className = "action-cell";
+
+      // HOTFIX CIBLE (disponibilite des actions distantes): calcule UNE fois
+      // par ligne - Valider et Arreter partagent la meme disponibilite,
+      // puisqu'ils ciblent le meme Agent proprietaire (command.agentId).
+      const availability = getOwningAgentAvailability(command);
+      const unavailableMessage = availability.reason ? AGENT_UNAVAILABLE_MESSAGE[availability.reason] : null;
+
       if (command.botStatus === "WAITING_FOR_USER" && !isValidateInFlight(command)) {
         const validate = document.createElement("button");
         validate.className = "primary";
         validate.type = "button";
         validate.textContent = "Valider";
+        validate.disabled = !availability.actionable;
+        if (unavailableMessage) {
+          validate.title = unavailableMessage;
+        }
         validate.addEventListener("click", () => {
           // Desactive immediatement pour eviter un double-clic pendant que
           // le prochain rendu (declenche par la reponse serveur) n'a pas
@@ -1015,10 +1065,26 @@
         stop.className = "outline danger-text";
         stop.type = "button";
         stop.textContent = "Arreter";
+        stop.disabled = !availability.actionable;
+        if (unavailableMessage) {
+          stop.title = unavailableMessage;
+        }
         stop.addEventListener("click", () => {
           APP.socket.emit("stop-bot", { botId: command.botId, clientRequestId: `${command.botId}-stop-${Date.now()}` });
         });
         actions.append(stop);
+      }
+
+      // Indication discrete a proximite des boutons desactives (jamais un
+      // remplacement du detail runtime de la colonne "Details" ci-dessus) -
+      // uniquement si au moins un bouton d'action existe reellement sur
+      // cette ligne (inutile d'afficher ce message pour un bot deja Arrete,
+      // qui n'a de toute facon ni Valider ni Arreter).
+      if (unavailableMessage && actions.childElementCount > 0) {
+        const notice = document.createElement("span");
+        notice.className = "quiet";
+        notice.textContent = unavailableMessage;
+        actions.append(notice);
       }
 
       if (isRowDeletable(command)) {
@@ -1273,6 +1339,15 @@
     }
     if (APP.state.page === "agent") {
       void renderAgentLocalPage();
+    }
+    // HOTFIX CIBLE (disponibilite des actions distantes): reactivite
+    // automatique - une reconnexion/synchronisation d'Agent (evenement
+    // agent-status, cf. agentContext.js) doit reactiver Valider/Arreter sans
+    // rechargement manuel de la page, meme mecanisme (CTX.subscribe) que les
+    // autres reactions a un changement d'etat Agent ci-dessus, aucun
+    // polling supplementaire.
+    if (APP.state.page === "bot") {
+      renderAgentCommandsPanel();
     }
   }
 
