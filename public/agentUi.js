@@ -798,30 +798,77 @@
   const isValidateInFlight = (command) =>
     command.type === "VALIDATE_BOT" && ["PENDING", "SENT", "ACKNOWLEDGED"].includes(command.status);
 
-  // Traduit le couple (statut de commande, statut de bot remonte par
-  // l'agent) dans les messages utilisateur exiges par la section 12/7. La
-  // page ne doit jamais laisser entendre que Chrome est lance tant que
-  // l'agent ne l'a pas confirme via BOT_STATUS.
-  const commandStatusMessage = (command) => {
-    if (command.status === "FAILED") {
-      if (FAILURE_MESSAGE_BY_ERROR_CODE[command.errorCode]) {
-        return FAILURE_MESSAGE_BY_ERROR_CODE[command.errorCode];
-      }
-      // BUG CIBLE 0.1.5 (point 5): a defaut d'une entree dediee ci-dessus,
-      // afficher le message public deja assaini envoye par l'agent
-      // (AgentBotManager.publicMessageFor - jamais de payload/login/mot de
-      // passe, toujours une phrase fixe par code) plutot que de masquer
-      // silencieusement l'echec derriere le texte generique "Commande
-      // echouee". Si meme ce message est absent, afficher au moins le code
-      // reel pour rester diagnosticable.
-      if (typeof command.message === "string" && command.message.trim()) {
-        return command.message;
-      }
-      return command.errorCode ? `Commande echouee (${command.errorCode})` : "Commande echouee";
+  // HOTFIX CIBLE (etat du bot = information principale): construit le texte
+  // "brut" d'un echec (errorCode connu -> message agent -> code) sans
+  // decider ENCORE comment il doit etre presente (avec/sans prefixe) - cette
+  // decision depend du botStatus au moment de l'appel, cf. commandStatusMessage.
+  const failureDetailText = (command) => {
+    if (FAILURE_MESSAGE_BY_ERROR_CODE[command.errorCode]) {
+      return FAILURE_MESSAGE_BY_ERROR_CODE[command.errorCode];
     }
+    // BUG CIBLE 0.1.5 (point 5): a defaut d'une entree dediee ci-dessus,
+    // afficher le message public deja assaini envoye par l'agent
+    // (AgentBotManager.publicMessageFor - jamais de payload/login/mot de
+    // passe, toujours une phrase fixe par code) plutot que de masquer
+    // silencieusement l'echec derriere le texte generique "Commande
+    // echouee". Si meme ce message est absent, afficher au moins le code
+    // reel pour rester diagnosticable.
+    if (typeof command.message === "string" && command.message.trim()) {
+      return command.message;
+    }
+    return command.errorCode ? `Commande echouee (${command.errorCode})` : "Commande echouee";
+  };
+
+  // HOTFIX CIBLE (etat du bot = information principale): certains messages
+  // FAILURE_MESSAGE_BY_ERROR_CODE sont deja des instructions completes et
+  // sans ambiguite temporelle (ex. PAGE_NOT_READY: "...puis validez a
+  // nouveau" - deja clairement une action a refaire, jamais une description
+  // d'etat actuel) et s'affichent tels quels. Les autres (ex.
+  // AGENT_ACK_TIMEOUT: "Delai de reponse depasse") pourraient se lire comme
+  // l'etat ACTUEL du bot si affiches seuls alors que le badge "Etat du bot"
+  // dit autre chose (ex. Surveillance): prefixes explicitement pour lever
+  // toute ambiguite passe/present.
+  const SELF_CONTAINED_FAILURE_CODES = new Set(["PAGE_NOT_READY"]);
+
+  // Traduit le couple (statut de commande, statut de bot remonte par
+  // l'agent) dans les messages utilisateur. Le badge "Etat du bot"
+  // (RUNTIME_BADGE) reste TOUJOURS l'information principale et n'est jamais
+  // remis en cause ici: une commande FAILED ne doit jamais donner
+  // l'impression que le bot est actuellement en panne si le runtime dit
+  // autre chose - ce texte precise alors explicitement qu'il s'agit de la
+  // DERNIERE COMMANDE, jamais de l'etat actuel (sauf ERROR/STOPPED, ou le
+  // runtime a sa propre presentation dediee ci-dessous).
+  const commandStatusMessage = (command) => {
     if (isValidateInFlight(command)) {
       return "Verification de la page...";
     }
+
+    if (command.botStatus === "STOPPED") {
+      // Une vieille commande FAILED ne doit jamais faire croire que le bot
+      // est actuellement en erreur une fois reellement arrete.
+      return "Bot arrete.";
+    }
+
+    if (command.botStatus === "ERROR") {
+      // Le message runtime d'erreur reste la base, complete par la derniere
+      // commande UNIQUEMENT si elle apporte une information distincte
+      // (jamais de duplication du meme texte).
+      const base = ACTIVE_BOT_STATUS_MESSAGE.ERROR;
+      if (command.status === "FAILED") {
+        const detail = failureDetailText(command);
+        return detail && detail !== base ? `${base} Derniere commande : ${detail}` : base;
+      }
+      return base;
+    }
+
+    if (command.status === "FAILED") {
+      const detail = failureDetailText(command);
+      if (command.errorCode && SELF_CONTAINED_FAILURE_CODES.has(command.errorCode)) {
+        return detail;
+      }
+      return `Derniere commande non executee : ${detail}`;
+    }
+
     if (ACTIVE_BOT_STATUS_MESSAGE[command.botStatus]) {
       return ACTIVE_BOT_STATUS_MESSAGE[command.botStatus];
     }
@@ -829,9 +876,6 @@
       return "Envoi de la commande...";
     }
     if (command.status === "ACKNOWLEDGED") {
-      if (command.botStatus === "STOPPED") {
-        return "Arret en cours (agent)";
-      }
       return "Commande recue par l'agent";
     }
     if (command.status === "EXPIRED") {
@@ -884,13 +928,37 @@
 
   const RUNTIME_BADGE = {
     STARTING: { label: "Demarrage", cls: "amber" },
-    WAITING_FOR_USER: { label: "Attente utilisateur", cls: "blue" },
+    WAITING_FOR_USER: { label: "Intervention requise", cls: "blue" },
     MONITORING: { label: "Surveillance", cls: "green" },
-    RATE_LIMITED: { label: "Ralenti", cls: "amber" },
+    RATE_LIMITED: { label: "Pause du site", cls: "amber" },
     SLOT_DETECTED: { label: "Creneau detecte", cls: "green" },
     STOPPING: { label: "Arret en cours", cls: "amber" },
     STOPPED: { label: "Arrete", cls: "grey" },
     ERROR: { label: "Erreur", cls: "red" }
+  };
+
+  // HOTFIX CIBLE (etat du bot = information principale): libelles lisibles
+  // pour la colonne "Derniere commande" (Type - Statut) - jamais les codes
+  // machine bruts (START_BOT/COMPLETED/...) dans le tableau principal, qui
+  // restent reserves au backend/tests.
+  const COMMAND_TYPE_LABEL = {
+    START_BOT: "Demarrer",
+    VALIDATE_BOT: "Valider",
+    STOP_BOT: "Arreter",
+    REFRESH_BOT: "Rafraichir",
+    UPDATE_SETTINGS: "Mettre a jour",
+    REQUEST_STATUS: "Verifier",
+    SHUTDOWN_BOT: "Arreter"
+  };
+
+  const COMMAND_STATUS_LABEL = {
+    PENDING: "En attente",
+    SENT: "Envoyee",
+    ACKNOWLEDGED: "Recue par l'agent",
+    COMPLETED: "Terminee",
+    FAILED: "Echouee",
+    EXPIRED: "Expiree",
+    CANCELLED: "Annulee"
   };
 
   const renderAgentCommandsPanel = () => {
@@ -906,17 +974,22 @@
       const row = document.createElement("tr");
       APP.addCell(row, command.botName || command.botId, "strong-cell");
 
-      const commandStatusCell = document.createElement("td");
-      const cls = command.status === "COMPLETED" ? "green"
-        : command.status === "FAILED" || command.status === "EXPIRED" ? "red"
-          : "blue";
-      commandStatusCell.append(APP.makeBadge(command.status, cls));
-      row.append(commandStatusCell);
-
+      // HOTFIX CIBLE (etat du bot = information principale): l'etat runtime
+      // (botStatus) est affiche AVANT la derniere commande, jamais l'inverse
+      // - c'est l'information que l'utilisateur doit lire en premier.
       const runtimeCell = document.createElement("td");
       const runtimeInfo = RUNTIME_BADGE[command.botStatus] || { label: "—", cls: "grey" };
       runtimeCell.append(APP.makeBadge(runtimeInfo.label, runtimeInfo.cls));
       row.append(runtimeCell);
+
+      const lastCommandCell = document.createElement("td");
+      const typeLabel = COMMAND_TYPE_LABEL[command.type] || command.type;
+      const statusLabel = COMMAND_STATUS_LABEL[command.status] || command.status;
+      const cls = command.status === "COMPLETED" ? "green"
+        : command.status === "FAILED" || command.status === "EXPIRED" ? "red"
+          : "blue";
+      lastCommandCell.append(APP.makeBadge(`${typeLabel} - ${statusLabel}`, cls));
+      row.append(lastCommandCell);
 
       APP.addCell(row, commandStatusMessage(command));
 
