@@ -124,7 +124,13 @@ export type AgentBotRecord = {
   botId: string;
   agentId: number;
   agencyId: number;
-  ownerUserId: number;
+  // HOTFIX CIBLE (isolation des logs): honnetement nullable - agent_commands.
+  // created_by_user_id est ON DELETE SET NULL (db.ts), donc l'utilisateur
+  // createur peut avoir ete supprime au moment d'une reconstruction apres
+  // reboot (getBotOwnershipHistory). null se propage explicitement plutot
+  // que d'etre remplace par une sentinelle (0/-1) qui pourrait par erreur
+  // correspondre a un vrai utilisateur.
+  ownerUserId: number | null;
   botName: string;
   category: string;
   latestCommandId: string;
@@ -260,7 +266,13 @@ export const getLatestCommandForBot = async (botId: string): Promise<DbAgentComm
 
 export type BotOwnershipHistory = {
   agencyId: number;
-  ownerUserId: number;
+  // HOTFIX CIBLE (isolation des logs): honnetement nullable - le type DB
+  // DbAgentCommand.created_by_user_id reste `number` par convention
+  // existante (ON DELETE SET NULL non reflete dans son typage), mais la
+  // valeur REELLE peut etre SQL NULL si l'utilisateur createur a ete
+  // supprime depuis. Verifie explicitement ci-dessous (typeof) plutot que de
+  // faire confiance au type declare.
+  ownerUserId: number | null;
   botName: string;
   category: string;
   // Vrai si un STOP_BOT a deja ete complete pour ce botId: un botId n'est
@@ -293,7 +305,7 @@ export const getBotOwnershipHistory = async (botId: string, agentId: number): Pr
 
   return {
     agencyId: startRow.agency_id,
-    ownerUserId: startRow.created_by_user_id,
+    ownerUserId: typeof startRow.created_by_user_id === "number" ? startRow.created_by_user_id : null,
     botName: typeof payload.botName === "string" ? payload.botName : "Bot",
     category: typeof payload.category === "string" ? payload.category : "",
     everStopped
@@ -445,7 +457,12 @@ export type CreatePendingCommandParams = {
   botId: string;
   type: AgentCommandType;
   publicPayload: unknown;
-  createdByUserId: number;
+  // HOTFIX CIBLE (isolation des logs): honnetement nullable - la colonne DB
+  // (created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL)
+  // l'est deja. Un dispatch de reconciliation (forceStopForReconciliation,
+  // agentGateway.ts) peut ne pas connaitre d'utilisateur reel (createur
+  // supprime depuis) - jamais un id invente qui violerait la foreign key.
+  createdByUserId: number | null;
   clientRequestId?: string | null;
   ttlMs: number;
 };
@@ -673,7 +690,9 @@ export type DispatchAgentCommandParams = {
   botId: string;
   type: AgentCommandType;
   publicPayload: unknown;
-  createdByUserId: number;
+  // HOTFIX CIBLE (isolation des logs): honnetement nullable, cf.
+  // CreatePendingCommandParams.createdByUserId ci-dessus.
+  createdByUserId: number | null;
   clientRequestId?: string | null;
   // Hotfix 0.1.1: transite UNIQUEMENT sur ce socket, jamais persiste (jamais
   // passe a createPendingCommand/INSERT INTO agent_commands ci-dessous, jamais

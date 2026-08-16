@@ -98,8 +98,15 @@ import {
 } from "./agencyBillingService.js";
 import { startAgencyBillingScheduler } from "./agencyBillingScheduler.js";
 
+// HOTFIX CIBLE (isolation des logs entre utilisateurs et agences):
+// userId/agencyId peuvent tous deux etre inconnus/non fiables au moment ou un
+// log est produit (ex. bot Agent dont le AgentBotRecord n'est plus dans le
+// registre en memoire) - jamais remplaces par une valeur sentinelle (0/-1)
+// qui pourrait accidentellement correspondre a un utilisateur/une agence
+// reels: null signifie explicitement "inconnu", exploite par canViewBotLog()
+// ci-dessous pour refuser l'acces plutot que de deviner (fail closed).
 type SessionOwner = {
-  userId: number;
+  userId: number | null;
   agencyId: number | null;
   botName: string;
   category?: string;
@@ -1177,6 +1184,40 @@ const canSeeOwner = (user: DbUser, owner: SessionOwner): boolean => {
     || (Boolean(user.agency_id) && user.agency_id === owner.agencyId);
 };
 
+// HOTFIX CIBLE (isolation des logs entre utilisateurs et agences): fonction
+// centrale UNIQUE pour "cet utilisateur peut-il voir ce log de bot",
+// reutilisee identiquement par tous les canaux de logs (temps reel
+// bot-log/emitLogToAuthorizedSockets, historique bot-log-history a la
+// reconnexion) - jamais une variante legerement differente d'un canal a
+// l'autre. Politique exacte:
+//   - role 0 (admin global): tous les logs ;
+//   - role 1 (gestionnaire d'agence): tous les logs de SA PROPRE agence
+//     (agencyId doit etre connu et correspondre - jamais suppose) ;
+//   - role 2 (utilisateur standard): UNIQUEMENT les logs des bots qu'il
+//     possede lui-meme - double condition explicite (meme agence ET meme
+//     utilisateur), jamais un simple userId===userId qui suffirait a lui
+//     seul si les identifiants venaient a se recouper autrement ;
+//   - tout owner dont l'agencyId (ou, pour le role 2, le userId) est
+//     inconnu (null) est REFUSE plutot que suppose "visible par toute
+//     l'agence" (fail closed) - cf. emitBotLogFromAgent ci-dessous, qui ne
+//     substitue plus jamais une valeur sentinelle (0) a un proprietaire
+//     reellement inconnu.
+// Distincte de canSeeOwner ci-dessus (inchangee, utilisee par les actions de
+// controle bot pause/reprise/arret et la selection de session implicite -
+// hors perimetre de ce hotfix, qui ne porte que sur les logs).
+const canViewBotLog = (user: DbUser, owner: SessionOwner): boolean => {
+  if (user.role === 0) {
+    return true;
+  }
+  if (owner.agencyId == null || user.agency_id !== owner.agencyId) {
+    return false;
+  }
+  if (user.role === 1) {
+    return true;
+  }
+  return owner.userId != null && user.id === owner.userId;
+};
+
 const canManageAgencySettings = (user: DbUser, agencyId: number): boolean =>
   user.role === 0 || (user.role === 1 && user.agency_id === agencyId);
 
@@ -1235,8 +1276,12 @@ const emitBotLogFromAgent = (
   message: string
 ): void => {
   const bot = getAgentBot(botId);
+  // HOTFIX CIBLE (isolation des logs): jamais de sentinelle (0) quand le bot
+  // est absent du registre en memoire - null signifie explicitement
+  // "proprietaire inconnu", que canViewBotLog() refuse pour le role 2 plutot
+  // que de risquer une correspondance accidentelle avec un vrai userId.
   const owner: SessionOwner = {
-    userId: bot?.ownerUserId ?? 0,
+    userId: bot?.ownerUserId ?? null,
     agencyId,
     botName,
     category: bot?.category ?? "",
@@ -1456,7 +1501,7 @@ registerAgentNamespace(io, agentGatewayConfig, agentCommandConfig, {
 const emitLogToAuthorizedSockets = (owner: SessionOwner, event: SessionEvent): void => {
   for (const [socketId, socket] of io.sockets.sockets) {
     const user = socketUsers.get(socketId);
-    if (user && canSeeOwner(user, owner)) {
+    if (user && canViewBotLog(user, owner)) {
       socket.emit("bot-log", event);
     }
   }
@@ -1489,13 +1534,17 @@ const recordLog = (owner: SessionOwner, event: SessionEvent, sessionKey: string)
   logHistory.unshift({ event: visibleEvent, owner, sessionKey });
   logHistory.splice(300);
   emitLogToAuthorizedSockets(owner, visibleEvent);
-  void notifyUserIfNeeded({
-    userId: owner.userId,
-    level: event.level,
-    message: event.message,
-    sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey,
-    botName: owner.botName
-  });
+  // Proprietaire inconnu (cf. emitBotLogFromAgent): jamais de notification
+  // email mal routee vers un userId devine/sentinelle.
+  if (owner.userId != null) {
+    void notifyUserIfNeeded({
+      userId: owner.userId,
+      level: event.level,
+      message: event.message,
+      sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey,
+      botName: owner.botName
+    });
+  }
 };
 
 const emitOwnedLog = (socket: Socket, owner: SessionOwner | null, event: SessionEvent): void => {
@@ -1545,7 +1594,7 @@ io.on("connection", (socket) => {
     socketUsers.set(socket.id, connectedUser);
     socket.emit(
       "bot-log-history",
-      logHistory.filter((entry) => canSeeOwner(connectedUser, entry.owner)).map((entry) => entry.event)
+      logHistory.filter((entry) => canViewBotLog(connectedUser, entry.owner)).map((entry) => entry.event)
     );
 
     for (const [sessionKey, prompt] of activePrompts) {
@@ -1836,13 +1885,15 @@ io.on("connection", (socket) => {
           activePrompts.set(sessionKey, { message, owner });
           selectedSessionBySocket.set(socket.id, sessionKey);
           emitPromptToAuthorizedSockets(owner, message, sessionKey);
-          void notifyUserIfNeeded({
-            userId: owner.userId,
-            level: "warn",
-            message,
-            sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey,
-            botName: owner.botName
-          });
+          if (owner.userId != null) {
+            void notifyUserIfNeeded({
+              userId: owner.userId,
+              level: "warn",
+              message,
+              sessionId: sessions.get(sessionKey)?.snapshot().id ?? sessionKey,
+              botName: owner.botName
+            });
+          }
         },
         onStatus: (status) => {
           emitStatusToAuthorizedSockets(owner, sessionKey, status);

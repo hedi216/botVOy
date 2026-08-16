@@ -340,7 +340,9 @@ export const registerAgentNamespace = (
     agencyId: number,
     agentId: number,
     botId: string,
-    ownerUserId: number
+    // HOTFIX CIBLE (isolation des logs): honnetement nullable - le createur
+    // original peut avoir ete supprime depuis (cf. AgentBotRecord.ownerUserId).
+    ownerUserId: number | null
   ): Promise<void> => {
     logger.warn(`Bot ${botId} rapporte actif par l'agent mais deja STOPPED cote serveur: renvoi de STOP_BOT pour reconciliation.`);
     const hourBucket = Math.floor(Date.now() / 3_600_000);
