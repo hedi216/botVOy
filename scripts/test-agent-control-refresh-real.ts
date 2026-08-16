@@ -1141,6 +1141,137 @@ const runScenarioCRP = async (browser: Browser): Promise<void> => {
   }
 };
 
+// ===================== CR-Q: recovery normal AVANT l'echeance -> echeance jamais repoussee =====================
+//
+// BUG CIBLE (refresh de controle 20 min repousse par un recovery normal):
+// reproduit ici SANS le refresh planifie (`unexpectedReason` generique
+// declenche en tete de cycle - la page devient hors workflow AVANT
+// l'echeance, jamais parce que le refresh planifie etait du). Avant
+// correctif: le recovery reussi appelait scheduleNextControlRefresh() sans
+// condition, ce qui repoussait l'echeance d'un intervalle complet supplementaire.
+
+const runScenarioCRQ = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== CR-Q: recovery normal (page hors workflow) AVANT l'echeance -> l'echeance n'est PAS repoussee ===");
+  const fixture = await startAlwaysReadyFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const readyUrl = `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`;
+
+  try {
+    await page.goto(readyUrl, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture(Date.now());
+    let recoverWorkflowCalls = 0;
+
+    const config = makeDirectConfig(readyUrl, 2_500);
+    const handle = startDirectMonitoring(page, config, capture, {
+      recoverWorkflow: async () => {
+        recoverWorkflowCalls += 1;
+        await sleep(300);
+        if (!page.isClosed()) {
+          await page.goto(readyUrl, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+        }
+        return page;
+      }
+    });
+
+    // Page hors workflow declenchee bien AVANT l'echeance (700ms << 2500ms),
+    // recovery termine ~1000ms - toujours avant l'echeance.
+    await sleep(700);
+    await page.goto("about:blank").catch(() => undefined);
+
+    await waitUntil(() => recoverWorkflowCalls >= 1, 10_000);
+    await waitUntil(() => capture.entries.some((e) => e.message.includes(CONTROL_REFRESH_LOG_MARKER)), 15_000);
+    handle.abort();
+    await handle.promise;
+
+    const refreshAtMs = capture.entries.find((e) => e.message.includes(CONTROL_REFRESH_LOG_MARKER))?.atMs ?? -1;
+
+    assert(recoverWorkflowCalls === 1, `CR-Q) Le recovery normal a bien ete declenche une fois (recu: ${recoverWorkflowCalls})`);
+    assert(
+      capture.entries.some((e) => e.message === "Page de rendez-vous retrouvee automatiquement. Surveillance reprise."),
+      "CR-Q) Le recovery normal (page hors workflow) a bien reussi"
+    );
+    assert(
+      capture.entries.some((e) => e.message.includes("Echeance du refresh de controle inchangee par ce recovery normal")),
+      "CR-Q) Le log confirme explicitement que l'echeance n'a pas ete modifiee par ce recovery normal"
+    );
+    assert(
+      refreshAtMs >= 2_200 && refreshAtMs <= 3_200,
+      `CR-Q) Le refresh de controle survient bien autour de l'echeance ORIGINALE (~2500ms), jamais repoussee d'un intervalle complet supplementaire par le recovery normal (recu: ${refreshAtMs}ms)`
+    );
+    assertNoSecretsInLogs(capture.entries, "CR-Q) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    await closeFixture(fixture);
+  }
+};
+
+// ===================== CR-R: recovery normal qui traverse l'echeance -> refresh reste DU =====================
+//
+// Le recovery normal COMMENCE avant l'echeance et se TERMINE apres - le
+// refresh de controle doit rester du et etre traite au prochain point sur
+// (immediatement apres le recovery), jamais reporte d'un intervalle complet
+// supplementaire a partir de la fin du recovery.
+
+const runScenarioCRR = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== CR-R: recovery normal qui commence AVANT l'echeance et se termine APRES -> le refresh reste DU, traite au prochain point sur ===");
+  const fixture = await startAlwaysReadyFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const readyUrl = `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`;
+
+  try {
+    await page.goto(readyUrl, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture(Date.now());
+    let recoverWorkflowCalls = 0;
+    let refreshSucceededCalls = 0;
+
+    const config = makeDirectConfig(readyUrl, 1_200);
+    const handle = startDirectMonitoring(page, config, capture, {
+      recoverWorkflow: async () => {
+        recoverWorkflowCalls += 1;
+        // Recovery volontairement lent: declenche avant l'echeance (1200ms),
+        // termine bien APRES (l'echeance est deja depassee a son retour).
+        await sleep(700);
+        if (!page.isClosed()) {
+          await page.goto(readyUrl, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+        }
+        return page;
+      },
+      onRefreshSucceeded: () => { refreshSucceededCalls += 1; }
+    });
+
+    // Declenche a 900ms (< 1200ms), termine ~1600ms (> 1200ms).
+    await sleep(900);
+    await page.goto("about:blank").catch(() => undefined);
+
+    await waitUntil(() => recoverWorkflowCalls >= 1, 10_000);
+    await waitUntil(() => refreshSucceededCalls >= 1, 10_000);
+    await sleep(300);
+    handle.abort();
+    await handle.promise;
+
+    const recoverAtMs = capture.entries.find((e) => e.message.includes("Page de rendez-vous retrouvee automatiquement. Surveillance reprise."))?.atMs ?? -1;
+    const refreshAtMs = capture.entries.find((e) => e.message.includes(CONTROL_REFRESH_LOG_MARKER))?.atMs ?? -1;
+
+    assert(recoverWorkflowCalls === 1, `CR-R) Le recovery normal a bien ete declenche une fois avant l'echeance (recu: ${recoverWorkflowCalls})`);
+    assert(recoverAtMs >= 1_400, `CR-R) Le recovery se termine bien APRES l'echeance initiale de 1200ms (recu: ${recoverAtMs}ms)`);
+    assert(
+      capture.entries.some((e) => e.message.includes("Refresh de controle deja du: ce recovery normal ne repousse pas l'echeance")),
+      "CR-R) Le log confirme que le refresh etait deja du au moment du recovery et que l'echeance n'a pas ete repoussee"
+    );
+    assert(refreshSucceededCalls === 1, `CR-R) Exactement UN refresh de controle execute (recu: ${refreshSucceededCalls})`);
+    assert(
+      refreshAtMs >= recoverAtMs - 50 && refreshAtMs <= recoverAtMs + 700,
+      `CR-R) Le refresh de controle (deja du depuis avant le recovery) s'execute au prochain point sur juste apres le recovery, jamais reporte d'un intervalle complet supplementaire (recovery termine a ${recoverAtMs}ms, refresh a ${refreshAtMs}ms)`
+    );
+    assertNoSecretsInLogs(capture.entries, "CR-R) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    await closeFixture(fixture);
+  }
+};
+
 // ===================== Helpers partages (agent layer) =====================
 
 const makeFakeReporter = (): { reporter: AgentEventReporter; statuses: Array<{ status: string; details?: unknown }> } => {
@@ -1191,6 +1322,8 @@ const main = async (): Promise<void> => {
     await runScenarioCRN(browser);
     await runScenarioCRO(browser);
     await runScenarioCRP(browser);
+    await runScenarioCRQ(browser);
+    await runScenarioCRR(browser);
   } finally {
     if (browser) await browser.close().catch(() => undefined);
   }

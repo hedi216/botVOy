@@ -714,7 +714,16 @@ export const monitorAppointments = async (
   // est deja, par contrat existant, la page de rendez-vous reelle - agent et
   // legacy_vm n'appellent tous deux cette fonction qu'apres l'avoir atteinte).
   let nextControlRefreshAt = controlRefreshIntervalMs !== null ? Date.now() + controlRefreshIntervalMs : null;
-  const scheduleNextControlRefresh = (): void => {
+  // nextControlRefreshAt exprime "l'echeance du prochain refresh de controle",
+  // jamais "20 minutes depuis la derniere fois qu'une page a ete recuperee".
+  // Seul le traitement REEL d'un cycle de refresh de controle (refresh
+  // planifie reussi, ou recovery qui EST la reprise de ce refresh planifie -
+  // cf. les 3 sites d'appel ci-dessous, tous a l'interieur du bloc
+  // controlRefreshDue) a l'autorite de reprogrammer cette echeance. Un
+  // recovery generique (page inattendue detectee en tete de cycle,
+  // independant du refresh planifie) n'a jamais cette autorite - voir le
+  // point d'appel `unexpectedReason` plus bas, qui ne l'appelle plus.
+  const markControlRefreshSatisfied = (): void => {
     if (controlRefreshIntervalMs !== null) {
       nextControlRefreshAt = Date.now() + controlRefreshIntervalMs;
     }
@@ -788,10 +797,22 @@ export const monitorAppointments = async (
       if (recoveredPage) {
         activePage = recoveredPage;
         lastKnownUrl = activePage.url();
-        // "Apres un recovery complet reussi qui ramene a appointment-booking":
-        // repart pour un cycle complet de 20 min (agent) - sans effet si le
-        // refresh de controle temporel n'est pas configure (legacy_vm/CLI).
-        scheduleNextControlRefresh();
+        // CORRECTIF CIBLE (refresh de controle repousse par un recovery normal):
+        // ce recovery est independant du refresh de controle temporel (page
+        // inattendue/sortie de workflow detectee en tete de cycle - jamais un
+        // refresh planifie qui etait du). Il n'a donc aucune autorite pour
+        // reprogrammer nextControlRefreshAt (jamais markControlRefreshSatisfied()
+        // ici): si l'echeance etait deja due pendant ce recovery, elle reste
+        // due et sera traitee au prochain point sur (bloc controlRefreshDue
+        // ci-dessous), jamais repoussee d'un intervalle complet par ce recovery.
+        if (controlRefreshIntervalMs !== null && nextControlRefreshAt !== null) {
+          resolved.log(
+            "info",
+            Date.now() >= nextControlRefreshAt
+              ? "Refresh de controle deja du: ce recovery normal ne repousse pas l'echeance, traitement au prochain point sur."
+              : "Echeance du refresh de controle inchangee par ce recovery normal."
+          );
+        }
         resolved.log("success", "Page de rendez-vous retrouvee automatiquement. Surveillance reprise.");
         continue;
       }
@@ -971,7 +992,7 @@ export const monitorAppointments = async (
           activePage = recoveredPage;
           lastKnownUrl = activePage.url();
           resolved.onRefreshSucceeded?.();
-          scheduleNextControlRefresh();
+          markControlRefreshSatisfied();
           resolved.log("success", "Page de rendez-vous retrouvee automatiquement (recovery avant refresh planifie). Surveillance reprise.");
           continue;
         }
@@ -1011,7 +1032,7 @@ export const monitorAppointments = async (
         // aucune notification speciale, le timer repart simplement pour un
         // cycle complet - sans effet si le refresh de controle n'est pas
         // configure (legacy_vm/CLI).
-        scheduleNextControlRefresh();
+        markControlRefreshSatisfied();
       } catch (error) {
         if (isTargetClosedError(error)) {
           const recovered = await recoverAfterTargetClosed(resolved, lastKnownUrl);
@@ -1048,7 +1069,7 @@ export const monitorAppointments = async (
             activePage = recoveredPage;
             lastKnownUrl = activePage.url();
             resolved.onRefreshSucceeded?.();
-            scheduleNextControlRefresh();
+            markControlRefreshSatisfied();
             resolved.log("success", "Page de rendez-vous retrouvee automatiquement (recovery apres refresh planifie). Surveillance reprise.");
             continue;
           }
