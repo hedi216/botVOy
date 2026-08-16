@@ -171,7 +171,17 @@ const main = async (): Promise<void> => {
       resolvePendingPair({ ok: true });
     },
     onPermanentFailure: (reason) => {
-      log("error", `Agent non reautorise a se connecter (${reason}). Les bots deja actifs localement continuent de tourner.`);
+      // CORRECTIF CIBLE (revoke Agent doit terminer tous ses bots): ce
+      // message pretendait TOUJOURS que les bots continuent, alors que
+      // applyPermanentFailurePolicy() (juste en dessous) appelle
+      // stopAllBotsForIdentityReset() pour toute raison identitaire
+      // (AGENT_REVOKED/INVALID_TOKEN/...) - jamais pour VERSION_INCOMPATIBLE,
+      // seul cas ou l'ancien message reste exact. Le texte reflete desormais
+      // precisement l'action reellement en cours, jamais l'inverse.
+      const botsOutcome = IDENTITY_INVALIDATING_REASONS.has(reason)
+        ? "Arret des bots locaux et reinitialisation de l'identite."
+        : "Les bots deja actifs localement continuent de tourner.";
+      log("error", `Agent non reautorise a se connecter (${reason}). ${botsOutcome}`);
       void applyPermanentFailurePolicy(reason);
     },
     onCredentialSaveFailure: (reason) => {

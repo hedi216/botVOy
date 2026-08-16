@@ -74,10 +74,12 @@ import {
   generateBotId,
   getAgentBot,
   getCommandForAgency,
+  getLatestCommandForBot,
   listAgentBotsForAgency,
   listAgentCommandsForAgency,
   registerAgentBot,
   removeAgentBot,
+  stopAllBotsForAgent,
   toPublicAgentCommand,
   toPublicAgentCommandDetail
 } from "./agentCommandService.js";
@@ -976,6 +978,21 @@ app.post("/api/agents/:id/revoke", requireAuth, requireAgencyManager, async (req
   for (const command of revokedCommands) {
     emitAgentCommandStatusToAuthorizedSockets(command.agency_id, toPublicAgentCommand(command));
   }
+
+  // CORRECTIF CIBLE (revoke Agent doit terminer tous ses bots): convergence
+  // SERVEUR immediate, AVANT de couper le socket - un Agent hors ligne au
+  // moment du revoke ne recevra jamais de commande, mais son quota et son
+  // affichage doivent neanmoins etre corrects sans attendre une eventuelle
+  // reconnexion future. Strictement ce seul agentId (jamais toute l'agence,
+  // cf. stopAllBotsForAgent/listAgentBotsForAgent).
+  const stoppedBotIds = stopAllBotsForAgent(agent.id);
+  for (const botId of stoppedBotIds) {
+    const latest = await getLatestCommandForBot(botId);
+    if (latest) {
+      emitAgentCommandStatusToAuthorizedSockets(latest.agency_id, toPublicAgentCommand(latest));
+    }
+  }
+
   disconnectAgentSocket(agent.id);
 
   const snapshot = await getSnapshotForAgent(agent.id, agentGatewayConfig);

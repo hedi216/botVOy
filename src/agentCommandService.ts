@@ -184,6 +184,28 @@ export const removeAgentBot = (botId: string): void => {
   agentBots.delete(botId);
 };
 
+// CORRECTIF CIBLE (revoke Agent doit terminer tous ses bots): reconciliation
+// IMMEDIATE, appelee par la route /api/agents/:id/revoke (server.ts) une
+// fois la revocation actee en DB - reutilise listAgentBotsForAgent (deja
+// strictement filtre sur CET agentId, jamais toute l'agence) et
+// updateAgentBotStatus (meme mecanisme que la reconciliation
+// AGENT_RUNTIME_STATUS, agentGateway.ts). Ignore les bots deja STOPPED
+// (idempotent: un second revoke ne fait rien de plus) et retourne
+// uniquement les botId REELLEMENT transitionnes, pour que l'appelant sache
+// lesquels rediffuser vers l'interface (jamais une diffusion aveugle de
+// bots deja a jour).
+export const stopAllBotsForAgent = (agentId: number): string[] => {
+  const touched: string[] = [];
+  for (const bot of listAgentBotsForAgent(agentId)) {
+    if (bot.botStatus === "STOPPED") {
+      continue;
+    }
+    updateAgentBotStatus(bot.botId, "STOPPED");
+    touched.push(bot.botId);
+  }
+  return touched;
+};
+
 // -------- Lecture/ecriture DB (chaque mutation est ecrite pour etre
 // idempotente via une clause WHERE conditionnee sur le statut courant plutot
 // que de faire confiance a l'appelant: un doublon ne modifie alors 0 ligne au

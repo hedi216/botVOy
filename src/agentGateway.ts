@@ -494,6 +494,21 @@ export const registerAgentNamespace = (
           return;
         }
 
+        // CORRECTIF CIBLE (evenement runtime tardif apres STOPPED): le
+        // commandId reste le meme (celui de START_BOT) pendant toute la vie
+        // du bot - un BOT_STATUS en vol depuis avant un STOP_BOT/revoke/
+        // reconciliation (retard reseau, rejeu du buffer hors ligne avec un
+        // eventId different) peut donc encore reussir ce controle
+        // d'appartenance longtemps apres que le bot soit devenu STOPPED.
+        // STOPPED est un etat sur/terminal (meme principe deja applique a la
+        // reconciliation AGENT_RUNTIME_STATUS ci-dessous, section 7): jamais
+        // reactivable par un simple rapport runtime passif, quel qu'il soit.
+        const existingBeforeUpdate = getAgentBot(botId);
+        if (existingBeforeUpdate?.botStatus === "STOPPED" && payload!.status !== "STOPPED") {
+          logger.warn(`BOT_STATUS tardif ignore pour ${botId}: deja STOPPED, rapport ${payload!.status as string} refuse.`);
+          return;
+        }
+
         const bot = updateAgentBotStatus(botId, payload!.status as BotStatusValue);
         if (!bot) {
           return;

@@ -301,7 +301,13 @@ export class AgentClient {
 
       if (PERMANENT_FAILURE_REASONS.has(error.message)) {
         this.permanentFailure = true;
-        this.log("error", `Echec definitif d'authentification (${error.message}): arret des tentatives de reconnexion. Les bots deja actifs localement continuent (aucune commande distante ne sera plus recue).`);
+        // CORRECTIF CIBLE (revoke Agent doit terminer tous ses bots): ce
+        // niveau (transport/reconnexion) ne connait pas la politique
+        // appliquee ensuite (AGENT_REVOKED/INVALID_TOKEN arretent bien les
+        // bots locaux via applyPermanentFailurePolicy, cf. agentMain.ts) -
+        // jamais affirmer ici qu'ils continuent, au risque de contredire
+        // l'action reelle qui suit immediatement ce log.
+        this.log("error", `Echec definitif d'authentification (${error.message}): arret des tentatives de reconnexion.`);
         this.callbacks.onPermanentFailure?.(error.message);
         return;
       }
