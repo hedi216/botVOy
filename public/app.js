@@ -61,7 +61,6 @@ const els = {
   activeCount: $("#activeCount"),
   sessionList: $("#sessionList"),
   stopAllSessions: $("#stopAllSessions"),
-  shutdownServer: $("#shutdownServer"),
   passwordNotice: $("#passwordNotice"),
   passwordNoticeTitle: $("#passwordNoticeTitle"),
   temporaryPassword: $("#temporaryPassword"),
@@ -1633,7 +1632,6 @@ els.clearLogs.addEventListener("click", () => {
 });
 
 els.stopAllSessions.addEventListener("click", () => socket.emit("stop-all-sessions"));
-els.shutdownServer.addEventListener("click", () => socket.emit("shutdown-server"));
 
 socket.on("bot-session", (session) => {
   mergeSession(session);

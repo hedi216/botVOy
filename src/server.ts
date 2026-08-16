@@ -2059,18 +2059,6 @@ io.on("connection", (socket) => {
     emitMaintenance();
   });
 
-  socket.on("shutdown-server", async () => {
-    await Promise.all([...sessions.values()].map((session) => session.stop()));
-    sessions.clear();
-    sessionOwners.clear();
-    selectedSessionBySocket.clear();
-    activePrompts.clear();
-    emitMaintenance();
-    cleanupServerLock();
-    socket.emit("bot-log", makeEvent("warn", "Arret du serveur web demande depuis l'interface."));
-    server.close(() => process.exit(0));
-  });
-
   socket.on("disconnect", async () => {
     logger.info(`Interface deconnectee: ${socket.id}`);
     socketUsers.delete(socket.id);
