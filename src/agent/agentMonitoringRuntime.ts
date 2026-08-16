@@ -65,6 +65,13 @@ const LOGGED_OUT_LANDING_GOTO_TIMEOUT_MS = 20_000;
 // de l'agent, cf. toAppConfig/monitor.ts). refreshEveryCycles reste dans
 // AgentMonitoringSettings uniquement pour retrocompatibilite (legacy_vm/UI
 // agence), mais n'est plus consulte comme declencheur ici.
+//
+// HOTFIX CIBLE (parametres de surveillance en secondes entieres): cette
+// constante n'est plus la source PRINCIPALE en production - elle ne reste
+// qu'un FALLBACK de compatibilite si settings.controlRefreshIntervalSeconds
+// est absent d'un ancien payload (cf. resolution ci-dessous). La valeur par
+// defaut du champ configurable (1200s, agentMonitoringSettings.ts) est
+// deliberement identique, donc aucun changement de comportement par defaut.
 const AGENT_CONTROL_REFRESH_INTERVAL_MS = 20 * 60 * 1000;
 
 // CORRECTIF CIBLE (login/captcha bloque trop longtemps apres recovery):
@@ -131,8 +138,9 @@ export type StartMonitoringParams = {
   humanValidationGraceMs?: number;
   // CORRECTIF CIBLE (refresh temporel securise toutes les 20 minutes):
   // override TEST UNIQUEMENT (jamais en production reelle, retombe alors sur
-  // AGENT_CONTROL_REFRESH_INTERVAL_MS ci-dessus) - jamais d'attente reelle de
-  // 20 minutes dans les tests.
+  // settings.controlRefreshIntervalSeconds - cf. HOTFIX parametres en
+  // secondes - ou sur AGENT_CONTROL_REFRESH_INTERVAL_MS en dernier recours) -
+  // jamais d'attente reelle de 20 minutes dans les tests.
   controlRefreshIntervalMs?: number;
   // CORRECTIF CIBLE (login/captcha bloque trop longtemps apres recovery):
   // overrides TEST UNIQUEMENT (jamais en production reelle, retombent alors
@@ -757,7 +765,16 @@ export const startMonitoring = (params: StartMonitoringParams): MonitoringRuntim
     agentLog("error", "Echec final de la reprise automatique du workflow (WORKFLOW_RECOVERY_FAILED): intervention humaine requise. Chrome reste ouvert.");
   };
 
-  const resolvedControlRefreshIntervalMs = params.controlRefreshIntervalMs ?? AGENT_CONTROL_REFRESH_INTERVAL_MS;
+  // HOTFIX CIBLE (parametres de surveillance en secondes entieres): source
+  // configurable par agence (settings.controlRefreshIntervalSeconds, cf.
+  // agentMonitoringSettings.ts) - AGENT_CONTROL_REFRESH_INTERVAL_MS ne reste
+  // qu'un FALLBACK de compatibilite si ce champ manquait totalement d'un
+  // ancien payload (validateMonitoringSettings le renseigne pourtant
+  // toujours avec un defaut de 1200s = 20min, identique a cette constante).
+  const snapshotControlRefreshIntervalMs = typeof settings.controlRefreshIntervalSeconds === "number"
+    ? settings.controlRefreshIntervalSeconds * 1000
+    : AGENT_CONTROL_REFRESH_INTERVAL_MS;
+  const resolvedControlRefreshIntervalMs = params.controlRefreshIntervalMs ?? snapshotControlRefreshIntervalMs;
   const appConfig = toAppConfig(settings, targetUrl, resolvedControlRefreshIntervalMs);
 
   const loopPromise = monitorAppointments(page, appConfig, {

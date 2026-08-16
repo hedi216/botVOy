@@ -36,13 +36,16 @@ import {
   getAgencySettings,
   getCategoriesReadAgencyId,
   getSettingsAgencyId,
+  fromPublicMonitoringSettingsPatch,
   initUserModule,
   listAgencies,
   listAgencyCategories,
   listExtensionLinks,
   listUsersForRequester,
+  PublicMonitoringSettingsPatch,
   renameAgencyCategory,
   resetUserPassword,
+  toPublicMonitoringSettings,
   updateAgency,
   updateAgencyMonitoringSettings,
   updateAgencyRecordingExtensionSettings,
@@ -415,11 +418,17 @@ app.get("/api/monitoring-settings", requireAuth, async (req: AuthenticatedReques
     return;
   }
 
-  res.json({ settings: await getAgencySettings(agencyId) });
+  const settings = await getAgencySettings(agencyId);
+  res.json({
+    settings: {
+      ...toPublicMonitoringSettings(settings),
+      recordingExtension: settings.recordingExtension
+    }
+  });
 });
 
 app.patch("/api/monitoring-settings", requireAuth, async (req: AuthenticatedRequest, res) => {
-  const body = req.body as { agencyId?: number };
+  const body = req.body as { agencyId?: number } & PublicMonitoringSettingsPatch;
   const agencyId = req.user!.role === 0
     ? Number(body.agencyId)
     : Number(req.user!.agency_id);
@@ -433,9 +442,13 @@ app.patch("/api/monitoring-settings", requireAuth, async (req: AuthenticatedRequ
     return;
   }
 
-  res.json({
-    settings: await updateAgencyMonitoringSettings(agencyId, req.body)
-  });
+  const result = await updateAgencyMonitoringSettings(agencyId, fromPublicMonitoringSettingsPatch(body));
+  if (!result.ok) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  res.json({ settings: toPublicMonitoringSettings(result.settings) });
 });
 
 // Centralise la resolution de l'agence pour les routes qui agissent "pour son

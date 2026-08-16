@@ -172,6 +172,20 @@ export class AgentBotManager {
 
     const settingsSnapshot = validateMonitoringSettings(params.rawMonitoringSettings, botLog);
 
+    // HOTFIX CIBLE (parametres de surveillance en secondes entieres): UN
+    // seul log synthetique par demarrage de bot (jamais un log par cycle),
+    // non sensible (aucun login/password/token) - permet de verifier
+    // immediatement chez le client que la config reellement chargee (apres
+    // validateMonitoringSettings ci-dessus) correspond bien aux parametres
+    // configures cote agence.
+    botLog(
+      "info",
+      `Parametres surveillance: mois=${Math.round(settingsSnapshot.monthClickMinDelayMs / 1000)}-${Math.round(settingsSnapshot.monthClickMaxDelayMs / 1000)}s, `
+      + `cycles=${Math.round(settingsSnapshot.botCycleCooldownMinMs / 1000)}-${Math.round(settingsSnapshot.botCycleCooldownMaxMs / 1000)}s, `
+      + `refresh=${settingsSnapshot.controlRefreshIntervalSeconds}s, rate-limit=${settingsSnapshot.rateLimitCooldownSeconds}s, `
+      + `scans-paralleles=${settingsSnapshot.maxParallelScansPerDomain}.`
+    );
+
     if (this.shuttingDown) {
       this.reporter.failed(commandId, "AGENT_SHUTTING_DOWN", "L'agent est en cours d'arret. Relancez RendezBot Agent.");
       return;

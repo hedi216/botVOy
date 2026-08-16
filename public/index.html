@@ -315,34 +315,35 @@
                 </label>
                 <label>
                   Scans simultanes maximum
-                  <input id="maxParallelScansPerDomain" type="number" min="1" max="5" required>
+                  <input id="maxParallelScansPerDomain" type="number" min="1" max="5" step="1" required>
                 </label>
                 <label>
                   Delai min entre mois (secondes)
-                  <input id="monthClickMinDelaySec" type="number" min="0" max="600" required>
+                  <input id="monthClickMinDelaySeconds" type="number" min="1" max="600" step="1" required>
                 </label>
                 <label>
                   Delai max entre mois (secondes)
-                  <input id="monthClickMaxDelaySec" type="number" min="0" max="600" required>
+                  <input id="monthClickMaxDelaySeconds" type="number" min="1" max="600" step="1" required>
                 </label>
                 <label>
-                  Pause min entre cycles (minutes)
-                  <input id="botCycleCooldownMinMin" type="number" min="0" max="60" required>
+                  Pause min entre cycles (secondes)
+                  <input id="botCycleCooldownMinSeconds" type="number" min="5" max="3600" step="1" required>
                 </label>
                 <label>
-                  Pause max entre cycles (minutes)
-                  <input id="botCycleCooldownMaxMin" type="number" min="0" max="60" required>
+                  Pause max entre cycles (secondes)
+                  <input id="botCycleCooldownMaxSeconds" type="number" min="5" max="3600" step="1" required>
                 </label>
                 <label>
-                  Refresh tous les X cycles (defaut conseille: 20)
-                  <input id="refreshEveryCycles" type="number" min="1" max="100" required>
+                  Refresh de controle (secondes)
+                  <input id="controlRefreshIntervalSeconds" type="number" min="60" max="86400" step="1" required>
                 </label>
                 <label>
-                  Cooldown rate limit (minutes)
-                  <input id="rateLimitCooldownMinutes" type="number" min="1" max="1440" required>
+                  Cooldown rate limit (secondes)
+                  <input id="rateLimitCooldownSeconds" type="number" min="60" max="86400" step="1" required>
                 </label>
                 <button class="primary" type="submit">Enregistrer</button>
               </form>
+              <p>Les modifications s'appliquent aux prochains demarrages de bots. Les bots deja actifs conservent leurs parametres actuels.</p>
               <p id="settingsMessage" class="form-message"></p>
             </section>
 

@@ -265,13 +265,22 @@ const runUnitTests = async (): Promise<void> => {
     botCycleCooldownMinMs: "not-a-number",
     botCycleCooldownMaxMs: null,
     refreshEveryCycles: -5,
-    rateLimitCooldownMinutes: 0,
+    rateLimitCooldownSeconds: 0,
+    controlRefreshIntervalSeconds: 0,
     scanMonthCount: "12"
   });
   assert(Number.isFinite(garbage.maxParallelScansPerDomain) && garbage.maxParallelScansPerDomain >= 1, "NaN/type invalide -> retombe sur une valeur sure (maxParallelScansPerDomain)");
   assert(garbage.monthClickMinDelayMs >= 0, "Valeur negative -> jamais negative en sortie");
   assert(Number.isFinite(garbage.monthClickMaxDelayMs), "Infinity -> jamais transmis tel quel");
-  assert(garbage.rateLimitCooldownMinutes >= 1, "rateLimitCooldownMinutes borne a un minimum >= 1");
+  assert(garbage.rateLimitCooldownSeconds >= 60, "rateLimitCooldownSeconds borne a un minimum >= 60s (jamais 0)");
+  assert(garbage.controlRefreshIntervalSeconds >= 60, "controlRefreshIntervalSeconds borne a un minimum >= 60s (jamais 0)");
+
+  // HOTFIX CIBLE (parametres de surveillance en secondes entieres): un
+  // ancien payload n'envoyant que rateLimitCooldownMinutes doit toujours
+  // etre accepte (fallback de compatibilite), converti en secondes sans
+  // arrondi destructeur (jamais 30s -> 0 ni 1 minute).
+  const legacyRateLimit = validateMonitoringSettings({ rateLimitCooldownMinutes: 30 });
+  assert(legacyRateLimit.rateLimitCooldownSeconds === 1_800, `Fallback ancien payload (rateLimitCooldownMinutes) converti exactement en secondes (recu: ${legacyRateLimit.rateLimitCooldownSeconds})`);
 
   const zeroFloor = validateMonitoringSettings({ monthClickMinDelayMs: 0, botCycleCooldownMinMs: 0 });
   assert(zeroFloor.monthClickMinDelayMs > 0, "Delai de changement de mois nul releve a un plancher de securite (jamais 0ms)");
@@ -283,9 +292,12 @@ const runUnitTests = async (): Promise<void> => {
   const valid = validateMonitoringSettings({
     maxParallelScansPerDomain: 2, monthClickMinDelayMs: 3_000, monthClickMaxDelayMs: 6_000,
     botCycleCooldownMinMs: 60_000, botCycleCooldownMaxMs: 90_000, refreshEveryCycles: 10,
-    rateLimitCooldownMinutes: 30, scanMonthCount: 3
+    controlRefreshIntervalSeconds: 600, rateLimitCooldownSeconds: 1_800, scanMonthCount: 3
   });
-  assert(valid.maxParallelScansPerDomain === 2 && valid.rateLimitCooldownMinutes === 30, "Snapshot deja valide et dans les bornes: transmis sans alteration");
+  assert(
+    valid.maxParallelScansPerDomain === 2 && valid.controlRefreshIntervalSeconds === 600 && valid.rateLimitCooldownSeconds === 1_800,
+    "Snapshot deja valide et dans les bornes: transmis sans alteration"
+  );
 
   log("UNIT", "=== SlotAlertDeduplicator ===");
   const dedup = new SlotAlertDeduplicator(5 * 60_000);
@@ -370,7 +382,8 @@ const main = async (): Promise<void> => {
       const settings = payload?.monitoringSettings;
       assert(Boolean(settings), "START_BOT.payload contient bien monitoringSettings");
       assert(typeof settings?.maxParallelScansPerDomain === "number", "monitoringSettings.maxParallelScansPerDomain present et numerique");
-      assert(typeof settings?.rateLimitCooldownMinutes === "number", "monitoringSettings.rateLimitCooldownMinutes present et numerique");
+      assert(typeof settings?.rateLimitCooldownSeconds === "number", "monitoringSettings.rateLimitCooldownSeconds present et numerique");
+      assert(typeof settings?.controlRefreshIntervalSeconds === "number", "monitoringSettings.controlRefreshIntervalSeconds present et numerique");
       assert(!JSON.stringify(payload ?? {}).match(/password|cookie|token/i), "Aucun champ sensible dans le snapshot transmis");
 
       agent.socket.emit("COMMAND_ACK", { commandId: startCommand.commandId, receivedAt: new Date().toISOString() });

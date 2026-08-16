@@ -8,6 +8,15 @@ import { AppConfig } from "../shared/types.js";
 // des charges Lot 4: "ne jamais permettre un intervalle nul produisant une
 // boucle intensive"). Cette validation est donc une seconde ligne de
 // defense independante, jamais une simple redite de celle du serveur.
+//
+// HOTFIX CIBLE (parametres de surveillance en secondes entieres):
+// rateLimitCooldownSeconds remplace rateLimitCooldownMinutes (precision
+// exacte a la seconde, jamais tronquee par un Math.trunc en minutes) et
+// controlRefreshIntervalSeconds est un nouveau champ (rend configurable
+// l'ancienne constante de production AGENT_CONTROL_REFRESH_INTERVAL_MS,
+// cf. agentMonitoringRuntime.ts) - ni l'un ni l'autre n'est Picked depuis
+// AppConfig (pas d'equivalent direct: AppConfig reste en minutes/optionnel
+// en ms respectivement pour ne rien casser cote legacy_vm/orchestrator.ts).
 export type AgentMonitoringSettings = Pick<
   AppConfig,
   | "maxParallelScansPerDomain"
@@ -16,14 +25,26 @@ export type AgentMonitoringSettings = Pick<
   | "botCycleCooldownMinMs"
   | "botCycleCooldownMaxMs"
   | "refreshEveryCycles"
-  | "rateLimitCooldownMinutes"
   | "scanMonthCount"
->;
+> & {
+  controlRefreshIntervalSeconds: number;
+  rateLimitCooldownSeconds: number;
+};
 
 // Planchers de securite STRICTEMENT internes a l'agent: jamais configurables
 // depuis le serveur, precisement pour rester une garde-fou independante.
 const MIN_SAFE_DELAY_MS = 500;
 const MIN_SAFE_CYCLE_COOLDOWN_MS = 5_000;
+
+// Bornes de production pour les deux nouveaux champs en secondes (alignees
+// sur normalizeMonitoringSettings, userService.ts): la encore une seconde
+// ligne de defense, jamais une simple redite du serveur.
+const CONTROL_REFRESH_MIN_SECONDS = 60;
+const CONTROL_REFRESH_MAX_SECONDS = 86_400;
+const RATE_LIMIT_MIN_SECONDS = 60;
+const RATE_LIMIT_MAX_SECONDS = 86_400;
+const DEFAULT_CONTROL_REFRESH_INTERVAL_SECONDS = 1_200;
+const DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 2_700;
 
 export const DEFAULT_AGENT_MONITORING_SETTINGS: AgentMonitoringSettings = {
   maxParallelScansPerDomain: 1,
@@ -32,8 +53,9 @@ export const DEFAULT_AGENT_MONITORING_SETTINGS: AgentMonitoringSettings = {
   botCycleCooldownMinMs: 120_000,
   botCycleCooldownMaxMs: 240_000,
   refreshEveryCycles: 20,
-  rateLimitCooldownMinutes: 45,
-  scanMonthCount: 0
+  scanMonthCount: 0,
+  controlRefreshIntervalSeconds: DEFAULT_CONTROL_REFRESH_INTERVAL_SECONDS,
+  rateLimitCooldownSeconds: DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
 };
 
 const isSafeFiniteNumber = (value: unknown): value is number =>
@@ -85,8 +107,31 @@ export const validateMonitoringSettings = (
   }
 
   const refreshEveryCycles = boundedInt(input.refreshEveryCycles, defaults.refreshEveryCycles, 0, 100);
-  const rateLimitCooldownMinutes = boundedInt(input.rateLimitCooldownMinutes, defaults.rateLimitCooldownMinutes, 1, 1_440);
   const scanMonthCount = boundedInt(input.scanMonthCount, defaults.scanMonthCount, 0, 24);
+
+  const controlRefreshIntervalSeconds = boundedInt(
+    input.controlRefreshIntervalSeconds,
+    defaults.controlRefreshIntervalSeconds,
+    CONTROL_REFRESH_MIN_SECONDS,
+    CONTROL_REFRESH_MAX_SECONDS
+  );
+
+  // Compat ascendante (Hotfix parametres en secondes): un ancien
+  // serveur/payload peut encore n'envoyer que rateLimitCooldownMinutes -
+  // convertie sans arrondi destructeur (jamais 30s -> 0 ni 1 minute) avant
+  // d'etre bornee comme une vraie valeur en secondes.
+  const legacyRateLimitCooldownMinutes = (input as { rateLimitCooldownMinutes?: unknown }).rateLimitCooldownMinutes;
+  const rawRateLimitCooldownSeconds = isSafeFiniteNumber(input.rateLimitCooldownSeconds)
+    ? input.rateLimitCooldownSeconds
+    : isSafeFiniteNumber(legacyRateLimitCooldownMinutes)
+      ? legacyRateLimitCooldownMinutes * 60
+      : defaults.rateLimitCooldownSeconds;
+  const rateLimitCooldownSeconds = boundedInt(
+    rawRateLimitCooldownSeconds,
+    defaults.rateLimitCooldownSeconds,
+    RATE_LIMIT_MIN_SECONDS,
+    RATE_LIMIT_MAX_SECONDS
+  );
 
   return {
     maxParallelScansPerDomain,
@@ -95,8 +140,9 @@ export const validateMonitoringSettings = (
     botCycleCooldownMinMs,
     botCycleCooldownMaxMs,
     refreshEveryCycles,
-    rateLimitCooldownMinutes,
-    scanMonthCount
+    scanMonthCount,
+    controlRefreshIntervalSeconds,
+    rateLimitCooldownSeconds
   };
 };
 
@@ -112,8 +158,14 @@ export const validateMonitoringSettings = (
 // (qui reste dans `settings` uniquement pour retrocompatibilite/legacy_vm,
 // et n'est alors plus la cadence principale de l'agent). Parametre requis
 // (jamais implicite): l'appelant (agentMonitoringRuntime.ts) est seul
-// responsable de resoudre la valeur reelle (constante interne ou override
-// test uniquement).
+// responsable de resoudre la valeur reelle (snapshot, override test, ou
+// constante de compatibilite).
+//
+// HOTFIX CIBLE (parametres de surveillance en secondes entieres):
+// rateLimitCooldownMinutes (AppConfig/orchestrator.ts, inchanges) est
+// calculee ici par simple division exacte de rateLimitCooldownSeconds -
+// jamais via boundedInt/Math.trunc, pour ne jamais perdre en route une
+// precision a la seconde (30s ne doit jamais devenir 0 ni 1 minute).
 export const toAppConfig = (
   settings: AgentMonitoringSettings,
   targetUrl: string,
@@ -127,6 +179,13 @@ export const toAppConfig = (
   slowMoMs: 0,
   debugKeepBrowserOpen: true,
   maxRefreshAttempts: 0,
-  ...settings,
+  maxParallelScansPerDomain: settings.maxParallelScansPerDomain,
+  monthClickMinDelayMs: settings.monthClickMinDelayMs,
+  monthClickMaxDelayMs: settings.monthClickMaxDelayMs,
+  botCycleCooldownMinMs: settings.botCycleCooldownMinMs,
+  botCycleCooldownMaxMs: settings.botCycleCooldownMaxMs,
+  refreshEveryCycles: settings.refreshEveryCycles,
+  scanMonthCount: settings.scanMonthCount,
+  rateLimitCooldownMinutes: settings.rateLimitCooldownSeconds / 60,
   controlRefreshIntervalMs
 });

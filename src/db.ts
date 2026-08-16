@@ -37,6 +37,16 @@ export type DbAgency = {
   bot_cycle_cooldown_max_ms: number;
   refresh_every_cycles: number;
   rate_limit_cooldown_minutes: number;
+  // HOTFIX CIBLE (parametres de surveillance en secondes entieres): nouvelles
+  // colonnes en SECONDES qui deviennent la source de verite (cf.
+  // userService.ts) - rate_limit_cooldown_minutes ci-dessus est conservee
+  // pour retrocompatibilite de schema uniquement, plus jamais lue/ecrite par
+  // le code applicatif. control_refresh_interval_seconds remplace l'ancienne
+  // constante de production AGENT_CONTROL_REFRESH_INTERVAL_MS (20*60*1000,
+  // agentMonitoringRuntime.ts), qui ne reste qu'un fallback si ce champ est
+  // absent d'un ancien payload.
+  control_refresh_interval_seconds: number;
+  rate_limit_cooldown_seconds: number;
   created_at: string;
   // CHANTIER CIBLE (gestion des echeances et impayes): source de verite pour
   // computeAgencyBillingState() (src/agencyBillingService.ts) - jamais un
@@ -263,6 +273,8 @@ export const ensureSchema = async (): Promise<void> => {
       bot_cycle_cooldown_max_ms INTEGER NOT NULL DEFAULT 240000 CHECK (bot_cycle_cooldown_max_ms BETWEEN 0 AND 3600000),
       refresh_every_cycles INTEGER NOT NULL DEFAULT 20 CHECK (refresh_every_cycles BETWEEN 0 AND 100),
       rate_limit_cooldown_minutes INTEGER NOT NULL DEFAULT 45 CHECK (rate_limit_cooldown_minutes BETWEEN 1 AND 1440),
+      control_refresh_interval_seconds INTEGER NOT NULL DEFAULT 1200 CHECK (control_refresh_interval_seconds BETWEEN 60 AND 86400),
+      rate_limit_cooldown_seconds INTEGER NOT NULL DEFAULT 2700 CHECK (rate_limit_cooldown_seconds BETWEEN 60 AND 86400),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -577,4 +589,28 @@ export const ensureSchema = async (): Promise<void> => {
   await pool.query(
     "UPDATE agencies SET categories_seeded_at = NOW() WHERE categories_seeded_at IS NULL"
   );
+
+  // HOTFIX CIBLE (parametres de surveillance en secondes entieres): ajoute
+  // deux colonnes en SECONDES sans toucher aux colonnes ms/minutes
+  // existantes (conservees pour retrocompatibilite de schema, cf. DbAgency
+  // ci-dessus). Idempotent: toute agence existante recoit
+  // control_refresh_interval_seconds=1200 (identique a l'ancienne constante
+  // de production AGENT_CONTROL_REFRESH_INTERVAL_MS=20*60*1000 - aucun
+  // changement de comportement par defaut) et rate_limit_cooldown_seconds=
+  // 2700 (identique a l'ancien defaut de 45 minutes). Le backfill ne
+  // convertit que les agences deja personnalisees (rate_limit_cooldown_minutes
+  // different du defaut d'origine 45) et seulement tant que
+  // rate_limit_cooldown_seconds vaut encore le defaut de la nouvelle colonne:
+  // un redemarrage ulterieur ne peut donc jamais ecraser une valeur en
+  // secondes deja ajustee manuellement depuis.
+  await pool.query(`
+    ALTER TABLE agencies
+      ADD COLUMN IF NOT EXISTS control_refresh_interval_seconds INTEGER NOT NULL DEFAULT 1200,
+      ADD COLUMN IF NOT EXISTS rate_limit_cooldown_seconds INTEGER NOT NULL DEFAULT 2700;
+
+    UPDATE agencies
+       SET rate_limit_cooldown_seconds = rate_limit_cooldown_minutes * 60
+     WHERE rate_limit_cooldown_seconds = 2700
+       AND rate_limit_cooldown_minutes <> 45;
+  `);
 };

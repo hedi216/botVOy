@@ -1272,6 +1272,113 @@ const runScenarioCRR = async (browser: Browser): Promise<void> => {
   }
 };
 
+// ===================== CR-S/CR-T: HOTFIX parametres de surveillance en
+// secondes - controlRefreshIntervalSeconds pilote reellement le refresh,
+// SANS l'override de test controlRefreshIntervalMs (toutes les scenarios
+// CR-A a CR-R ci-dessus utilisent get override explicite ou monitor.ts
+// directement - aucun ne prouve que la resolution EN PRODUCTION, via le
+// snapshot de parametres, fonctionne reellement) =====================
+
+const makeFakeReporterForSnapshot = (): AgentEventReporter => ({
+  ack: () => undefined,
+  completed: () => undefined,
+  failed: () => undefined,
+  botStatus: () => undefined
+});
+
+// CR-S: controlRefreshIntervalSeconds (snapshot) pilote le refresh reel,
+// jamais AGENT_CONTROL_REFRESH_INTERVAL_MS (20 min) - aucun override de test
+// controlRefreshIntervalMs n'est passe a startMonitoring() ici.
+const runScenarioCRS = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== CR-S: controlRefreshIntervalSeconds (snapshot, sans override de test) pilote reellement le refresh ===");
+  const fixture = await startAlwaysReadyFixture();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const readyUrl = `${fixture.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`;
+
+  try {
+    await page.goto(readyUrl, { waitUntil: "domcontentloaded" });
+    const capture = makeLogCapture(Date.now());
+
+    const handle = startMonitoring({
+      botId: "bot-cr-s",
+      page,
+      context,
+      settings: { ...FAST_SETTINGS, controlRefreshIntervalSeconds: 1 },
+      targetUrl: readyUrl,
+      commandId: "cmd-cr-s",
+      reporter: makeFakeReporterForSnapshot(),
+      log: capture.log,
+      isBotStillRegistered: () => true
+    });
+
+    await waitUntil(() => capture.entries.some((e) => e.message.includes(CONTROL_REFRESH_LOG_MARKER)), 15_000);
+    handle.abortController.abort();
+    await handle.loopPromise;
+
+    const refreshAtMs = capture.entries.find((e) => e.message.includes(CONTROL_REFRESH_LOG_MARKER))?.atMs ?? -1;
+    assert(
+      refreshAtMs >= 700 && refreshAtMs <= 5_000,
+      `CR-S) Le refresh survient bien autour de l'echeance configuree via le snapshot (1s), jamais apres 20 minutes (recu: ${refreshAtMs}ms)`
+    );
+    assertNoSecretsInLogs(capture.entries, "CR-S) Aucun secret dans les logs");
+  } finally {
+    await context.close();
+    await closeFixture(fixture);
+  }
+};
+
+// CR-T: deux bots avec des controlRefreshIntervalSeconds DIFFERENTS (deux
+// agences distinctes en production) -> chacun applique reellement SA PROPRE
+// valeur, jamais celle de l'autre bot/agence.
+const runScenarioCRT = async (browser: Browser): Promise<void> => {
+  log("BOOT", "=== CR-T: deux bots, deux controlRefreshIntervalSeconds differents -> chacun applique reellement sa propre valeur ===");
+  const fixtureA = await startAlwaysReadyFixture();
+  const fixtureB = await startAlwaysReadyFixture();
+  const context = await browser.newContext();
+  const pageA = await context.newPage();
+  const pageB = await context.newPage();
+
+  try {
+    const readyUrlA = `${fixtureA.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`;
+    const readyUrlB = `${fixtureB.baseUrl}/workflow/appointment-booking/tnTUN2fr/1`;
+    await pageA.goto(readyUrlA, { waitUntil: "domcontentloaded" });
+    await pageB.goto(readyUrlB, { waitUntil: "domcontentloaded" });
+
+    const captureA = makeLogCapture(Date.now());
+    const captureB = makeLogCapture(Date.now());
+
+    const handleA = startMonitoring({
+      botId: "bot-cr-t-a", page: pageA, context, settings: { ...FAST_SETTINGS, controlRefreshIntervalSeconds: 1 },
+      targetUrl: readyUrlA, commandId: "cmd-cr-t-a", reporter: makeFakeReporterForSnapshot(), log: captureA.log,
+      isBotStillRegistered: () => true
+    });
+    const handleB = startMonitoring({
+      botId: "bot-cr-t-b", page: pageB, context, settings: { ...FAST_SETTINGS, controlRefreshIntervalSeconds: 3 },
+      targetUrl: readyUrlB, commandId: "cmd-cr-t-b", reporter: makeFakeReporterForSnapshot(), log: captureB.log,
+      isBotStillRegistered: () => true
+    });
+
+    await waitUntil(() => captureA.entries.some((e) => e.message.includes(CONTROL_REFRESH_LOG_MARKER)), 15_000);
+    await waitUntil(() => captureB.entries.some((e) => e.message.includes(CONTROL_REFRESH_LOG_MARKER)), 15_000);
+    handleA.abortController.abort();
+    handleB.abortController.abort();
+    await Promise.all([handleA.loopPromise, handleB.loopPromise]);
+
+    const refreshAtA = captureA.entries.find((e) => e.message.includes(CONTROL_REFRESH_LOG_MARKER))?.atMs ?? -1;
+    const refreshAtB = captureB.entries.find((e) => e.message.includes(CONTROL_REFRESH_LOG_MARKER))?.atMs ?? -1;
+
+    assert(refreshAtA >= 700 && refreshAtA <= 5_000, `CR-T) Bot A (1s) refresh bien autour de SA propre echeance (recu: ${refreshAtA}ms)`);
+    assert(refreshAtB >= 2_500 && refreshAtB <= 8_000, `CR-T) Bot B (3s) refresh bien autour de SA propre echeance, distincte de A (recu: ${refreshAtB}ms)`);
+    assertNoSecretsInLogs(captureA.entries, "CR-T) Aucun secret dans les logs (bot A)");
+    assertNoSecretsInLogs(captureB.entries, "CR-T) Aucun secret dans les logs (bot B)");
+  } finally {
+    await context.close();
+    await closeFixture(fixtureA);
+    await closeFixture(fixtureB);
+  }
+};
+
 // ===================== Helpers partages (agent layer) =====================
 
 const makeFakeReporter = (): { reporter: AgentEventReporter; statuses: Array<{ status: string; details?: unknown }> } => {
@@ -1324,6 +1431,8 @@ const main = async (): Promise<void> => {
     await runScenarioCRP(browser);
     await runScenarioCRQ(browser);
     await runScenarioCRR(browser);
+    await runScenarioCRS(browser);
+    await runScenarioCRT(browser);
   } finally {
     if (browser) await browser.close().catch(() => undefined);
   }

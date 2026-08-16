@@ -305,8 +305,8 @@ const main = async (): Promise<void> => {
     let managerCookie = await loginWithRetry(server.baseUrl, managerLogin, managerPassword);
 
     await setShortMonitoringSettings(server.baseUrl, managerCookie, {
-      maxParallelScansPerDomain: 2, monthClickMinDelayMs: 500, monthClickMaxDelayMs: 800,
-      botCycleCooldownMinMs: 4_000, botCycleCooldownMaxMs: 6_000, refreshEveryCycles: 3, rateLimitCooldownMinutes: 1
+      maxParallelScansPerDomain: 2, monthClickMinDelaySeconds: 1, monthClickMaxDelaySeconds: 2,
+      botCycleCooldownMinSeconds: 5, botCycleCooldownMaxSeconds: 6, rateLimitCooldownSeconds: 60
     });
 
     const pairing = await requestJson(server.baseUrl, "POST", "/api/agents/pairing-codes", managerCookie, {});

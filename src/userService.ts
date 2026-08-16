@@ -19,6 +19,16 @@ export type CreateUserResult = {
   temporaryPassword: string;
 };
 
+// HOTFIX CIBLE (parametres de surveillance en secondes entieres):
+// rateLimitCooldownSeconds est desormais le champ canonique (precision
+// exacte a la seconde, jamais tronquee) - rateLimitCooldownMinutes (Picked
+// depuis AppConfig ci-dessus) reste calculee automatiquement en
+// rateLimitCooldownSeconds/60 UNIQUEMENT pour que sessionManager.ts
+// (legacy_vm, spread direct de MonitoringSettings dans AppConfig, cf.
+// BotSession.start()) continue de fonctionner sans aucune modification.
+// controlRefreshIntervalSeconds n'a pas d'equivalent AppConfig (le champ
+// AppConfig s'appelle controlRefreshIntervalMs et n'est jamais renseigne par
+// ce spread) - legacy_vm reste donc exclusivement sur refreshEveryCycles.
 export type MonitoringSettings = Pick<
   AppConfig,
   | "maxParallelScansPerDomain"
@@ -28,7 +38,68 @@ export type MonitoringSettings = Pick<
   | "botCycleCooldownMaxMs"
   | "refreshEveryCycles"
   | "rateLimitCooldownMinutes"
->;
+> & {
+  controlRefreshIntervalSeconds: number;
+  rateLimitCooldownSeconds: number;
+};
+
+// Contrat PUBLIC (HTTP GET/PATCH /api/monitoring-settings, consomme par
+// public/app.js): unites explicitement en SECONDES, jamais de nom `Ms` ou
+// `Minutes` - distinct de MonitoringSettings (interne, hybride ms/secondes)
+// pour ne jamais faire fuiter les unites internes vers l'UI. refreshEveryCycles
+// n'apparait plus ici (retire de l'ecran Agent, reste uniquement pour
+// legacy_vm en interne, cf. section 5 du hotfix).
+export type PublicMonitoringSettings = {
+  maxParallelScansPerDomain: number;
+  monthClickMinDelaySeconds: number;
+  monthClickMaxDelaySeconds: number;
+  botCycleCooldownMinSeconds: number;
+  botCycleCooldownMaxSeconds: number;
+  controlRefreshIntervalSeconds: number;
+  rateLimitCooldownSeconds: number;
+};
+
+export type PublicMonitoringSettingsPatch = Partial<PublicMonitoringSettings>;
+
+export const toPublicMonitoringSettings = (settings: MonitoringSettings): PublicMonitoringSettings => ({
+  maxParallelScansPerDomain: settings.maxParallelScansPerDomain,
+  monthClickMinDelaySeconds: Math.round(settings.monthClickMinDelayMs / 1000),
+  monthClickMaxDelaySeconds: Math.round(settings.monthClickMaxDelayMs / 1000),
+  botCycleCooldownMinSeconds: Math.round(settings.botCycleCooldownMinMs / 1000),
+  botCycleCooldownMaxSeconds: Math.round(settings.botCycleCooldownMaxMs / 1000),
+  controlRefreshIntervalSeconds: settings.controlRefreshIntervalSeconds,
+  rateLimitCooldownSeconds: settings.rateLimitCooldownSeconds
+});
+
+// Convertit uniquement les champs presents dans le patch public (secondes)
+// vers le patch interne (ms pour mois/cycles, secondes deja natives pour
+// refresh/rate-limit) - jamais de multiplication par 60000 pour un champ en
+// secondes (cf. "30 secondes ne doit jamais devenir 30 minutes").
+export const fromPublicMonitoringSettingsPatch = (patch: PublicMonitoringSettingsPatch): Partial<MonitoringSettings> => {
+  const result: Partial<MonitoringSettings> = {};
+  if (patch.maxParallelScansPerDomain !== undefined) {
+    result.maxParallelScansPerDomain = patch.maxParallelScansPerDomain;
+  }
+  if (patch.monthClickMinDelaySeconds !== undefined) {
+    result.monthClickMinDelayMs = patch.monthClickMinDelaySeconds * 1000;
+  }
+  if (patch.monthClickMaxDelaySeconds !== undefined) {
+    result.monthClickMaxDelayMs = patch.monthClickMaxDelaySeconds * 1000;
+  }
+  if (patch.botCycleCooldownMinSeconds !== undefined) {
+    result.botCycleCooldownMinMs = patch.botCycleCooldownMinSeconds * 1000;
+  }
+  if (patch.botCycleCooldownMaxSeconds !== undefined) {
+    result.botCycleCooldownMaxMs = patch.botCycleCooldownMaxSeconds * 1000;
+  }
+  if (patch.controlRefreshIntervalSeconds !== undefined) {
+    result.controlRefreshIntervalSeconds = patch.controlRefreshIntervalSeconds;
+  }
+  if (patch.rateLimitCooldownSeconds !== undefined) {
+    result.rateLimitCooldownSeconds = patch.rateLimitCooldownSeconds;
+  }
+  return result;
+};
 
 export type RecordingExtensionLicenseType = "" | "free" | "paid";
 
@@ -68,6 +139,8 @@ export type AgencyCategory = {
   createdAt: string;
 };
 
+const DEFAULT_CONTROL_REFRESH_INTERVAL_SECONDS = 1_200;
+
 const defaultMonitoringSettings = (): MonitoringSettings => {
   const config = loadConfig();
   return {
@@ -77,7 +150,9 @@ const defaultMonitoringSettings = (): MonitoringSettings => {
     botCycleCooldownMinMs: config.botCycleCooldownMinMs,
     botCycleCooldownMaxMs: config.botCycleCooldownMaxMs,
     refreshEveryCycles: config.refreshEveryCycles,
-    rateLimitCooldownMinutes: config.rateLimitCooldownMinutes
+    rateLimitCooldownMinutes: config.rateLimitCooldownMinutes,
+    controlRefreshIntervalSeconds: DEFAULT_CONTROL_REFRESH_INTERVAL_SECONDS,
+    rateLimitCooldownSeconds: config.rateLimitCooldownMinutes * 60
   };
 };
 
@@ -87,6 +162,8 @@ const agencyToMonitoringSettings = (agency: DbAgency | null): MonitoringSettings
     return defaults;
   }
 
+  const rateLimitCooldownSeconds = agency.rate_limit_cooldown_seconds ?? defaults.rateLimitCooldownSeconds;
+
   return {
     maxParallelScansPerDomain: agency.max_parallel_scans_per_domain ?? defaults.maxParallelScansPerDomain,
     monthClickMinDelayMs: agency.month_click_min_delay_ms ?? defaults.monthClickMinDelayMs,
@@ -94,7 +171,13 @@ const agencyToMonitoringSettings = (agency: DbAgency | null): MonitoringSettings
     botCycleCooldownMinMs: agency.bot_cycle_cooldown_min_ms ?? defaults.botCycleCooldownMinMs,
     botCycleCooldownMaxMs: agency.bot_cycle_cooldown_max_ms ?? defaults.botCycleCooldownMaxMs,
     refreshEveryCycles: agency.refresh_every_cycles ?? defaults.refreshEveryCycles,
-    rateLimitCooldownMinutes: agency.rate_limit_cooldown_minutes ?? defaults.rateLimitCooldownMinutes
+    // Retrocompatibilite legacy_vm (sessionManager.ts, spread direct dans
+    // AppConfig): derivee de rateLimitCooldownSeconds, simple division jamais
+    // tronquee - jamais lue depuis la colonne DB minutes (gelee, cf. db.ts),
+    // pour rester alignee sur la valeur reellement configuree en secondes.
+    rateLimitCooldownMinutes: rateLimitCooldownSeconds / 60,
+    controlRefreshIntervalSeconds: agency.control_refresh_interval_seconds ?? defaults.controlRefreshIntervalSeconds,
+    rateLimitCooldownSeconds
   };
 };
 
@@ -115,23 +198,86 @@ const clampInt = (value: unknown, fallback: number, min: number, max: number): n
   return Math.min(Math.max(Math.trunc(numberValue), min), max);
 };
 
+// HOTFIX CIBLE (parametres de surveillance en secondes entieres): planchers
+// alignes UI/serveur/Agent - une valeur hors bornes est desormais REFUSEE
+// (HTTP 400 clair), jamais silencieusement remontee a la valeur plancher
+// sans que l'utilisateur le sache (cf. MIN_SAFE_CYCLE_COOLDOWN_MS cote
+// Agent, agentMonitoringSettings.ts, qui reste une SECONDE ligne de defense
+// independante avec le meme plancher).
+const MONTH_DELAY_MIN_MS = 1_000;
+const MONTH_DELAY_MAX_MS = 600_000;
+const CYCLE_COOLDOWN_MIN_MS = 5_000;
+const CYCLE_COOLDOWN_MAX_MS = 3_600_000;
+const CONTROL_REFRESH_MIN_SECONDS = 60;
+const CONTROL_REFRESH_MAX_SECONDS = 86_400;
+const RATE_LIMIT_MIN_SECONDS = 60;
+const RATE_LIMIT_MAX_SECONDS = 86_400;
+
+export type NormalizeMonitoringSettingsResult =
+  | { ok: true; settings: MonitoringSettings }
+  | { ok: false; error: string };
+
 export const normalizeMonitoringSettings = (
   patch: Partial<MonitoringSettings>,
-  current = defaultMonitoringSettings()
-): MonitoringSettings => {
-  const minMonthDelay = clampInt(patch.monthClickMinDelayMs, current.monthClickMinDelayMs, 0, 600_000);
-  const maxMonthDelay = clampInt(patch.monthClickMaxDelayMs, current.monthClickMaxDelayMs, minMonthDelay, 600_000);
-  const minCycleCooldown = clampInt(patch.botCycleCooldownMinMs, current.botCycleCooldownMinMs, 0, 3_600_000);
-  const maxCycleCooldown = clampInt(patch.botCycleCooldownMaxMs, current.botCycleCooldownMaxMs, minCycleCooldown, 3_600_000);
+  current: MonitoringSettings = defaultMonitoringSettings()
+): NormalizeMonitoringSettingsResult => {
+  const monthClickMinDelayMs = patch.monthClickMinDelayMs ?? current.monthClickMinDelayMs;
+  const monthClickMaxDelayMs = patch.monthClickMaxDelayMs ?? current.monthClickMaxDelayMs;
+  if (
+    !Number.isFinite(monthClickMinDelayMs) || !Number.isFinite(monthClickMaxDelayMs)
+    || monthClickMinDelayMs < MONTH_DELAY_MIN_MS || monthClickMinDelayMs > MONTH_DELAY_MAX_MS
+    || monthClickMaxDelayMs < MONTH_DELAY_MIN_MS || monthClickMaxDelayMs > MONTH_DELAY_MAX_MS
+  ) {
+    return { ok: false, error: `Delai entre mois hors bornes (${MONTH_DELAY_MIN_MS / 1000} a ${MONTH_DELAY_MAX_MS / 1000} secondes).` };
+  }
+  if (monthClickMinDelayMs > monthClickMaxDelayMs) {
+    return { ok: false, error: "Le delai min entre mois doit etre inferieur ou egal au delai max." };
+  }
+
+  const botCycleCooldownMinMs = patch.botCycleCooldownMinMs ?? current.botCycleCooldownMinMs;
+  const botCycleCooldownMaxMs = patch.botCycleCooldownMaxMs ?? current.botCycleCooldownMaxMs;
+  if (
+    !Number.isFinite(botCycleCooldownMinMs) || !Number.isFinite(botCycleCooldownMaxMs)
+    || botCycleCooldownMinMs < CYCLE_COOLDOWN_MIN_MS || botCycleCooldownMinMs > CYCLE_COOLDOWN_MAX_MS
+    || botCycleCooldownMaxMs < CYCLE_COOLDOWN_MIN_MS || botCycleCooldownMaxMs > CYCLE_COOLDOWN_MAX_MS
+  ) {
+    return { ok: false, error: `Pause entre cycles hors bornes (${CYCLE_COOLDOWN_MIN_MS / 1000} a ${CYCLE_COOLDOWN_MAX_MS / 1000} secondes).` };
+  }
+  if (botCycleCooldownMinMs > botCycleCooldownMaxMs) {
+    return { ok: false, error: "La pause min entre cycles doit etre inferieure ou egale a la pause max." };
+  }
+
+  const controlRefreshIntervalSeconds = patch.controlRefreshIntervalSeconds ?? current.controlRefreshIntervalSeconds;
+  if (
+    !Number.isFinite(controlRefreshIntervalSeconds)
+    || controlRefreshIntervalSeconds < CONTROL_REFRESH_MIN_SECONDS
+    || controlRefreshIntervalSeconds > CONTROL_REFRESH_MAX_SECONDS
+  ) {
+    return { ok: false, error: `Refresh de controle hors bornes (${CONTROL_REFRESH_MIN_SECONDS} a ${CONTROL_REFRESH_MAX_SECONDS} secondes).` };
+  }
+
+  const rateLimitCooldownSeconds = patch.rateLimitCooldownSeconds ?? current.rateLimitCooldownSeconds;
+  if (
+    !Number.isFinite(rateLimitCooldownSeconds)
+    || rateLimitCooldownSeconds < RATE_LIMIT_MIN_SECONDS
+    || rateLimitCooldownSeconds > RATE_LIMIT_MAX_SECONDS
+  ) {
+    return { ok: false, error: `Cooldown rate limit hors bornes (${RATE_LIMIT_MIN_SECONDS} a ${RATE_LIMIT_MAX_SECONDS} secondes).` };
+  }
 
   return {
-    maxParallelScansPerDomain: clampInt(patch.maxParallelScansPerDomain, current.maxParallelScansPerDomain, 1, 5),
-    monthClickMinDelayMs: minMonthDelay,
-    monthClickMaxDelayMs: maxMonthDelay,
-    botCycleCooldownMinMs: minCycleCooldown,
-    botCycleCooldownMaxMs: maxCycleCooldown,
-    refreshEveryCycles: clampInt(patch.refreshEveryCycles, current.refreshEveryCycles, 0, 100),
-    rateLimitCooldownMinutes: clampInt(patch.rateLimitCooldownMinutes, current.rateLimitCooldownMinutes, 1, 1_440)
+    ok: true,
+    settings: {
+      maxParallelScansPerDomain: clampInt(patch.maxParallelScansPerDomain, current.maxParallelScansPerDomain, 1, 5),
+      monthClickMinDelayMs: Math.trunc(monthClickMinDelayMs),
+      monthClickMaxDelayMs: Math.trunc(monthClickMaxDelayMs),
+      botCycleCooldownMinMs: Math.trunc(botCycleCooldownMinMs),
+      botCycleCooldownMaxMs: Math.trunc(botCycleCooldownMaxMs),
+      refreshEveryCycles: clampInt(patch.refreshEveryCycles, current.refreshEveryCycles, 0, 100),
+      rateLimitCooldownMinutes: rateLimitCooldownSeconds / 60,
+      controlRefreshIntervalSeconds: Math.trunc(controlRefreshIntervalSeconds),
+      rateLimitCooldownSeconds: Math.trunc(rateLimitCooldownSeconds)
+    }
   };
 };
 
@@ -391,12 +537,21 @@ export const getAgencySettings = async (agencyId: number | null): Promise<Agency
   };
 };
 
+export type UpdateAgencyMonitoringSettingsResult =
+  | { ok: true; settings: MonitoringSettings }
+  | { ok: false; error: string };
+
 export const updateAgencyMonitoringSettings = async (
   agencyId: number,
   patch: Partial<MonitoringSettings>
-): Promise<MonitoringSettings> => {
+): Promise<UpdateAgencyMonitoringSettingsResult> => {
   const current = await getAgencyMonitoringSettings(agencyId);
-  const settings = normalizeMonitoringSettings(patch, current);
+  const normalized = normalizeMonitoringSettings(patch, current);
+  if (!normalized.ok) {
+    return normalized;
+  }
+
+  const settings = normalized.settings;
   const result = await pool.query<DbAgency>(
     `UPDATE agencies
      SET max_parallel_scans_per_domain = $2,
@@ -405,7 +560,8 @@ export const updateAgencyMonitoringSettings = async (
          bot_cycle_cooldown_min_ms = $5,
          bot_cycle_cooldown_max_ms = $6,
          refresh_every_cycles = $7,
-         rate_limit_cooldown_minutes = $8
+         control_refresh_interval_seconds = $8,
+         rate_limit_cooldown_seconds = $9
      WHERE id = $1
      RETURNING *`,
     [
@@ -416,11 +572,12 @@ export const updateAgencyMonitoringSettings = async (
       settings.botCycleCooldownMinMs,
       settings.botCycleCooldownMaxMs,
       settings.refreshEveryCycles,
-      settings.rateLimitCooldownMinutes
+      settings.controlRefreshIntervalSeconds,
+      settings.rateLimitCooldownSeconds
     ]
   );
 
-  return agencyToMonitoringSettings(result.rows[0]);
+  return { ok: true, settings: agencyToMonitoringSettings(result.rows[0]) };
 };
 
 const validateInstallUrl = (value: unknown): string | null => {
