@@ -460,9 +460,21 @@ const runScenarioB = async (): Promise<void> => {
     // Aucun element cliquable + /fr-fr/login toujours bloque: l'agent doit
     // finir par WAITING_FOR_USER (bouton 'Valider'), jamais une fausse
     // 'surveillance', et jamais indefiniment bloque.
+    //
+    // HOTFIX CIBLE (navigation initiale bloquee sur page inconnue/externe):
+    // budget elargi (60s -> 100s). Consequence ATTENDUE et bornee du nouveau
+    // hotfix: un echec reel de clickSeConnecter() declenche desormais une
+    // recuperation bornee (retour vers l'URL TLS de depart, meme si celle-ci
+    // s'avere ici etre la MEME page deja essayee) avant d'abandonner la
+    // tentative - l'issue de cette recuperation devient "attempted" plutot
+    // que "none", ce qui ajoute l'attente de reglage existante
+    // (AUTO_NAV_STEP_SETTLE_MS ~8s) a CHAQUE tentative (jamais une boucle
+    // supplementaire ni un nombre de tentatives different: toujours au plus
+    // AUTO_NAV_FINAL_ATTEMPT=4 tentatives globales, toujours WAITING_FOR_USER
+    // au final).
     await requireWithin(
       async () => (await rowFor(BOT_NAME_B).locator("button", { hasText: "Valider" }).count()) === 1,
-      60_000,
+      100_000,
       "l'agent n'a jamais escalade vers WAITING_FOR_USER (bouton 'Valider') apres l'echec reel de clickSeConnecter()"
     );
     const rowText = await rowFor(BOT_NAME_B).innerText();

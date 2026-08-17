@@ -5,6 +5,7 @@ import {
   clickSeConnecter,
   clickSelectTravelGroup,
   fillLoginForm,
+  homeCountryPagePattern,
   isAuthPage,
   isServiceLevelPage,
   loginPathPattern,
@@ -612,6 +613,108 @@ export class AgentBotManager {
     let blockedByCloudflare = false;
     let lastSubmittedPageUrl: string | null = null;
 
+    // HOTFIX CIBLE (navigation initiale bloquee sur page inconnue/externe):
+    // meme principe conceptuel que navigateToRecoveryTargetUrl
+    // (agentMonitoringRuntime.ts) applique ici au parcours PRE-monitoring -
+    // source UNIQUE de l'URL de retour: handle.recoveryTargetUrl (deja
+    // valide en amont dans startBot() via isValidAbsoluteStartUrl, jamais
+    // page.url() ni une reconstruction a partir de la page actuelle).
+    // Revalidee ici en defense en profondeur uniquement, jamais pour en
+    // deduire une autre destination.
+    const navigateToSafeRecoveryUrl = async (page: import("playwright").Page, description: string): Promise<boolean> => {
+      const safeRecoveryUrl = handle.recoveryTargetUrl;
+      if (!isValidAbsoluteStartUrl(safeRecoveryUrl)) {
+        navLog("warn", `${description}, mais aucune URL de recuperation validee n'est disponible: retour impossible.`);
+        return false;
+      }
+      navLog("info", `${description}. Retour vers l'URL TLS de depart (${maskUrlForLog(safeRecoveryUrl)}).`);
+      try {
+        await page.goto(safeRecoveryUrl, { waitUntil: "domcontentloaded", timeout: INITIAL_NAVIGATION_TIMEOUT_MS });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        navLog("warn", `Retour vers l'URL TLS de depart impossible: ${message}.`);
+        return false;
+      }
+      if (!stillRunning() || page.isClosed()) {
+        return false;
+      }
+      navLog("success", `Retour vers l'URL TLS de depart effectue. Etat reevalue au pas suivant.`);
+      return true;
+    };
+
+    // HOTFIX CIBLE (navigation initiale bloquee sur page inconnue/externe):
+    // point d'entree UNIQUE de la recuperation "etat inconnu", partage par
+    // l'etat H (aucune etape reconnue) ET par l'echec reel de
+    // clickSeConnecter() en etat F (page qui n'est en realite ni la page
+    // d'accueil TLS ni une etape reconnue - meme symptome, jamais distingue
+    // autrement que par elimination dans ce dispatcher). Au plus UNE
+    // recuperation par TENTATIVE globale (unknownRecoveryState partage sur
+    // toute la duree d'attemptOnce()).
+    const attemptBoundedUnknownRecovery = async (
+      page: import("playwright").Page,
+      unknownRecoveryState: { used: boolean },
+      description: string
+    ): Promise<StateDispatchOutcome> => {
+      if (unknownRecoveryState.used) {
+        navLog(
+          "warn",
+          "Etat toujours non reconnu apres une premiere recuperation dans cette tentative: abandon de cette tentative "
+          + "(pas de deuxieme retour vers l'URL TLS de depart avant la prochaine tentative globale)."
+        );
+        return "none";
+      }
+      unknownRecoveryState.used = true;
+      const recovered = await navigateToSafeRecoveryUrl(page, description);
+      return recovered ? "attempted" : "none";
+    };
+
+    // CORRECTIF CIBLE (clickSeConnecter() jamais invoque sur une page non
+    // confirmee comme contexte d'accueil TLS): l'etat F etait declenche par
+    // simple elimination ("premiere etape non reconnue de cette tentative"),
+    // sans jamais verifier que la page correspond REELLEMENT a l'URL TLS de
+    // depart validee - une page externe (evil.example), about:blank, ou un
+    // chemin TLS inconnu pouvait ainsi declencher clickSeConnecter()/
+    // navigateToLogin(), qui construit new URL("/fr-fr/login", page.url())
+    // SUR L'ORIGINE COURANTE (jamais verifiee avant): un evil.example/test
+    // pouvait ainsi produire une navigation vers evil.example/fr-fr/login.
+    // Jamais de liste de domaines fragile: reutilise uniquement la source de
+    // verite deja validee (handle.recoveryTargetUrl) et un motif deja
+    // existant (homeCountryPagePattern, redirection pays reelle de TLS).
+    // clickSeConnecter() lui-meme reste INCHANGE (jamais touche globalement,
+    // aucun risque pour legacy_vm ou d'autres appelants): seul l'appel DEPUIS
+    // runAutoNavigation() est desormais garde.
+    const isPlausibleTlsHomeContext = (url: string): boolean => {
+      if (!isValidAbsoluteStartUrl(handle.recoveryTargetUrl)) {
+        // Fail closed: sans URL de reference validee, ne jamais supposer
+        // qu'une page est un contexte d'accueil sur.
+        return false;
+      }
+      let current: URL;
+      let recovery: URL;
+      try {
+        current = new URL(url);
+        recovery = new URL(handle.recoveryTargetUrl);
+      } catch {
+        return false;
+      }
+      if (current.origin !== recovery.origin) {
+        // Origine differente de l'URL TLS de depart validee (page externe,
+        // ex. evil.example): jamais suppose accueil, quel que soit le chemin.
+        return false;
+      }
+      if (current.pathname === recovery.pathname) {
+        // Exactement l'URL de depart deja validee (cas nominal: home au
+        // meme chemin que startUrl, y compris apres une navigation revenue
+        // au meme endroit).
+        return true;
+      }
+      // Meme origine mais chemin different de startUrl: reconnu uniquement
+      // si c'est le motif reel d'une page d'accueil pays TLS (redirection
+      // legitime cote serveur, deja geree ailleurs dans ce fichier) - jamais
+      // un chemin quelconque de la meme origine par defaut.
+      return homeCountryPagePattern.test(url);
+    };
+
     // HOTFIX CIBLE (service-level bloque malgre un lien "Continuer" valide et
     // deja trouvable en reel): l'ancienne cascade rejouait INCONDITIONNELLEMENT
     // clickSeConnecter -> fillLoginForm -> clickSelectTravelGroup ->
@@ -762,7 +865,8 @@ export class AgentBotManager {
 
     const dispatchOnState = async (
       page: import("playwright").Page,
-      initialLoginState: { attempted: boolean }
+      initialLoginState: { attempted: boolean },
+      unknownRecoveryState: { used: boolean }
     ): Promise<StateDispatchOutcome> => {
       const url = page.url();
 
@@ -849,6 +953,22 @@ export class AgentBotManager {
 
       if (!initialLoginState.attempted) {
         initialLoginState.attempted = true;
+
+        // CORRECTIF CIBLE (clickSeConnecter() jamais invoque sur une page non
+        // confirmee comme contexte d'accueil TLS): "premiere etape non
+        // reconnue" ne signifie pas "page d'accueil" - une page externe,
+        // about:blank ou un chemin TLS inconnu de la meme origine doit suivre
+        // le meme mecanisme que l'etat H (recuperation bornee vers
+        // handle.recoveryTargetUrl UNIQUEMENT), jamais un clic/une navigation
+        // tentee sur une origine/un chemin non confirme.
+        if (!isPlausibleTlsHomeContext(url)) {
+          navLog(
+            "warn",
+            `Page non confirmee comme contexte d'accueil TLS sur (${maskUrlForLog(url)}): clickSeConnecter() non tente.`
+          );
+          return attemptBoundedUnknownRecovery(page, unknownRecoveryState, "Page non confirmee comme contexte d'accueil TLS sur");
+        }
+
         const urlBeforeClick = page.url();
         // HOTFIX CIBLE 0.1.9: le resultat de clickSeConnecter() etait avale
         // (.catch(() => false) puis totalement ignore) - un clic/une
@@ -869,10 +989,15 @@ export class AgentBotManager {
           navLog(
             "warn",
             `clickSeConnecter() a echoue reellement (connected=false, URL avant=${maskUrlForLog(urlBeforeClick)}, `
-            + `URL apres=${maskUrlForLog(page.url())}): aucune action n'a fait progresser cette page. `
-            + "Abandon de cette tentative (reprise controlee a la tentative suivante) plutot que de pretendre un succes."
+            + `URL apres=${maskUrlForLog(page.url())}): aucune action n'a fait progresser cette page.`
           );
-          return "none";
+          // HOTFIX CIBLE (navigation initiale bloquee sur page inconnue/externe):
+          // un echec reel de clickSeConnecter() ici ne prouve pas a lui seul une
+          // vraie page d'accueil TLS defaillante (hotfix 0.1.9) - il peut tout
+          // autant signifier que cette page n'est en realite PAS la page
+          // d'accueil TLS (page externe/restauree/inconnue). Meme recuperation
+          // bornee que l'etat H, jamais une deuxieme dans la meme tentative.
+          return attemptBoundedUnknownRecovery(page, unknownRecoveryState, "clickSeConnecter() sans effet reel (aucun element de connexion trouve)");
         }
         navLog(
           "info",
@@ -895,15 +1020,28 @@ export class AgentBotManager {
 
       // Etat H: aucune des etapes reconnues (B-E) ni la premiere tentative de
       // connexion (F) ne s'applique. Jamais de navigation forcee vers le
-      // login ici (c'est precisement le defaut corrige par ce hotfix): on
-      // attend brievement une eventuelle navigation SPA deja en cours, puis
-      // on reevalue une seule fois avant d'abandonner cette tentative.
+      // login ici (c'est precisement le defaut corrige par le hotfix
+      // precedent): on attend brievement une eventuelle navigation SPA deja
+      // en cours, puis on reevalue avant de conclure a un etat reellement
+      // inconnu (jamais un reset premature sur un etat transitoire).
       navLog("warn", `Etat de page non reconnu (${maskUrlForLog(url)}). Attente breve puis reevaluation avant abandon de cette tentative.`);
       await new Promise((resolve) => setTimeout(resolve, 1_500));
       if (page.isClosed() || !stillRunning()) {
         return "none";
       }
-      return page.url() === url ? "none" : "attempted";
+      if (page.url() !== url) {
+        // Etat transitoire (navigation SPA en cours au moment du controle):
+        // une vraie progression a eu lieu entre-temps, jamais assimilee a un
+        // etat inconnu confirme - la prochaine iteration reclassifie la page
+        // normalement, aucune recuperation forcee ici.
+        return "attempted";
+      }
+
+      // HOTFIX CIBLE (navigation initiale bloquee sur page inconnue/externe):
+      // etat confirme reellement inconnu apres l'attente ci-dessus (page
+      // externe, ancienne page restauree par le profil Chrome, URL TLS non
+      // reconnue...).
+      return attemptBoundedUnknownRecovery(page, unknownRecoveryState, "Etat de navigation initiale non reconnu");
     };
 
     // Borne haute de defense (jamais atteinte en pratique: le parcours
@@ -914,6 +1052,11 @@ export class AgentBotManager {
 
     const attemptOnce = async (): Promise<boolean> => {
       const initialLoginState = { attempted: false };
+      // Reinitialise a chaque TENTATIVE globale (jamais partage entre
+      // tentatives): borne la recuperation "etat inconnu" a une seule
+      // occurrence par tentative, dans le meme budget que
+      // AUTO_NAV_FINAL_ATTEMPT (jamais un compteur de goto independant).
+      const unknownRecoveryState = { used: false };
       // Garde-fou anti-repetition: si une action a deja ete tentee sur cette
       // EXACTE url (le clic/remplissage a echoue sans faire bouger la page),
       // rejouer la meme action sur la meme page n'aidera jamais - on arrete
@@ -957,7 +1100,7 @@ export class AgentBotManager {
           return false;
         }
 
-        const outcome = await dispatchOnState(page, initialLoginState);
+        const outcome = await dispatchOnState(page, initialLoginState, unknownRecoveryState);
         if (outcome === "confirmed") {
           return true;
         }
